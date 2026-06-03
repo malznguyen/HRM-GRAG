@@ -1,6 +1,12 @@
 pub mod deepseek;
 pub mod retrieval;
 
+use std::collections::HashSet;
+use std::sync::LazyLock;
+
+use chrono::NaiveDateTime;
+use regex::Regex;
+use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -12,6 +18,30 @@ use self::retrieval::{
 };
 
 pub const CITATION_INSTRUCTION: &str = "You MUST cite your sources. When using information from a document chunk, append [chunk:<chunk_id>] to the end of the sentence, replacing <chunk_id> with the chunk's UUID.";
+
+static CHUNK_CITATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\[chunk:([0-9a-fA-F\-]{36})\]").expect("chunk citation regex must compile")
+});
+
+/// Extracts unique chunk UUIDs from `[chunk:<uuid>]` markers in assistant text.
+pub fn extract_chunk_citations(text: &str) -> Vec<Uuid> {
+    let mut seen = HashSet::new();
+    let mut citations = Vec::new();
+
+    for cap in CHUNK_CITATION_RE.captures_iter(text) {
+        let Some(uuid_match) = cap.get(1) else {
+            continue;
+        };
+        let Ok(uuid) = Uuid::parse_str(uuid_match.as_str()) else {
+            continue;
+        };
+        if seen.insert(uuid) {
+            citations.push(uuid);
+        }
+    }
+
+    citations
+}
 
 #[derive(Debug)]
 pub enum ChatPipelineError {
@@ -250,11 +280,33 @@ pub enum SessionError {
     Database(sqlx::Error),
 }
 
+const SESSION_TITLE_MAX_CHARS: usize = 40;
+
+/// First-line session label from the user's opening message.
+pub fn truncate_session_title(message: &str) -> String {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return "New Chat".to_string();
+    }
+
+    let char_count = trimmed.chars().count();
+    if char_count <= SESSION_TITLE_MAX_CHARS {
+        return trimmed.to_string();
+    }
+
+    let truncated: String = trimmed
+        .chars()
+        .take(SESSION_TITLE_MAX_CHARS)
+        .collect();
+    format!("{truncated}...")
+}
+
 pub async fn ensure_chat_session(
     pool: &PgPool,
     session_id: Uuid,
     workspace_id: Uuid,
     user_id: &str,
+    title: &str,
 ) -> Result<(), SessionError> {
     let owner: Option<String> = sqlx::query_scalar(
         r#"
@@ -279,7 +331,87 @@ pub async fn ensure_chat_session(
     sqlx::query(
         r#"
         INSERT INTO chat_sessions (id, workspace_id, user_id, title)
-        VALUES ($1, $2, $3, 'New Chat')
+        VALUES ($1, $2, $3, $4)
+        "#,
+    )
+    .bind(session_id)
+    .bind(workspace_id)
+    .bind(user_id)
+    .bind(title)
+    .execute(pool)
+    .await
+    .map_err(SessionError::Database)?;
+
+    Ok(())
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct ChatSessionSummary {
+    pub id: Uuid,
+    pub title: String,
+    pub created_at: NaiveDateTime,
+}
+
+pub async fn list_user_chat_sessions(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    user_id: &str,
+) -> Result<Vec<ChatSessionSummary>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT id, title, created_at
+        FROM chat_sessions
+        WHERE workspace_id = $1 AND user_id = $2
+        ORDER BY created_at DESC
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn verify_chat_session_owner(
+    pool: &PgPool,
+    session_id: Uuid,
+    workspace_id: Uuid,
+    user_id: &str,
+) -> Result<bool, SessionError> {
+    let owner: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT user_id
+        FROM chat_sessions
+        WHERE id = $1 AND workspace_id = $2
+        "#,
+    )
+    .bind(session_id)
+    .bind(workspace_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(SessionError::Database)?;
+
+    match owner {
+        None => Ok(false),
+        Some(existing) if existing == user_id => Ok(true),
+        Some(_) => Err(SessionError::Forbidden),
+    }
+}
+
+pub async fn delete_chat_session(
+    pool: &PgPool,
+    session_id: Uuid,
+    workspace_id: Uuid,
+    user_id: &str,
+) -> Result<bool, SessionError> {
+    match verify_chat_session_owner(pool, session_id, workspace_id, user_id).await? {
+        true => {}
+        false => return Ok(false),
+    }
+
+    let result = sqlx::query(
+        r#"
+        DELETE FROM chat_sessions
+        WHERE id = $1 AND workspace_id = $2 AND user_id = $3
         "#,
     )
     .bind(session_id)
@@ -289,7 +421,7 @@ pub async fn ensure_chat_session(
     .await
     .map_err(SessionError::Database)?;
 
-    Ok(())
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn insert_chat_message(
@@ -297,16 +429,20 @@ pub async fn insert_chat_message(
     session_id: Uuid,
     role: &str,
     content: &str,
+    citations: &[Uuid],
 ) -> Result<(), sqlx::Error> {
+    let citations_json = sqlx::types::Json(citations);
+
     sqlx::query(
         r#"
-        INSERT INTO chat_messages (session_id, role, content)
-        VALUES ($1, $2, $3)
+        INSERT INTO chat_messages (session_id, role, content, citations)
+        VALUES ($1, $2, $3, $4)
         "#,
     )
     .bind(session_id)
     .bind(role)
     .bind(content)
+    .bind(citations_json)
     .execute(pool)
     .await?;
     Ok(())

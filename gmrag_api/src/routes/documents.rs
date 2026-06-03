@@ -28,6 +28,55 @@ pub struct DocumentResponse {
     pub created_at: NaiveDateTime,
 }
 
+#[derive(Serialize, sqlx::FromRow)]
+pub struct ChunkResponse {
+    pub id: Uuid,
+    pub original_text: String,
+}
+
+pub async fn get_document_chunk(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((workspace_id, chunk_id)): Path<(Uuid, Uuid)>,
+) -> impl IntoResponse {
+    if let Err(status) = require_workspace_member(&state.pool, workspace_id, &auth.user_id).await {
+        return status.into_response();
+    }
+
+    match fetch_workspace_chunk(&state.pool, workspace_id, chunk_id).await {
+        Ok(Some(chunk)) => Json(chunk).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %auth.user_id,
+                workspace_id = %workspace_id,
+                chunk_id = %chunk_id,
+                "Failed to fetch document chunk"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn fetch_workspace_chunk(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    chunk_id: Uuid,
+) -> Result<Option<ChunkResponse>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT id, original_text
+        FROM document_chunks
+        WHERE id = $1 AND workspace_id = $2
+        "#,
+    )
+    .bind(chunk_id)
+    .bind(workspace_id)
+    .fetch_optional(pool)
+    .await
+}
+
 pub async fn list_documents(
     State(state): State<AppState>,
     auth: AuthUser,

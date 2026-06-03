@@ -12,8 +12,11 @@ use axum::{
     response::{IntoResponse, Json},
     routing::{delete, get, post},
 };
-use routes::chat::workspace_chat;
-use routes::documents::{delete_document, list_documents, upload_document};
+use routes::chat::{
+    delete_workspace_chat_session, get_workspace_chat_session_messages,
+    list_workspace_chat_sessions, workspace_chat, workspace_chat_history,
+};
+use routes::documents::{delete_document, get_document_chunk, list_documents, upload_document};
 use routes::graph::get_workspace_graph;
 use routes::users::get_current_user;
 use routes::workspaces::{create_workspace, delete_workspace, list_workspaces};
@@ -112,7 +115,27 @@ async fn main() {
             "/workspaces/{workspace_id}/documents/{document_id}",
             delete(delete_document),
         )
+        .route(
+            "/workspaces/{workspace_id}/chunks/{chunk_id}",
+            get(get_document_chunk),
+        )
         .route("/workspaces/{workspace_id}/chat", post(workspace_chat))
+        .route(
+            "/workspaces/{workspace_id}/chat/history",
+            get(workspace_chat_history),
+        )
+        .route(
+            "/workspaces/{workspace_id}/chat/sessions",
+            get(list_workspace_chat_sessions),
+        )
+        .route(
+            "/workspaces/{workspace_id}/chat/sessions/{session_id}/messages",
+            get(get_workspace_chat_session_messages),
+        )
+        .route(
+            "/workspaces/{workspace_id}/chat/sessions/{session_id}",
+            delete(delete_workspace_chat_session),
+        )
         .route("/workspaces/{workspace_id}/graph", get(get_workspace_graph))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(cors)

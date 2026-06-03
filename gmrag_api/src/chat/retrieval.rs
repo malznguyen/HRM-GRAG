@@ -1,3 +1,4 @@
+use chrono::NaiveDateTime;
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -34,6 +35,15 @@ pub struct GraphContext {
 pub struct ChatHistoryMessage {
     pub role: String,
     pub content: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct StoredChatMessage {
+    pub id: Uuid,
+    pub role: String,
+    pub content: String,
+    pub citations: sqlx::types::Json<Vec<Uuid>>,
+    pub created_at: NaiveDateTime,
 }
 
 pub async fn fetch_similar_chunks(
@@ -185,4 +195,28 @@ pub async fn fetch_chat_history(
     .await?;
 
     Ok(rows.into_iter().rev().collect())
+}
+
+pub async fn fetch_session_chat_messages(
+    pool: &PgPool,
+    session_id: Uuid,
+    workspace_id: Uuid,
+    user_id: &str,
+) -> Result<Vec<StoredChatMessage>, sqlx::Error> {
+    sqlx::query_as(
+        r#"
+        SELECT cm.id, cm.role, cm.content, cm.citations, cm.created_at
+        FROM chat_messages cm
+        INNER JOIN chat_sessions cs ON cs.id = cm.session_id
+        WHERE cm.session_id = $1
+          AND cs.workspace_id = $2
+          AND cs.user_id = $3
+        ORDER BY cm.created_at ASC
+        "#,
+    )
+    .bind(session_id)
+    .bind(workspace_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
 }

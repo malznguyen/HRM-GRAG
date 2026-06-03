@@ -873,6 +873,7 @@ dependencies = [
  "futures",
  "jsonwebtoken",
  "lopdf",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
