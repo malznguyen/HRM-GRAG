@@ -1,0 +1,40 @@
+# Documentation
+docs/
+**/docs/
+*.md
+*.mdx
+*.pdf
+*.doc
+*.docx
+
+# Secrets and local configuration
+.env
+.env.*
+*.local
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+secrets/
+credentials/
+
+# Local data
+.docker_data/
+**/data/
+**/uploads/
+
+# Dependencies and build outputs
+node_modules/
+.next/
+target/
+build/
+dist/
+out/
+coverage/
+*.tsbuildinfo
+
+# Tooling caches
+.turbo/
+.vercel/
+.DS_Store
