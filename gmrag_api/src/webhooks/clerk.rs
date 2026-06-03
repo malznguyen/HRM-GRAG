@@ -5,7 +5,9 @@ use axum::{
     response::IntoResponse,
 };
 use serde::Deserialize;
+use tracing::error;
 
+use crate::invite::{normalize_email, reconcile_pending_invites};
 use crate::state::AppState;
 use svix::webhooks::Webhook;
 
@@ -61,19 +63,20 @@ pub async fn handle_clerk_webhook(
         .first()
         .map(|e| e.email_address.as_str())
     {
-        Some(email) if !email.is_empty() => email,
+        Some(email) if !email.is_empty() => normalize_email(email),
         _ => return StatusCode::BAD_REQUEST,
     };
 
-    let result =
-        sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
-            .bind(&event.data.id)
-            .bind(email)
-            .execute(&state.pool)
-            .await;
-
-    match result {
-        Ok(_) => StatusCode::NO_CONTENT,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    match reconcile_pending_invites(&state.pool, &event.data.id, &email).await {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(err) => {
+            error!(
+                error = %err,
+                clerk_user_id = %event.data.id,
+                email = %email,
+                "Failed to reconcile user invite memberships"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     }
 }

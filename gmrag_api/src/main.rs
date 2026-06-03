@@ -1,6 +1,7 @@
 mod auth;
 mod chat;
 mod ingestion;
+mod invite;
 mod routes;
 mod state;
 mod webhooks;
@@ -18,7 +19,10 @@ use routes::chat::{
 };
 use routes::documents::{delete_document, get_document_chunk, list_documents, upload_document};
 use routes::graph::get_workspace_graph;
-use routes::users::get_current_user;
+use routes::users::{get_current_user, sync_current_user};
+use routes::members::{
+    add_workspace_member, list_workspace_members, remove_workspace_member,
+};
 use routes::workspaces::{create_workspace, delete_workspace, list_workspaces};
 use serde::Serialize;
 use sqlx::postgres::PgPoolOptions;
@@ -104,6 +108,7 @@ async fn main() {
         .route("/health", get(health))
         .route("/api/webhooks/clerk", post(handle_clerk_webhook))
         .route("/users/me", get(get_current_user))
+        .route("/users/sync", post(sync_current_user))
         .route("/workspaces", get(list_workspaces).post(create_workspace))
         .route("/workspaces/{workspace_id}", delete(delete_workspace))
         .route("/workspaces/{workspace_id}/documents", get(list_documents))
@@ -137,6 +142,14 @@ async fn main() {
             delete(delete_workspace_chat_session),
         )
         .route("/workspaces/{workspace_id}/graph", get(get_workspace_graph))
+        .route(
+            "/workspaces/{workspace_id}/members",
+            get(list_workspace_members).post(add_workspace_member),
+        )
+        .route(
+            "/workspaces/{workspace_id}/members/{member_id}",
+            delete(remove_workspace_member),
+        )
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(cors)
         .with_state(state);

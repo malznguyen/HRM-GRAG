@@ -2,6 +2,8 @@ use axum::http::StatusCode;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+pub const WORKSPACE_ADMIN_REQUIRED: &str = "Workspace admin access required";
+
 pub async fn require_workspace_member(
     pool: &PgPool,
     workspace_id: Uuid,
@@ -30,7 +32,7 @@ pub async fn require_workspace_admin(
     pool: &PgPool,
     workspace_id: Uuid,
     user_id: &str,
-) -> Result<(), StatusCode> {
+) -> Result<(), (StatusCode, &'static str)> {
     let role: Result<Option<String>, _> = sqlx::query_scalar(
         r#"
         SELECT role
@@ -44,8 +46,8 @@ pub async fn require_workspace_admin(
     .await;
 
     match role {
-        Ok(Some(ref r)) if r.as_str() == "ADMIN" => Ok(()),
-        Ok(_) => Err(StatusCode::FORBIDDEN),
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+        Ok(Some(ref role)) if role.as_str() == "ADMIN" => Ok(()),
+        Ok(_) => Err((StatusCode::FORBIDDEN, WORKSPACE_ADMIN_REQUIRED)),
+        Err(_) => Err((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")),
     }
 }

@@ -105,8 +105,10 @@ pub async fn delete_document(
     auth: AuthUser,
     Path((workspace_id, document_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    if let Err(status) = require_workspace_admin(&state.pool, workspace_id, &auth.user_id).await {
-        return status.into_response();
+    if let Err((status, message)) =
+        require_workspace_admin(&state.pool, workspace_id, &auth.user_id).await
+    {
+        return (status, message).into_response();
     }
 
     let mut tx = match state.pool.begin().await {
@@ -269,8 +271,10 @@ pub async fn upload_document(
     Path(workspace_id): Path<Uuid>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    if let Err(status) = require_workspace_admin(&state.pool, workspace_id, &auth.user_id).await {
-        return status.into_response();
+    if let Err((status, message)) =
+        require_workspace_admin(&state.pool, workspace_id, &auth.user_id).await
+    {
+        return (status, message).into_response();
     }
 
     let (filename, pdf_bytes) = match read_pdf_field(&mut multipart).await {
