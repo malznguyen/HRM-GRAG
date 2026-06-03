@@ -5,7 +5,14 @@ use serde::Deserialize;
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
-pub const GRAPH_EXTRACTION_SYSTEM_PROMPT: &str = "Extract Knowledge Graph nodes and edges from this text. Return ONLY a valid JSON array of objects. Each object must have: `type` ('node' or 'edge'), `name`/`relationship`, `description`, and for edges, `source` and `target`.";
+pub const GRAPH_EXTRACTION_SYSTEM_PROMPT: &str = r#"Extract the most important Knowledge Graph nodes and edges from this text.
+Return ONLY a valid JSON array of objects.
+Keep the response small: at most 8 nodes and 12 edges.
+Use only concrete named entities, concepts, systems, people, organizations, documents, or facts that are explicitly present in the text.
+Do not include generic filler nodes.
+Keep descriptions concise, under 20 words.
+Node objects must have: `type` = "node", `name`, optional `entity_type`, and `description`.
+Edge objects must have: `type` = "edge", `source`, `target`, `relationship`, and `description`."#;
 
 const DEFAULT_DEEPSEEK_URL: &str = "https://api.deepseek.com/chat/completions";
 const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
@@ -16,6 +23,18 @@ pub fn deepseek_chat_url() -> String {
 
 pub fn deepseek_model() -> String {
     std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| DEFAULT_DEEPSEEK_MODEL.to_string())
+}
+
+fn deepseek_graph_max_tokens() -> u32 {
+    env_u32("DEEPSEEK_GRAPH_MAX_TOKENS", 2048, 256)
+}
+
+fn env_u32(name: &str, default: u32, min: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(default)
+        .max(min)
 }
 
 pub async fn extract_graph_elements(
@@ -37,6 +56,8 @@ pub async fn extract_graph_elements(
             },
         ],
         temperature: 0.0,
+        max_tokens: deepseek_graph_max_tokens(),
+        thinking: DeepseekThinking { mode: "disabled" },
     };
 
     let response = client
@@ -498,6 +519,14 @@ struct DeepseekChatRequest<'a> {
     model: String,
     messages: Vec<DeepseekMessage<'a>>,
     temperature: f32,
+    max_tokens: u32,
+    thinking: DeepseekThinking<'a>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DeepseekThinking<'a> {
+    #[serde(rename = "type")]
+    mode: &'a str,
 }
 
 #[derive(Debug, serde::Serialize)]

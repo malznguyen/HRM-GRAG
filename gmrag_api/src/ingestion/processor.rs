@@ -176,7 +176,8 @@ async fn process_document(
             %workspace_id,
             %document_id,
             chunks = chunk_rows.len(),
-            concurrency = graph_extraction_concurrency(),
+            configured_concurrency = graph_extraction_concurrency(),
+            effective_concurrency = effective_graph_extraction_concurrency(chunk_rows.len()),
             timeout_secs = graph_extraction_timeout_secs(),
             retries = graph_extraction_retries(),
             stage_timeout_secs = graph_extraction_stage_timeout_secs(),
@@ -332,8 +333,7 @@ async fn extract_graph_for_chunks(
     document_id: Uuid,
     chunks: &[ChunkRow],
 ) -> Vec<(i32, Vec<GraphElement>)> {
-    let concurrency = graph_extraction_concurrency();
-    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let concurrency = effective_graph_extraction_concurrency(chunks.len());
     let timeout_duration = Duration::from_secs(graph_extraction_timeout_secs());
     let retries = graph_extraction_retries();
     let stage_timeout = Duration::from_secs(graph_extraction_stage_timeout_secs());
@@ -344,19 +344,10 @@ async fn extract_graph_for_chunks(
 
     let mut pending = stream::iter(inputs.into_iter().map(|(index, text)| {
         let client = client.clone();
-        let semaphore = semaphore.clone();
 
         async move {
             let started = Instant::now();
-            let result = async {
-                let _permit = semaphore
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| ProcessError::Semaphore("graph extraction"))?;
-
-                extract_graph_with_retry(&client, &text, timeout_duration, retries).await
-            }
-            .await;
+            let result = extract_graph_with_retry(&client, &text, timeout_duration, retries).await;
 
             (index, result, started.elapsed().as_millis())
         }
@@ -560,7 +551,11 @@ fn graph_extraction_enabled() -> bool {
 }
 
 fn graph_extraction_concurrency() -> usize {
-    env_usize("GMRAG_GRAPH_EXTRACTION_CONCURRENCY", 4, 1)
+    env_usize("GMRAG_GRAPH_EXTRACTION_CONCURRENCY", 12, 1)
+}
+
+fn effective_graph_extraction_concurrency(chunk_count: usize) -> usize {
+    graph_extraction_concurrency().min(chunk_count.max(1))
 }
 
 fn graph_extraction_timeout_secs() -> u64 {
@@ -624,7 +619,6 @@ enum ProcessError {
     Graph(GraphError),
     GraphTimeout { timeout_secs: u64 },
     Database(sqlx::Error),
-    Semaphore(&'static str),
 }
 
 impl std::fmt::Display for ProcessError {
@@ -651,7 +645,6 @@ impl std::fmt::Display for ProcessError {
                 write!(f, "graph extraction timed out after {timeout_secs}s")
             }
             ProcessError::Database(e) => write!(f, "database error: {e}"),
-            ProcessError::Semaphore(name) => write!(f, "{name} semaphore closed"),
         }
     }
 }

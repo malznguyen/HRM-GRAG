@@ -4,9 +4,6 @@ use uuid::Uuid;
 #[derive(Debug, sqlx::FromRow)]
 pub struct RetrievedChunk {
     pub id: Uuid,
-    pub document_id: Uuid,
-    pub filename: String,
-    pub chunk_index: i32,
     pub original_text: String,
 }
 
@@ -50,9 +47,6 @@ pub async fn fetch_similar_chunks(
         r#"
         SELECT
             dc.id,
-            dc.document_id,
-            d.filename,
-            dc.chunk_index,
             dc.original_text
         FROM document_chunks dc
         INNER JOIN documents d
