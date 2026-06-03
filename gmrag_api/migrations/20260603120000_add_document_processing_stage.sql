@@ -1,0 +1,2 @@
+ALTER TABLE documents
+ADD COLUMN processing_stage VARCHAR(50) NOT NULL DEFAULT 'QUEUED';

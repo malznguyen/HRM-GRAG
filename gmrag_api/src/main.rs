@@ -17,7 +17,9 @@ use routes::chat::{
     delete_workspace_chat_session, get_workspace_chat_session_messages,
     list_workspace_chat_sessions, workspace_chat, workspace_chat_history,
 };
-use routes::documents::{delete_document, get_document_chunk, list_documents, upload_document};
+use routes::documents::{
+    delete_document, get_document_chunk, get_document_preview, list_documents, upload_document,
+};
 use routes::graph::get_workspace_graph;
 use routes::users::{get_current_user, sync_current_user};
 use routes::members::{
@@ -119,6 +121,10 @@ async fn main() {
         .route(
             "/workspaces/{workspace_id}/documents/{document_id}",
             delete(delete_document),
+        )
+        .route(
+            "/workspaces/{workspace_id}/documents/{document_id}/preview",
+            get(get_document_preview),
         )
         .route(
             "/workspaces/{workspace_id}/chunks/{chunk_id}",

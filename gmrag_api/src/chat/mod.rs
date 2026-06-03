@@ -17,11 +17,47 @@ use self::retrieval::{
     GraphContext, RetrievedChunk, fetch_chat_history, fetch_graph_context, fetch_similar_chunks,
 };
 
-pub const CITATION_INSTRUCTION: &str = "You MUST cite your sources. When using information from a document chunk, append [chunk:<chunk_id>] to the end of the sentence, replacing <chunk_id> with the chunk's UUID.";
+pub const CITATION_INSTRUCTION: &str = "When citing information from a context chunk, you MUST append [chunk:1], [chunk:2], etc., at the end of the sentence based on its CHUNK INDEX number. Do not output raw UUIDs under any circumstance.";
 
 static CHUNK_CITATION_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\[chunk:([0-9a-fA-F\-]{36})\]").expect("chunk citation regex must compile")
 });
+
+static CHUNK_INDEX_CITATION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\[chunk:(\d+)\]").expect("chunk index citation regex must compile")
+});
+
+/// Replaces `[chunk:<index>]` markers with `[chunk:<uuid>]` and returns deduplicated citations.
+pub fn resolve_chunk_index_citations(text: &str, chunk_ids: &[Uuid]) -> (String, Vec<Uuid>) {
+    let mut seen = HashSet::new();
+    let mut citations = Vec::new();
+
+    let resolved = CHUNK_INDEX_CITATION_RE.replace_all(text, |caps: &regex::Captures| {
+        let Some(index_match) = caps.get(1) else {
+            return caps[0].to_string();
+        };
+        let Ok(index) = index_match.as_str().parse::<usize>() else {
+            return caps[0].to_string();
+        };
+        if index == 0 || index > chunk_ids.len() {
+            return caps[0].to_string();
+        }
+
+        let uuid = chunk_ids[index - 1];
+        if seen.insert(uuid) {
+            citations.push(uuid);
+        }
+        format!("[chunk:{uuid}]")
+    });
+
+    for uuid in extract_chunk_citations(&resolved) {
+        if seen.insert(uuid) {
+            citations.push(uuid);
+        }
+    }
+
+    (resolved.into_owned(), citations)
+}
 
 /// Extracts unique chunk UUIDs from `[chunk:<uuid>]` markers in assistant text.
 pub fn extract_chunk_citations(text: &str) -> Vec<Uuid> {
@@ -71,6 +107,8 @@ impl From<sqlx::Error> for ChatPipelineError {
 pub struct ChatContext {
     pub system_prompt: String,
     pub messages: Vec<ChatMessage>,
+    /// Ordered chunk UUIDs; index 1 in prompts maps to `chunk_ids[0]`.
+    pub chunk_ids: Vec<Uuid>,
 }
 
 pub async fn build_chat_context(
@@ -113,10 +151,12 @@ pub async fn build_chat_context(
         "RAG pipeline: loaded chat history"
     );
 
+    let chunk_ids: Vec<Uuid> = chunks.iter().map(|chunk| chunk.id).collect();
     let system_prompt = assemble_system_prompt(&chunks, &graph);
     tracing::info!(
         %workspace_id,
         system_prompt_chars = system_prompt.len(),
+        chunk_count = chunk_ids.len(),
         "RAG pipeline: assembled augmented system prompt"
     );
 
@@ -141,6 +181,7 @@ pub async fn build_chat_context(
     Ok(ChatContext {
         system_prompt,
         messages,
+        chunk_ids,
     })
 }
 
@@ -231,10 +272,11 @@ Answer using only the retrieved context below when possible. Be concise and accu
     if chunks.is_empty() {
         prompt.push_str("(none)\n");
     } else {
-        for chunk in chunks {
+        for (index, chunk) in chunks.iter().enumerate() {
+            let chunk_index = index + 1;
             prompt.push_str(&format!(
-                "- chunk_id: {}\n  original_text: {}\n\n",
-                chunk.id, chunk.original_text
+                "--- CHUNK INDEX {chunk_index} (Document: {}) ---\n{}\n\n",
+                chunk.document_filename, chunk.original_text
             ));
         }
     }
@@ -446,4 +488,47 @@ pub async fn insert_chat_message(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_index_markers_to_uuids() {
+        let u1 = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let u2 = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let chunk_ids = vec![u1, u2];
+        let text = "First fact.[chunk:1] Second fact.[chunk:2] Repeat.[chunk:1]";
+
+        let (resolved, citations) = resolve_chunk_index_citations(text, &chunk_ids);
+
+        assert_eq!(
+            resolved,
+            format!(
+                "First fact.[chunk:{u1}] Second fact.[chunk:{u2}] Repeat.[chunk:{u1}]"
+            )
+        );
+        assert_eq!(citations, vec![u1, u2]);
+    }
+
+    #[test]
+    fn resolve_leaves_unknown_index_markers_unchanged() {
+        let u1 = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let chunk_ids = vec![u1];
+        let text = "Valid.[chunk:1] Invalid.[chunk:99] Zero.[chunk:0]";
+
+        let (resolved, citations) = resolve_chunk_index_citations(text, &chunk_ids);
+
+        assert_eq!(resolved, format!("Valid.[chunk:{u1}] Invalid.[chunk:99] Zero.[chunk:0]"));
+        assert_eq!(citations, vec![u1]);
+    }
+
+    #[test]
+    fn extract_chunk_citations_deduplicates_uuid_markers() {
+        let u1 = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let text = format!("One.[chunk:{u1}] Two.[chunk:{u1}]");
+
+        assert_eq!(extract_chunk_citations(&text), vec![u1]);
+    }
 }

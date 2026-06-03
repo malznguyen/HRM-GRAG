@@ -16,8 +16,14 @@ use crate::ingestion::processor::spawn_document_processing;
 use crate::state::AppState;
 
 #[derive(Serialize)]
-pub struct UploadDocumentResponse {
+pub struct UploadedDocumentItem {
     pub document_id: Uuid,
+    pub filename: String,
+}
+
+#[derive(Serialize)]
+pub struct UploadDocumentsResponse {
+    pub documents: Vec<UploadedDocumentItem>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -25,7 +31,26 @@ pub struct DocumentResponse {
     pub id: Uuid,
     pub filename: String,
     pub status: String,
+    pub processing_stage: String,
     pub created_at: NaiveDateTime,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct PreviewChunkRow {
+    pub chunk_index: i32,
+    pub original_text: String,
+}
+
+#[derive(Serialize)]
+pub struct DocumentPreviewResponse {
+    pub content: String,
+    pub chunks: Vec<PreviewChunkItem>,
+}
+
+#[derive(Serialize)]
+pub struct PreviewChunkItem {
+    pub chunk_index: i32,
+    pub text: String,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -75,6 +100,58 @@ async fn fetch_workspace_chunk(
     .bind(workspace_id)
     .fetch_optional(pool)
     .await
+}
+
+pub async fn get_document_preview(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((workspace_id, document_id)): Path<(Uuid, Uuid)>,
+) -> impl IntoResponse {
+    if let Err(status) = require_workspace_member(&state.pool, workspace_id, &auth.user_id).await {
+        return status.into_response();
+    }
+
+    let document_status: Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
+        r#"
+        SELECT status
+        FROM documents
+        WHERE id = $1 AND workspace_id = $2
+        "#,
+    )
+    .bind(document_id)
+    .bind(workspace_id)
+    .fetch_optional(&state.pool)
+    .await;
+
+    match document_status {
+        Ok(Some(status)) if status == "COMPLETED" => {}
+        Ok(Some(_)) => return StatusCode::CONFLICT.into_response(),
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %auth.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to verify document before preview"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
+    match fetch_document_preview(&state.pool, workspace_id, document_id).await {
+        Ok(preview) => Json(preview).into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %auth.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to fetch document preview"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 pub async fn list_documents(
@@ -254,7 +331,7 @@ async fn fetch_workspace_documents(
 ) -> Result<Vec<DocumentResponse>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT id, filename, status, created_at
+        SELECT id, filename, status, processing_stage, created_at
         FROM documents
         WHERE workspace_id = $1
         ORDER BY created_at DESC
@@ -263,6 +340,41 @@ async fn fetch_workspace_documents(
     .bind(workspace_id)
     .fetch_all(pool)
     .await
+}
+
+async fn fetch_document_preview(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    document_id: Uuid,
+) -> Result<DocumentPreviewResponse, sqlx::Error> {
+    let rows: Vec<PreviewChunkRow> = sqlx::query_as(
+        r#"
+        SELECT chunk_index, original_text
+        FROM document_chunks
+        WHERE workspace_id = $1 AND document_id = $2
+        ORDER BY chunk_index ASC
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(document_id)
+    .fetch_all(pool)
+    .await?;
+
+    let chunks: Vec<PreviewChunkItem> = rows
+        .into_iter()
+        .map(|row| PreviewChunkItem {
+            chunk_index: row.chunk_index,
+            text: row.original_text,
+        })
+        .collect();
+
+    let content = chunks
+        .iter()
+        .map(|chunk| chunk.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    Ok(DocumentPreviewResponse { content, chunks })
 }
 
 pub async fn upload_document(
@@ -277,90 +389,88 @@ pub async fn upload_document(
         return (status, message).into_response();
     }
 
-    let (filename, pdf_bytes) = match read_pdf_field(&mut multipart).await {
-        Ok(v) => v,
-        Err(status) => return status.into_response(),
-    };
-
-    let document_id: Uuid = match sqlx::query_scalar(
-        r#"
-        INSERT INTO documents (workspace_id, filename, status)
-        VALUES ($1, $2, 'PROCESSING')
-        RETURNING id
-        "#,
-    )
-    .bind(workspace_id)
-    .bind(&filename)
-    .fetch_one(&state.pool)
-    .await
-    {
-        Ok(id) => id,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-
     let workspace_dir = state.upload_dir.join(workspace_id.to_string());
-    if let Err(_) = tokio::fs::create_dir_all(&workspace_dir).await {
-        let _ = mark_upload_failed(&state.pool, workspace_id, document_id).await;
+    if tokio::fs::create_dir_all(&workspace_dir).await.is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    let file_path = workspace_dir.join(format!("{document_id}.pdf"));
-    if let Err(_) = tokio::fs::write(&file_path, &pdf_bytes).await {
-        let _ = mark_upload_failed(&state.pool, workspace_id, document_id).await;
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-
-    spawn_document_processing(
-        state.pool.clone(),
-        workspace_id,
-        document_id,
-        file_path,
-        state.ingestion_limiter.clone(),
-    );
-
-    (
-        StatusCode::ACCEPTED,
-        Json(UploadDocumentResponse { document_id }),
-    )
-        .into_response()
-}
-
-async fn read_pdf_field(multipart: &mut Multipart) -> Result<(String, Vec<u8>), StatusCode> {
-    let mut filename: Option<String> = None;
-    let mut bytes: Option<Vec<u8>> = None;
+    let mut uploaded: Vec<UploadedDocumentItem> = Vec::new();
 
     while let Ok(Some(field)) = multipart.next_field().await {
         if field.name() != Some("file") {
             continue;
         }
 
-        filename = field
+        let filename = field
             .file_name()
             .map(sanitize_filename)
-            .or_else(|| Some("upload.pdf".to_string()));
+            .unwrap_or_else(|| "upload.pdf".to_string());
 
-        let data = field
-            .bytes()
-            .await
-            .map_err(|_| StatusCode::BAD_REQUEST)?
-            .to_vec();
+        let pdf_bytes = match field.bytes().await {
+            Ok(bytes) => bytes.to_vec(),
+            Err(_) => continue,
+        };
 
-        if data.is_empty() {
-            return Err(StatusCode::BAD_REQUEST);
+        if pdf_bytes.is_empty() || !is_pdf_upload(&filename, &pdf_bytes) {
+            continue;
         }
 
-        if !is_pdf_upload(&filename.as_deref().unwrap_or("upload.pdf"), &data) {
-            return Err(StatusCode::BAD_REQUEST);
+        let document_id: Uuid = match sqlx::query_scalar(
+            r#"
+            INSERT INTO documents (workspace_id, filename, status, processing_stage)
+            VALUES ($1, $2, 'PROCESSING', 'QUEUED')
+            RETURNING id
+            "#,
+        )
+        .bind(workspace_id)
+        .bind(&filename)
+        .fetch_one(&state.pool)
+        .await
+        {
+            Ok(id) => id,
+            Err(err) => {
+                error!(
+                    error = %err,
+                    user_id = %auth.user_id,
+                    workspace_id = %workspace_id,
+                    filename = %filename,
+                    "Failed to insert document row during batch upload"
+                );
+                continue;
+            }
+        };
+
+        let file_path = workspace_dir.join(format!("{document_id}.pdf"));
+        if tokio::fs::write(&file_path, &pdf_bytes).await.is_err() {
+            let _ = mark_upload_failed(&state.pool, workspace_id, document_id).await;
+            continue;
         }
 
-        bytes = Some(data);
-        break;
+        spawn_document_processing(
+            state.pool.clone(),
+            workspace_id,
+            document_id,
+            file_path,
+            state.ingestion_limiter.clone(),
+        );
+
+        uploaded.push(UploadedDocumentItem {
+            document_id,
+            filename,
+        });
     }
 
-    match (filename, bytes) {
-        (Some(name), Some(data)) => Ok((name, data)),
-        _ => Err(StatusCode::BAD_REQUEST),
+    if uploaded.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
     }
+
+    (
+        StatusCode::ACCEPTED,
+        Json(UploadDocumentsResponse {
+            documents: uploaded,
+        }),
+    )
+        .into_response()
 }
 
 fn sanitize_filename(name: &str) -> String {

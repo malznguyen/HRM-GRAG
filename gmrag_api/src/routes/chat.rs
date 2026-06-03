@@ -21,8 +21,8 @@ use crate::chat::deepseek::{DeepseekTokenParser, next_stream_token};
 use crate::chat::retrieval::fetch_session_chat_messages;
 use crate::chat::{
     ChatPipelineError, SessionError, build_chat_context, delete_chat_session,
-    ensure_chat_session, extract_chunk_citations, insert_chat_message, list_user_chat_sessions,
-    prepare_deepseek_stream, truncate_session_title, verify_chat_session_owner,
+    ensure_chat_session, insert_chat_message, list_user_chat_sessions, prepare_deepseek_stream,
+    resolve_chunk_index_citations, truncate_session_title, verify_chat_session_owner,
 };
 use crate::state::AppState;
 
@@ -297,6 +297,7 @@ pub async fn workspace_chat(
 
     let pool = state.pool.clone();
     let session_id = body.session_id;
+    let chunk_ids = context.chunk_ids;
     let byte_stream = deepseek_response.bytes_stream();
 
     let event_stream = async_stream::stream! {
@@ -321,8 +322,8 @@ pub async fn workspace_chat(
         }
 
         if !assistant_buffer.is_empty() {
-            let content = assistant_buffer.clone();
-            let citations = extract_chunk_citations(&content);
+            let (content, citations) =
+                resolve_chunk_index_citations(&assistant_buffer, &chunk_ids);
             tokio::spawn(async move {
                 if let Err(err) = insert_chat_message(
                     &pool,

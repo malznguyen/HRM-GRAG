@@ -65,6 +65,8 @@ async fn process_document(
     file_path: PathBuf,
 ) -> Result<(), ProcessError> {
     let document_started = Instant::now();
+    set_processing_stage(&pool, workspace_id, document_id, "PARSING").await?;
+
     let parse_started = Instant::now();
     let parse_timeout = Duration::from_secs(pdf_parse_timeout_secs());
 
@@ -132,11 +134,14 @@ async fn process_document(
             %document_id,
             "No text chunks produced from document; marking COMPLETED"
         );
+        set_processing_stage(&pool, workspace_id, document_id, "SAVING").await?;
         let mut tx = pool.begin().await.map_err(ProcessError::Database)?;
         mark_document_completed_tx(&mut tx, workspace_id, document_id).await?;
         tx.commit().await.map_err(ProcessError::Database)?;
         return Ok(());
     }
+
+    set_processing_stage(&pool, workspace_id, document_id, "EMBEDDING").await?;
 
     let client = Client::new();
     let embedding_started = Instant::now();
@@ -170,6 +175,8 @@ async fn process_document(
         })
         .collect();
 
+    set_processing_stage(&pool, workspace_id, document_id, "GRAPH_EXTRACTION").await?;
+
     let graph_started = Instant::now();
     let graph_results = if graph_extraction_enabled() {
         tracing::info!(
@@ -202,6 +209,8 @@ async fn process_document(
         elapsed_ms = graph_started.elapsed().as_millis(),
         "Graph extraction stage completed"
     );
+
+    set_processing_stage(&pool, workspace_id, document_id, "SAVING").await?;
 
     let db_started = Instant::now();
     tracing::info!(
@@ -483,6 +492,28 @@ async fn bulk_upsert_document_chunks(
     Ok(())
 }
 
+async fn set_processing_stage(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    document_id: Uuid,
+    stage: &str,
+) -> Result<(), ProcessError> {
+    sqlx::query(
+        r#"
+        UPDATE documents
+        SET processing_stage = $3
+        WHERE id = $1 AND workspace_id = $2
+        "#,
+    )
+    .bind(document_id)
+    .bind(workspace_id)
+    .bind(stage)
+    .execute(pool)
+    .await
+    .map_err(ProcessError::Database)?;
+    Ok(())
+}
+
 async fn mark_document_completed_tx(
     tx: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
@@ -491,7 +522,7 @@ async fn mark_document_completed_tx(
     sqlx::query(
         r#"
         UPDATE documents
-        SET status = 'COMPLETED'
+        SET status = 'COMPLETED', processing_stage = 'DONE'
         WHERE id = $1 AND workspace_id = $2
         "#,
     )
