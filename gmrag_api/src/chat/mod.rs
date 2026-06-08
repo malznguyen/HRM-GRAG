@@ -17,7 +17,7 @@ use self::retrieval::{
     GraphContext, RetrievedChunk, fetch_chat_history, fetch_graph_context, fetch_similar_chunks,
 };
 
-pub const CITATION_INSTRUCTION: &str = "When citing information from a context chunk, you MUST append [chunk:1], [chunk:2], etc., at the end of the sentence based on its CHUNK INDEX number. Do not output raw UUIDs under any circumstance.";
+pub const CITATION_INSTRUCTION: &str = "When citing information from a chunk, you MUST append [chunk:1], [chunk:2], etc., at the exact end of the sentence based on its CHUNK INDEX number. Do not output raw UUIDs under any circumstance.";
 
 static CHUNK_CITATION_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\[chunk:([0-9a-fA-F\-]{36})\]").expect("chunk citation regex must compile")
@@ -264,8 +264,14 @@ fn log_graph_context(workspace_id: Uuid, graph: &GraphContext) {
 
 fn assemble_system_prompt(chunks: &[RetrievedChunk], graph: &GraphContext) -> String {
     let mut prompt = String::from(
-        "You are a knowledgeable assistant for a workspace document and knowledge-graph corpus. \
-Answer using only the retrieved context below when possible. Be concise and accurate.\n\n",
+        "You are a highly intelligent, analytical, and helpful assistant.\n\
+Use the provided Document Chunks and Knowledge Graph Context to answer the user's question comprehensively.\n\
+1. Provide detailed, well-structured answers.\n\
+2. Use markdown formatting, bullet points, and bold text to organize complex information.\n\
+3. When presenting rows and columns, use a valid GitHub-Flavored Markdown table with pipe separators and a header separator row. Never align table columns using spaces.\n\
+4. If the context contains multiple aspects, explain all of them thoroughly.\n\
+5. DO NOT give one-sentence answers unless explicitly asked for a summary.\n\
+6. When citing information from a chunk, you MUST append `[chunk:{index}]` at the exact end of the sentence.\n\n",
     );
 
     prompt.push_str("## Retrieved document chunks\n");

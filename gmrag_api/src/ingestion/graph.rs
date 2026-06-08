@@ -5,14 +5,12 @@ use serde::Deserialize;
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
-pub const GRAPH_EXTRACTION_SYSTEM_PROMPT: &str = r#"Extract the most important Knowledge Graph nodes and edges from this text.
+pub const GRAPH_EXTRACTION_SYSTEM_PROMPT: &str = r#"You are an expert data extractor. Extract comprehensive Knowledge Graph nodes and edges from this text.
 Return ONLY a valid JSON array of objects.
-Keep the response small: at most 8 nodes and 12 edges.
-Use only concrete named entities, concepts, systems, people, organizations, documents, or facts that are explicitly present in the text.
-Do not include generic filler nodes.
-Keep descriptions concise, under 20 words.
-Node objects must have: `type` = "node", `name`, optional `entity_type`, and `description`.
-Edge objects must have: `type` = "edge", `source`, `target`, `relationship`, and `description`."#;
+Extract ALL critical named entities, medical concepts, systems, people, organizations, statistics, and facts. Do not arbitrarily limit the count.
+Node objects must have: `type` = "node", `name`, `entity_type` (e.g., PATHOGEN, METRIC, PERSON), and a detailed `description` (up to 50 words explaining context).
+Edge objects must have: `type` = "edge", `source`, `target`, `relationship` (verb-phrase), and a detailed `description` explaining how they connect.
+Do not hallucinate. Base everything strictly on the provided text."#;
 
 const DEFAULT_DEEPSEEK_URL: &str = "https://api.deepseek.com/chat/completions";
 const DEFAULT_DEEPSEEK_MODEL: &str = "deepseek-v4-flash";
@@ -26,7 +24,7 @@ pub fn deepseek_model() -> String {
 }
 
 fn deepseek_graph_max_tokens() -> u32 {
-    env_u32("DEEPSEEK_GRAPH_MAX_TOKENS", 2048, 256)
+    env_u32("DEEPSEEK_GRAPH_MAX_TOKENS", 32768, 1024)
 }
 
 fn env_u32(name: &str, default: u32, min: u32) -> u32 {
@@ -42,6 +40,9 @@ pub async fn extract_graph_elements(
     chunk_text: &str,
 ) -> Result<Vec<GraphElement>, GraphError> {
     let api_key = std::env::var("DEEPSEEK_API_KEY").map_err(|_| GraphError::MissingApiKey)?;
+    let user_content = format!(
+        "Extract graph elements only from the text inside <text> tags.\n<text>\n{chunk_text}\n</text>"
+    );
 
     let body = DeepseekChatRequest {
         model: deepseek_model(),
@@ -52,7 +53,7 @@ pub async fn extract_graph_elements(
             },
             DeepseekMessage {
                 role: "user",
-                content: chunk_text,
+                content: &user_content,
             },
         ],
         temperature: 0.0,
@@ -79,7 +80,16 @@ pub async fn extract_graph_elements(
         .filter(|content| !content.trim().is_empty())
         .ok_or(GraphError::EmptyResponse)?;
 
-    parse_graph_elements(&content)
+    let elements = parse_graph_elements(&content)?;
+    if elements.is_empty() {
+        tracing::warn!(
+            response_chars = content.len(),
+            response_preview = %preview_for_log(&content, 800),
+            "DeepSeek graph extraction returned zero normalized elements"
+        );
+    }
+
+    Ok(elements)
 }
 
 pub async fn bulk_upsert_graph(
@@ -424,9 +434,10 @@ fn normalize_optional(value: Option<&str>) -> Option<String> {
 }
 
 fn parse_graph_elements(raw: &str) -> Result<Vec<GraphElement>, GraphError> {
-    let json_text = extract_json_array(raw);
-    let raw_elements: Vec<RawGraphElement> =
+    let json_text = extract_json_payload(raw);
+    let value: serde_json::Value =
         serde_json::from_str(&json_text).map_err(GraphError::InvalidJson)?;
+    let raw_elements = raw_graph_elements_from_value(value);
 
     Ok(raw_elements
         .into_iter()
@@ -434,14 +445,32 @@ fn parse_graph_elements(raw: &str) -> Result<Vec<GraphElement>, GraphError> {
         .collect())
 }
 
-fn extract_json_array(raw: &str) -> String {
+fn extract_json_payload(raw: &str) -> String {
     let trimmed = raw.trim();
-    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+    let trimmed = strip_code_fence(trimmed);
+
+    if (trimmed.starts_with('[') && trimmed.ends_with(']'))
+        || (trimmed.starts_with('{') && trimmed.ends_with('}'))
+    {
         return trimmed.to_string();
     }
 
-    if let Some(start) = trimmed.find('[') {
-        if let Some(end) = trimmed.rfind(']') {
+    let array_start = trimmed.find('[');
+    let object_start = trimmed.find('{');
+    let start = match (array_start, object_start) {
+        (Some(array), Some(object)) => Some(array.min(object)),
+        (Some(array), None) => Some(array),
+        (None, Some(object)) => Some(object),
+        (None, None) => None,
+    };
+
+    if let Some(start) = start {
+        let end_char = if trimmed[start..].starts_with('{') {
+            '}'
+        } else {
+            ']'
+        };
+        if let Some(end) = trimmed.rfind(end_char) {
             if end > start {
                 return trimmed[start..=end].to_string();
             }
@@ -451,8 +480,109 @@ fn extract_json_array(raw: &str) -> String {
     trimmed.to_string()
 }
 
+fn strip_code_fence(value: &str) -> &str {
+    let Some(stripped) = value.strip_prefix("```") else {
+        return value;
+    };
+    let Some(line_end) = stripped.find('\n') else {
+        return value;
+    };
+    let without_opening_fence = stripped[line_end + 1..].trim();
+    without_opening_fence
+        .strip_suffix("```")
+        .map(str::trim)
+        .unwrap_or(without_opening_fence)
+}
+
+fn raw_graph_elements_from_value(value: serde_json::Value) -> Vec<RawGraphElement> {
+    match value {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| raw_graph_element_from_value(item, None))
+            .collect(),
+        serde_json::Value::Object(mut map) => {
+            let mut elements = Vec::new();
+
+            if let Some(graph) = remove_case_insensitive(&mut map, "graph") {
+                elements.extend(raw_graph_elements_from_value(graph));
+            }
+            if let Some(nodes) = remove_case_insensitive(&mut map, "nodes") {
+                append_raw_graph_array(&mut elements, nodes, "node");
+            }
+            if let Some(edges) = remove_case_insensitive(&mut map, "edges") {
+                append_raw_graph_array(&mut elements, edges, "edge");
+            }
+            if let Some(relationships) = remove_case_insensitive(&mut map, "relationships") {
+                append_raw_graph_array(&mut elements, relationships, "edge");
+            }
+
+            if elements.is_empty() {
+                raw_graph_element_from_value(serde_json::Value::Object(map), None)
+                    .into_iter()
+                    .collect()
+            } else {
+                elements
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn append_raw_graph_array(
+    elements: &mut Vec<RawGraphElement>,
+    value: serde_json::Value,
+    default_type: &str,
+) {
+    match value {
+        serde_json::Value::Array(items) => {
+            elements.extend(
+                items
+                    .into_iter()
+                    .filter_map(|item| raw_graph_element_from_value(item, Some(default_type))),
+            );
+        }
+        item => {
+            if let Some(element) = raw_graph_element_from_value(item, Some(default_type)) {
+                elements.push(element);
+            }
+        }
+    }
+}
+
+fn raw_graph_element_from_value(
+    value: serde_json::Value,
+    default_type: Option<&str>,
+) -> Option<RawGraphElement> {
+    let mut element: RawGraphElement = serde_json::from_value(value).ok()?;
+    if element.element_type.is_none() {
+        element.element_type = default_type.map(str::to_string);
+    }
+    Some(element)
+}
+
+fn remove_case_insensitive(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<serde_json::Value> {
+    if let Some(value) = map.remove(key) {
+        return Some(value);
+    }
+
+    let matched_key = map
+        .keys()
+        .find(|candidate| candidate.eq_ignore_ascii_case(key))
+        .cloned()?;
+    map.remove(&matched_key)
+}
+
 fn normalize_graph_element(raw: RawGraphElement) -> Option<GraphElement> {
-    match raw.element_type.as_deref() {
+    let element_type = raw
+        .element_type
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase);
+
+    match element_type.as_deref() {
         Some("node") => {
             let name = raw.name?.trim().to_string();
             if name.is_empty() {
@@ -460,8 +590,8 @@ fn normalize_graph_element(raw: RawGraphElement) -> Option<GraphElement> {
             }
             Some(GraphElement::Node {
                 name,
-                entity_type: raw.entity_type,
-                description: raw.description,
+                entity_type: normalize_optional(raw.entity_type.as_deref()),
+                description: normalize_optional(raw.description.as_deref()),
             })
         }
         Some("edge") => {
@@ -479,11 +609,22 @@ fn normalize_graph_element(raw: RawGraphElement) -> Option<GraphElement> {
                 relationship,
                 source,
                 target,
-                description: raw.description,
+                description: normalize_optional(raw.description.as_deref()),
             })
         }
         _ => None,
     }
+}
+
+fn preview_for_log(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .take(max_chars)
+        .map(|ch| match ch {
+            '\n' | '\r' | '\t' => ' ',
+            _ => ch,
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -503,14 +644,19 @@ pub enum GraphElement {
 
 #[derive(Debug, Deserialize)]
 struct RawGraphElement {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", alias = "element_type", alias = "kind")]
     element_type: Option<String>,
+    #[serde(alias = "label", alias = "entity", alias = "entity_name")]
     name: Option<String>,
+    #[serde(alias = "relation", alias = "predicate")]
     relationship: Option<String>,
+    #[serde(alias = "details")]
     description: Option<String>,
-    #[serde(rename = "entity_type")]
+    #[serde(rename = "entity_type", alias = "entityType", alias = "category")]
     entity_type: Option<String>,
+    #[serde(alias = "from", alias = "source_node")]
     source: Option<String>,
+    #[serde(alias = "to", alias = "target_node")]
     target: Option<String>,
 }
 
@@ -572,3 +718,80 @@ impl std::fmt::Display for GraphError {
 }
 
 impl std::error::Error for GraphError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_fenced_json_with_case_insensitive_type() {
+        let raw = r#"```json
+[
+  {
+    "type": "Node",
+    "name": "ICU",
+    "entity_type": "SYSTEM",
+    "description": "Intensive care unit"
+  }
+]
+```"#;
+
+        let elements = parse_graph_elements(raw).expect("graph JSON should parse");
+
+        assert_eq!(elements.len(), 1);
+        match &elements[0] {
+            GraphElement::Node {
+                name,
+                entity_type,
+                description,
+            } => {
+                assert_eq!(name, "ICU");
+                assert_eq!(entity_type.as_deref(), Some("SYSTEM"));
+                assert_eq!(description.as_deref(), Some("Intensive care unit"));
+            }
+            GraphElement::Edge { .. } => panic!("expected node"),
+        }
+    }
+
+    #[test]
+    fn parses_wrapped_nodes_and_edges() {
+        let raw = r#"{
+  "nodes": [
+    {
+      "name": "Ferritin",
+      "entityType": "METRIC",
+      "description": "Monitoring marker"
+    }
+  ],
+  "edges": [
+    {
+      "source": "Ferritin",
+      "target": "MAS",
+      "relation": "helps assess",
+      "details": "Rising ferritin prompts consideration of MAS."
+    }
+  ]
+}"#;
+
+        let elements = parse_graph_elements(raw).expect("wrapped graph JSON should parse");
+
+        assert_eq!(elements.len(), 2);
+        assert!(matches!(
+            &elements[0],
+            GraphElement::Node {
+                name,
+                entity_type,
+                ..
+            } if name == "Ferritin" && entity_type.as_deref() == Some("METRIC")
+        ));
+        assert!(matches!(
+            &elements[1],
+            GraphElement::Edge {
+                source,
+                target,
+                relationship,
+                ..
+            } if source == "Ferritin" && target == "MAS" && relationship == "helps assess"
+        ));
+    }
+}

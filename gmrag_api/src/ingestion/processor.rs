@@ -356,9 +356,10 @@ async fn extract_graph_for_chunks(
 
         async move {
             let started = Instant::now();
+            let text_chars = text.chars().count();
             let result = extract_graph_with_retry(&client, &text, timeout_duration, retries).await;
 
-            (index, result, started.elapsed().as_millis())
+            (index, result, started.elapsed().as_millis(), text_chars)
         }
     }))
     .buffer_unordered(concurrency);
@@ -367,17 +368,28 @@ async fn extract_graph_for_chunks(
     let mut failures = 0usize;
 
     let completed = timeout(stage_timeout, async {
-        while let Some((index, result, elapsed_ms)) = pending.next().await {
+        while let Some((index, result, elapsed_ms, text_chars)) = pending.next().await {
             match result {
                 Ok(elements) => {
-                    tracing::info!(
-                        %workspace_id,
-                        %document_id,
-                        chunk_index = index,
-                        graph_items = elements.len(),
-                        elapsed_ms,
-                        "Graph extraction chunk completed"
-                    );
+                    if elements.is_empty() {
+                        tracing::warn!(
+                            %workspace_id,
+                            %document_id,
+                            chunk_index = index,
+                            text_chars,
+                            elapsed_ms,
+                            "Graph extraction chunk produced zero items"
+                        );
+                    } else {
+                        tracing::info!(
+                            %workspace_id,
+                            %document_id,
+                            chunk_index = index,
+                            graph_items = elements.len(),
+                            elapsed_ms,
+                            "Graph extraction chunk completed"
+                        );
+                    }
                     graph_results.push((index, elements));
                 }
                 Err(err) => {
