@@ -1,0 +1,98 @@
+name: "GMRAG Authorization Model Tests"
+model_file: "./model.fga"
+tuples:
+  # Platform Setup
+  - user: user:p_admin
+    relation: admin
+    object: platform:system
+
+  # Tenant Setup
+  - user: platform:system
+    relation: platform
+    object: tenant:t1
+  - user: user:t_owner
+    relation: owner
+    object: tenant:t1
+
+  # Workspace Setup
+  - user: tenant:t1
+    relation: tenant
+    object: workspace:w1
+  - user: user:w_admin
+    relation: admin
+    object: workspace:w1
+  - user: user:w_member
+    relation: member
+    object: workspace:w1
+
+  # Document Setup
+  - user: workspace:w1
+    relation: workspace
+    object: document:d1
+  - user: user:w_admin
+    relation: owner
+    object: document:d1
+  - user: user:w_member
+    relation: explicit_viewer
+    object: document:d1
+
+tests:
+  - name: "Platform Admin Quyền hạn"
+    check:
+      - user: user:p_admin
+        object: platform:system
+        assertions:
+          admin: true
+      - user: user:p_admin
+        object: tenant:t1
+        assertions:
+          admin: true
+      - user: user:p_admin
+        object: workspace:w1
+        assertions:
+          admin: false
+          member: false
+
+  - name: "Tenant Owner Quyền hạn"
+    check:
+      - user: user:t_owner
+        object: tenant:t1
+        assertions:
+          owner: true
+          admin: true
+      - user: user:t_owner
+        object: workspace:w1
+        assertions:
+          tenant_owner: true
+          admin: true
+          member: true
+          can_assign_role: true
+          can_manage_member: true
+      - user: user:t_owner
+        object: document:d1
+        assertions:
+          bypass_viewer: true
+
+  - name: "Workspace Admin Quyền hạn"
+    check:
+      - user: user:w_admin
+        object: workspace:w1
+        assertions:
+          admin: true
+          member: true
+          can_manage_member: true
+          can_assign_role: false
+      - user: user:w_admin
+        object: document:d1
+        assertions:
+          bypass_viewer: false
+
+  - name: "Workspace Member Quyền hạn"
+    check:
+      - user: user:w_member
+        object: workspace:w1
+        assertions:
+          admin: false
+          member: true
+          can_manage_member: false
+          can_assign_role: false

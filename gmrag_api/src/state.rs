@@ -4,6 +4,8 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 use crate::auth::jwt::JwtValidator;
+use crate::auth::authz::AuthzClient;
+use crate::auth::keycloak::KeycloakClient;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -11,6 +13,8 @@ pub struct AppState {
     pub jwt: Arc<JwtValidator>,
     pub upload_dir: PathBuf,
     pub ingestion_limiter: Arc<Semaphore>,
+    pub authz_client: AuthzClient,
+    pub keycloak_client: KeycloakClient,
 }
 
 impl AppState {

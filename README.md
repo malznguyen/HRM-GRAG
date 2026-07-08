@@ -19,8 +19,9 @@
 
 Every API request is authenticated with a Clerk JWT. Workspace membership is enforced in PostgreSQL via `workspace_members` with roles `ADMIN` and `USER`:
 
-- **ADMIN** (owner/admin): create workspaces, upload and delete documents, invite and remove members, delete workspaces.
-- **USER** (member): list documents, query chat, view graph, read chat history; cannot upload, delete documents, or manage members.
+- **Super admin** (`users.is_super_admin = true`): create and delete workspaces.
+- **ADMIN** (workspace role): upload/delete documents, invite/remove members, view chat/graph/document data within the workspace.
+- **USER** (workspace role): list documents, query chat, view graph, read chat history; cannot upload, delete documents, or manage members.
 
 All queries scope data by `workspace_id`, so tenants never cross workspace boundaries.
 
@@ -35,8 +36,11 @@ PDF uploads run asynchronously with a global document concurrency limit (`GMRAG_
 | `EMBEDDING` | Tiktoken chunking + concurrent Ollama batch embeddings |
 | `GRAPH_EXTRACTION` | Bounded concurrent DeepSeek graph node/edge extraction per chunk |
 | `SAVING` | Transactional persist of chunks, vectors, and graph elements |
+| `DONE` | Final stage when status becomes `COMPLETED` |
 
-Status transitions: `PROCESSING` → `COMPLETED` or `FAILED`. Failed runs update status without leaving partial graph sources inconsistent when constraints apply.
+Status transitions: `PROCESSING` → `COMPLETED` or `FAILED`. Failed documents can be manually re-queued via `POST /workspaces/{workspace_id}/documents/{document_id}/retry` (admin-only, source PDF must still exist on disk).
+
+Note: current OCR fallback is a placeholder (`mock_ocr_text`) for low-text pages.
 
 ### Idempotent database transactions
 
@@ -281,11 +285,19 @@ npm run dev
 
 Open **`http://localhost:3000`**, sign in with Clerk, sync the user (`POST /users/sync` is triggered from the app), create a workspace, upload PDFs (admin), and use chat/graph views.
 
+Workspace creation/deletion are gated by `users.is_super_admin`. For local bootstrapping, promote your user after first sign-in/sync:
+
+```bash
+docker compose exec postgres psql -U gmrag_user -d gmrag -c "UPDATE users SET is_super_admin = TRUE WHERE email = 'you@example.com';"
+```
+
+Adjust user/database names if you changed `POSTGRES_USER` / `POSTGRES_DB`.
+
 ### 5.6 First-time verification checklist
 
 | Step | Expected result |
 |------|-----------------|
-| `docker compose ps` | `postgres` healthy on port 5432 |
+| `docker compose ps` | `postgres` is `Up` on port 5432 |
 | `curl :8080/health` | `{"status":"ok","db":"connected"}` |
 | Ollama model | `nomic-embed-text` listed in `ollama list` |
 | Upload PDF (admin) | Document status moves through stages → `COMPLETED` |
@@ -306,20 +318,21 @@ Base URL: `http://127.0.0.1:8080` (configurable in production).
 | `GET` | `/health` | Public | Liveness and DB connectivity |
 | `POST` | `/api/webhooks/clerk` | Svix secret | Clerk user lifecycle webhooks |
 | `GET` | `/users/me` | Auth | Current user profile |
-| `POST` | `/users/sync` | Auth | Upsert user from Clerk claims |
+| `POST` | `/users/sync` | Auth | Upsert/reconcile user from request email |
 | `GET` | `/workspaces` | Auth | List workspaces for current user |
-| `POST` | `/workspaces` | Auth | Create workspace (creator becomes `ADMIN`) |
-| `DELETE` | `/workspaces/{workspace_id}` | Admin | Delete workspace |
+| `POST` | `/workspaces` | Super admin | Create workspace (creator becomes `ADMIN`) |
+| `DELETE` | `/workspaces/{workspace_id}` | Super admin | Delete workspace |
 | `GET` | `/workspaces/{workspace_id}/members` | Member | List members |
 | `POST` | `/workspaces/{workspace_id}/members` | Admin | Invite/add member (`role`: `admin`/`owner` → `ADMIN`, `user`/`member` → `USER`) |
 | `DELETE` | `/workspaces/{workspace_id}/members/{member_id}` | Admin | Remove member |
 | `GET` | `/workspaces/{workspace_id}/documents` | Member | List documents and processing status |
-| `POST` | `/workspaces/{workspace_id}/documents/upload` | Admin | Multipart PDF upload (`file` field, max 50 MB) |
+| `POST` | `/workspaces/{workspace_id}/documents/upload` | Admin | Multipart PDF upload (`file` field, 50 MiB total request limit) |
 | `DELETE` | `/workspaces/{workspace_id}/documents/{document_id}` | Admin | Delete document + orphan graph cleanup |
+| `POST` | `/workspaces/{workspace_id}/documents/{document_id}/retry` | Admin | Retry ingestion for `FAILED` document |
 | `GET` | `/workspaces/{workspace_id}/documents/{document_id}/preview` | Member | Aggregated chunk text preview |
 | `GET` | `/workspaces/{workspace_id}/chunks/{chunk_id}` | Member | Single chunk text (citation target) |
 | `POST` | `/workspaces/{workspace_id}/chat` | Member | **SSE** streaming RAG chat |
-| `GET` | `/workspaces/{workspace_id}/chat/history` | Member | Recent messages for active session |
+| `GET` | `/workspaces/{workspace_id}/chat/history` | Member | Messages for `session_id` query parameter |
 | `GET` | `/workspaces/{workspace_id}/chat/sessions` | Member | List chat sessions |
 | `GET` | `/workspaces/{workspace_id}/chat/sessions/{session_id}/messages` | Member | Messages with citation UUIDs |
 | `DELETE` | `/workspaces/{workspace_id}/chat/sessions/{session_id}` | Member | Delete session |
@@ -327,7 +340,7 @@ Base URL: `http://127.0.0.1:8080` (configurable in production).
 
 ### Chat streaming (`POST /workspaces/{workspace_id}/chat`)
 
-- **Content-Type:** `application/json` body with user message and optional `session_id`.
+- **Content-Type:** `application/json` body with required `session_id` and `message`.
 - **Response:** `text/event-stream` (SSE) with token deltas; final assistant message persisted with resolved citation UUIDs.
 - **RAG flow:** embed query (Ollama) → top-5 chunk vector search → graph context → DeepSeek stream with index-based citations.
 

@@ -10,8 +10,7 @@ use sqlx::PgPool;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::auth::extractor::AuthUser;
-use crate::auth::rbac::{require_workspace_admin, require_workspace_member};
+use crate::auth::authz::{Authz, Relation, Object, TupleKey};
 use crate::invite::{invite_placeholder_user_id, normalize_email};
 use crate::state::AppState;
 
@@ -29,15 +28,21 @@ pub struct AddWorkspaceMemberRequest {
     pub role: String,
 }
 
+#[derive(Deserialize)]
+pub struct UpdateWorkspaceMemberRoleRequest {
+    pub role: String,
+}
+
+/// GET /workspaces/{workspace_id}/members
+/// Xem danh sách thành viên workspace
 pub async fn list_workspace_members(
     State(state): State<AppState>,
-    auth: AuthUser,
+    authz: Authz,
     Path(workspace_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if let Err(status) =
-        require_workspace_member(&state.pool, workspace_id, &auth.user_id).await
-    {
-        return status.into_response();
+    // Check Member
+    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(workspace_id)).await {
+        return err.into_response();
     }
 
     match fetch_workspace_members(&state.pool, workspace_id).await {
@@ -45,7 +50,7 @@ pub async fn list_workspace_members(
         Err(err) => {
             error!(
                 error = %err,
-                user_id = %auth.user_id,
+                user_id = %authz.user_id,
                 workspace_id = %workspace_id,
                 "Failed to list workspace members"
             );
@@ -54,16 +59,17 @@ pub async fn list_workspace_members(
     }
 }
 
+/// POST /workspaces/{workspace_id}/members
+/// Thêm thành viên mới vào workspace
 pub async fn add_workspace_member(
     State(state): State<AppState>,
-    auth: AuthUser,
+    authz: Authz,
     Path(workspace_id): Path<Uuid>,
     Json(body): Json<AddWorkspaceMemberRequest>,
 ) -> impl IntoResponse {
-    if let Err((status, message)) =
-        require_workspace_admin(&state.pool, workspace_id, &auth.user_id).await
-    {
-        return (status, message).into_response();
+    // Check CanManageMember
+    if let Err(err) = authz.require_relation(Relation::CanManageMember, &Object::Workspace(workspace_id)).await {
+        return err.into_response();
     }
 
     let email = normalize_email(&body.email);
@@ -83,14 +89,30 @@ pub async fn add_workspace_member(
     };
 
     match insert_workspace_member(&state.pool, workspace_id, &email, role).await {
-        Ok(member) => (StatusCode::CREATED, Json(member)).into_response(),
+        Ok(member) => {
+            // Ghi quyền vào OpenFGA
+            let fga_relation = if role == "ADMIN" {
+                Relation::Admin
+            } else {
+                Relation::Member
+            };
+            if let Err(err) = state.authz_client.write_tuple(
+                &format!("user:{}", member.id),
+                fga_relation,
+                &Object::Workspace(workspace_id)
+            ).await {
+                error!(error = %err, workspace_id = %workspace_id, user_id = %member.id, "Failed to write workspace member to OpenFGA");
+            }
+
+            (StatusCode::CREATED, Json(member)).into_response()
+        }
         Err(MemberInsertError::AlreadyMember) => {
             (StatusCode::CONFLICT, "User is already a workspace member").into_response()
         }
         Err(MemberInsertError::Database(err)) => {
             error!(
                 error = %err,
-                user_id = %auth.user_id,
+                user_id = %authz.user_id,
                 workspace_id = %workspace_id,
                 email = %email,
                 "Failed to add workspace member"
@@ -100,24 +122,129 @@ pub async fn add_workspace_member(
     }
 }
 
-pub async fn remove_workspace_member(
+/// PATCH /workspaces/{workspace_id}/members/{member_id}/role
+/// Thay đổi role thành viên workspace (chỉ Tenant Owner có quyền)
+pub async fn update_workspace_member_role(
     State(state): State<AppState>,
-    auth: AuthUser,
+    authz: Authz,
     Path((workspace_id, member_id)): Path<(Uuid, String)>,
+    Json(body): Json<UpdateWorkspaceMemberRoleRequest>,
 ) -> impl IntoResponse {
-    if let Err((status, message)) =
-        require_workspace_admin(&state.pool, workspace_id, &auth.user_id).await
-    {
-        return (status, message).into_response();
+    // Check CanAssignRole (chỉ Tenant Owner mới có quyền đổi role)
+    if let Err(err) = authz.require_relation(Relation::CanAssignRole, &Object::Workspace(workspace_id)).await {
+        return err.into_response();
     }
 
-    if member_id == auth.user_id {
+    let new_role = match normalize_member_role(&body.role) {
+        Some(role) => role,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Role must be owner or member (admin/user also accepted)",
+            )
+                .into_response();
+        }
+    };
+
+    // Lấy role hiện tại của user trong DB
+    let current_role: Option<String> = sqlx::query_scalar(
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2"
+    )
+    .bind(workspace_id)
+    .bind(&member_id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let Some(current_role_str) = current_role else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    if current_role_str == new_role {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    let mut tx = match state.pool.begin().await {
+        Ok(t) => t,
+        Err(err) => {
+            error!(error = %err, "Failed to start transaction");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    // Cập nhật SQL
+    if let Err(err) = sqlx::query(
+        "UPDATE workspace_members SET role = $1 WHERE workspace_id = $2 AND user_id = $3"
+    )
+    .bind(new_role)
+    .bind(workspace_id)
+    .bind(&member_id)
+    .execute(&mut *tx)
+    .await {
+        error!(error = %err, workspace_id = %workspace_id, user_id = %member_id, "Failed to update member role in DB");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    // Cập nhật OpenFGA bằng cách thay thế tuple cũ bằng tuple mới
+    let old_relation = if current_role_str == "ADMIN" { Relation::Admin } else { Relation::Member };
+    let new_relation = if new_role == "ADMIN" { Relation::Admin } else { Relation::Member };
+
+    if let Err(err) = state.authz_client.write_tuples(
+        vec![TupleKey {
+            user: format!("user:{}", member_id),
+            relation: new_relation.as_str().to_string(),
+            object: Object::Workspace(workspace_id).to_string(),
+        }],
+        vec![TupleKey {
+            user: format!("user:{}", member_id),
+            relation: old_relation.as_str().to_string(),
+            object: Object::Workspace(workspace_id).to_string(),
+        }],
+    ).await {
+        error!(error = %err, workspace_id = %workspace_id, user_id = %member_id, "Failed to sync role update to OpenFGA");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    if let Err(err) = tx.commit().await {
+        error!(error = %err, "Failed to commit transaction");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// DELETE /workspaces/{workspace_id}/members/{member_id}
+/// Xoá thành viên khỏi workspace
+pub async fn remove_workspace_member(
+    State(state): State<AppState>,
+    authz: Authz,
+    Path((workspace_id, member_id)): Path<(Uuid, String)>,
+) -> impl IntoResponse {
+    // Check CanManageMember
+    if let Err(err) = authz.require_relation(Relation::CanManageMember, &Object::Workspace(workspace_id)).await {
+        return err.into_response();
+    }
+
+    if member_id == authz.user_id {
         return (
             StatusCode::BAD_REQUEST,
             "You cannot remove yourself from the workspace",
         )
             .into_response();
     }
+
+    let role: Option<String> = sqlx::query_scalar(
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2"
+    )
+    .bind(workspace_id)
+    .bind(&member_id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let Some(role_str) = role else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
 
     let result = sqlx::query(
         r#"
@@ -132,11 +259,27 @@ pub async fn remove_workspace_member(
 
     match result {
         Ok(outcome) if outcome.rows_affected() == 0 => StatusCode::NOT_FOUND.into_response(),
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            // Xoá tuple trong OpenFGA
+            let fga_relation = if role_str == "ADMIN" {
+                Relation::Admin
+            } else {
+                Relation::Member
+            };
+            if let Err(err) = state.authz_client.delete_tuple(
+                &format!("user:{}", member_id),
+                fga_relation,
+                &Object::Workspace(workspace_id)
+            ).await {
+                error!(error = %err, workspace_id = %workspace_id, user_id = %member_id, "Failed to delete workspace member from OpenFGA");
+            }
+
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(err) => {
             error!(
                 error = %err,
-                user_id = %auth.user_id,
+                user_id = %authz.user_id,
                 workspace_id = %workspace_id,
                 member_id = %member_id,
                 "Failed to remove workspace member"
@@ -242,7 +385,7 @@ async fn insert_workspace_member(
 fn normalize_member_role(role: &str) -> Option<&'static str> {
     match role.trim().to_ascii_lowercase().as_str() {
         "owner" | "admin" => Some("ADMIN"),
-        "member" | "user" => Some("USER"),
+        "member" | "user" => Some("MEMBER"),
         _ => None,
     }
 }

@@ -15,8 +15,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::auth::extractor::AuthUser;
-use crate::auth::rbac::require_workspace_member;
+use crate::auth::authz::{Authz, Relation, Object};
 use crate::chat::deepseek::{DeepseekTokenParser, next_stream_token};
 use crate::chat::retrieval::fetch_session_chat_messages;
 use crate::chat::{
@@ -54,14 +53,14 @@ pub struct ChatRequest {
 
 pub async fn list_workspace_chat_sessions(
     State(state): State<AppState>,
-    auth: AuthUser,
+    authz: Authz,
     Path(workspace_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if let Err(status) = require_workspace_member(&state.pool, workspace_id, &auth.user_id).await {
-        return status.into_response();
+    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(workspace_id)).await {
+        return err.into_response();
     }
 
-    match list_user_chat_sessions(&state.pool, workspace_id, &auth.user_id).await {
+    match list_user_chat_sessions(&state.pool, workspace_id, &authz.user_id).await {
         Ok(sessions) => Json(sessions).into_response(),
         Err(err) => {
             tracing::error!(error = %err, "Failed to list chat sessions");
@@ -72,20 +71,18 @@ pub async fn list_workspace_chat_sessions(
 
 pub async fn get_workspace_chat_session_messages(
     State(state): State<AppState>,
-    auth: AuthUser,
+    authz: Authz,
     Path(path): Path<WorkspaceChatSessionPath>,
 ) -> impl IntoResponse {
-    if let Err(status) =
-        require_workspace_member(&state.pool, path.workspace_id, &auth.user_id).await
-    {
-        return status.into_response();
+    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(path.workspace_id)).await {
+        return err.into_response();
     }
 
     match verify_chat_session_owner(
         &state.pool,
         path.session_id,
         path.workspace_id,
-        &auth.user_id,
+        &authz.user_id,
     )
     .await
     {
@@ -104,7 +101,7 @@ pub async fn get_workspace_chat_session_messages(
         &state.pool,
         path.session_id,
         path.workspace_id,
-        &auth.user_id,
+        &authz.user_id,
     )
     .await
     {
@@ -130,20 +127,18 @@ pub async fn get_workspace_chat_session_messages(
 
 pub async fn delete_workspace_chat_session(
     State(state): State<AppState>,
-    auth: AuthUser,
+    authz: Authz,
     Path(path): Path<WorkspaceChatSessionPath>,
 ) -> impl IntoResponse {
-    if let Err(status) =
-        require_workspace_member(&state.pool, path.workspace_id, &auth.user_id).await
-    {
-        return status.into_response();
+    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(path.workspace_id)).await {
+        return err.into_response();
     }
 
     match delete_chat_session(
         &state.pool,
         path.session_id,
         path.workspace_id,
-        &auth.user_id,
+        &authz.user_id,
     )
     .await
     {
@@ -161,19 +156,19 @@ pub async fn delete_workspace_chat_session(
 
 pub async fn workspace_chat_history(
     State(state): State<AppState>,
-    auth: AuthUser,
+    authz: Authz,
     Path(workspace_id): Path<Uuid>,
     Query(query): Query<ChatHistoryQuery>,
 ) -> impl IntoResponse {
-    if let Err(status) = require_workspace_member(&state.pool, workspace_id, &auth.user_id).await {
-        return status.into_response();
+    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(workspace_id)).await {
+        return err.into_response();
     }
 
     match verify_chat_session_owner(
         &state.pool,
         query.session_id,
         workspace_id,
-        &auth.user_id,
+        &authz.user_id,
     )
     .await
     {
@@ -192,7 +187,7 @@ pub async fn workspace_chat_history(
         &state.pool,
         query.session_id,
         workspace_id,
-        &auth.user_id,
+        &authz.user_id,
     )
     .await
     {
@@ -218,24 +213,24 @@ pub async fn workspace_chat_history(
 
 pub async fn workspace_chat(
     State(state): State<AppState>,
-    auth: AuthUser,
+    authz: Authz,
     Path(workspace_id): Path<Uuid>,
     Json(body): Json<ChatRequest>,
 ) -> impl IntoResponse {
     tracing::info!(
         %workspace_id,
-        user_id = %auth.user_id,
+        user_id = %authz.user_id,
         session_id = %body.session_id,
         "Chat request received"
     );
 
-    if let Err(status) = require_workspace_member(&state.pool, workspace_id, &auth.user_id).await {
+    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(workspace_id)).await {
         tracing::warn!(
             %workspace_id,
-            user_id = %auth.user_id,
+            user_id = %authz.user_id,
             "Chat request denied: user is not a workspace member"
         );
-        return status.into_response();
+        return err.into_response();
     }
 
     let message = body.message.trim().to_string();
@@ -248,7 +243,7 @@ pub async fn workspace_chat(
         &state.pool,
         body.session_id,
         workspace_id,
-        &auth.user_id,
+        &authz.user_id,
         &session_title,
     )
     .await

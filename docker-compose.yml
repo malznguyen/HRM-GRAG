@@ -1,4 +1,5 @@
 services:
+  # DB chính cho ứng dụng GMRAG
   postgres:
     image: pgvector/pgvector:pg16
     ports:
@@ -9,3 +10,46 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-gmrag}
     volumes:
       - ./.docker_data/postgres:/var/lib/postgresql/data
+
+  # DB riêng cho OpenFGA (không dùng chung DB với ứng dụng chính)
+  openfga-postgres:
+    image: postgres:16
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: ${OPENFGA_DB_USER:-fga_user}
+      POSTGRES_PASSWORD: ${OPENFGA_DB_PASSWORD:-fga_password}
+      POSTGRES_DB: ${OPENFGA_DB_NAME:-openfga}
+    volumes:
+      - ./.docker_data/openfga_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fga_user -d openfga"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Container chạy migrate database cho OpenFGA trước khi start service chính
+  openfga-migrate:
+    image: openfga/openfga:v1.5.0
+    command: migrate
+    environment:
+      - OPENFGA_DATASTORE_ENGINE=postgres
+      - OPENFGA_DATASTORE_URI=postgres://fga_user:fga_password@openfga-postgres:5432/openfga?sslmode=disable
+    depends_on:
+      openfga-postgres:
+        condition: service_healthy
+
+  # Service OpenFGA chính
+  openfga:
+    image: openfga/openfga:v1.5.0
+    command: run
+    ports:
+      - "8081:8080" # Map cổng 8081 trên host để tránh xung đột với cổng 8080 của API backend GMRAG
+      - "8082:8081" # Cổng gRPC
+    environment:
+      - OPENFGA_DATASTORE_ENGINE=postgres
+      - OPENFGA_DATASTORE_URI=postgres://fga_user:fga_password@openfga-postgres:5432/openfga?sslmode=disable
+      - OPENFGA_PLAYGROUND_ENABLED=true
+    depends_on:
+      openfga-migrate:
+        condition: service_completed_successfully

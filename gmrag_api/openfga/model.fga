@@ -1,0 +1,30 @@
+model
+  schema 1.1
+
+type user
+
+type platform
+  relations
+    define admin: [user]
+
+type tenant
+  relations
+    define platform: [platform]
+    define owner: [user]
+    define admin: owner or admin from platform
+
+type workspace
+  relations
+    define tenant: [tenant]
+    define tenant_owner: owner from tenant
+    define admin: [user] or tenant_owner
+    define member: [user] or admin
+    define can_assign_role: tenant_owner
+    define can_manage_member: [user] or admin
+
+type document
+  relations
+    define workspace: [workspace]
+    define owner: [user]
+    define explicit_viewer: [user]
+    define bypass_viewer: tenant_owner from workspace

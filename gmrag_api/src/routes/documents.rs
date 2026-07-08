@@ -10,8 +10,7 @@ use sqlx::PgPool;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::auth::extractor::AuthUser;
-use crate::auth::rbac::{require_workspace_admin, require_workspace_member};
+use crate::auth::authz::{Authz, Relation, Object};
 use crate::ingestion::processor::spawn_document_processing;
 use crate::state::AppState;
 
@@ -61,11 +60,11 @@ pub struct ChunkResponse {
 
 pub async fn get_document_chunk(
     State(state): State<AppState>,
-    auth: AuthUser,
+    authz: Authz,
     Path((workspace_id, chunk_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    if let Err(status) = require_workspace_member(&state.pool, workspace_id, &auth.user_id).await {
-        return status.into_response();
+    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(workspace_id)).await {
+        return err.into_response();
     }
 
     match fetch_workspace_chunk(&state.pool, workspace_id, chunk_id).await {
@@ -74,7 +73,7 @@ pub async fn get_document_chunk(
         Err(err) => {
             error!(
                 error = %err,
-                user_id = %auth.user_id,
+                user_id = %authz.user_id,
                 workspace_id = %workspace_id,
                 chunk_id = %chunk_id,
                 "Failed to fetch document chunk"
@@ -104,11 +103,11 @@ async fn fetch_workspace_chunk(
 
 pub async fn get_document_preview(
     State(state): State<AppState>,
-    auth: AuthUser,
+    authz: Authz,
     Path((workspace_id, document_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    if let Err(status) = require_workspace_member(&state.pool, workspace_id, &auth.user_id).await {
-        return status.into_response();
+    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(workspace_id)).await {
+        return err.into_response();
     }
 
     let document_status: Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
@@ -130,7 +129,7 @@ pub async fn get_document_preview(
         Err(err) => {
             error!(
                 error = %err,
-                user_id = %auth.user_id,
+                user_id = %authz.user_id,
                 workspace_id = %workspace_id,
                 document_id = %document_id,
                 "Failed to verify document before preview"
@@ -144,7 +143,7 @@ pub async fn get_document_preview(
         Err(err) => {
             error!(
                 error = %err,
-                user_id = %auth.user_id,
+                user_id = %authz.user_id,
                 workspace_id = %workspace_id,
                 document_id = %document_id,
                 "Failed to fetch document preview"
@@ -156,11 +155,11 @@ pub async fn get_document_preview(
 
 pub async fn list_documents(
     State(state): State<AppState>,
-    auth: AuthUser,
+    authz: Authz,
     Path(workspace_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if let Err(status) = require_workspace_member(&state.pool, workspace_id, &auth.user_id).await {
-        return status.into_response();
+    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(workspace_id)).await {
+        return err.into_response();
     }
 
     match fetch_workspace_documents(&state.pool, workspace_id).await {
@@ -168,7 +167,7 @@ pub async fn list_documents(
         Err(err) => {
             error!(
                 error = %err,
-                user_id = %auth.user_id,
+                user_id = %authz.user_id,
                 workspace_id = %workspace_id,
                 "Failed to list documents"
             );
@@ -179,13 +178,11 @@ pub async fn list_documents(
 
 pub async fn delete_document(
     State(state): State<AppState>,
-    auth: AuthUser,
+    authz: Authz,
     Path((workspace_id, document_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    if let Err((status, message)) =
-        require_workspace_admin(&state.pool, workspace_id, &auth.user_id).await
-    {
-        return (status, message).into_response();
+    if let Err(err) = authz.require_relation(Relation::Admin, &Object::Workspace(workspace_id)).await {
+        return err.into_response();
     }
 
     let mut tx = match state.pool.begin().await {
@@ -193,7 +190,7 @@ pub async fn delete_document(
         Err(err) => {
             error!(
                 error = %err,
-                user_id = %auth.user_id,
+                user_id = %authz.user_id,
                 workspace_id = %workspace_id,
                 document_id = %document_id,
                 "Failed to start document delete transaction"
@@ -220,7 +217,7 @@ pub async fn delete_document(
         Err(err) => {
             error!(
                 error = %err,
-                user_id = %auth.user_id,
+                user_id = %authz.user_id,
                 workspace_id = %workspace_id,
                 document_id = %document_id,
                 "Failed to verify document before delete"
@@ -315,7 +312,7 @@ pub async fn delete_document(
         Err(err) => {
             error!(
                 error = %err,
-                user_id = %auth.user_id,
+                user_id = %authz.user_id,
                 workspace_id = %workspace_id,
                 document_id = %document_id,
                 "Failed to delete document and graph provenance"
@@ -323,6 +320,104 @@ pub async fn delete_document(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+pub async fn retry_document_ingestion(
+    State(state): State<AppState>,
+    authz: Authz,
+    Path((workspace_id, document_id)): Path<(Uuid, Uuid)>,
+) -> impl IntoResponse {
+    if let Err(err) = authz.require_relation(Relation::Admin, &Object::Workspace(workspace_id)).await {
+        return err.into_response();
+    }
+
+    // Only documents stuck in FAILED can be re-queued; anything else would
+    // race with an in-flight ingestion.
+    let document_status: Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
+        r#"
+        SELECT status
+        FROM documents
+        WHERE id = $1 AND workspace_id = $2
+        "#,
+    )
+    .bind(document_id)
+    .bind(workspace_id)
+    .fetch_optional(&state.pool)
+    .await;
+
+    match document_status {
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(Some(status)) if status == "FAILED" => {}
+        Ok(Some(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                "Document is not in a failed state",
+            )
+                .into_response();
+        }
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to verify document before retry"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
+    // The original PDF is kept on disk until the document is deleted, so a
+    // FAILED document can be reprocessed from its existing upload.
+    let file_path = state
+        .upload_dir
+        .join(workspace_id.to_string())
+        .join(format!("{document_id}.pdf"));
+
+    match tokio::fs::metadata(&file_path).await {
+        Ok(_) => {}
+        Err(_) => {
+            return (
+                StatusCode::GONE,
+                "Document source file is missing",
+            )
+                .into_response();
+        }
+    }
+
+    if let Err(err) = sqlx::query(
+        r#"
+        UPDATE documents
+        SET status = 'PROCESSING', processing_stage = 'QUEUED'
+        WHERE id = $1 AND workspace_id = $2
+        "#,
+    )
+    .bind(document_id)
+    .bind(workspace_id)
+    .execute(&state.pool)
+    .await
+    {
+        error!(
+            error = %err,
+            user_id = %authz.user_id,
+            workspace_id = %workspace_id,
+            document_id = %document_id,
+            "Failed to reset document status before retry"
+        );
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    // Ingestion upserts chunks/graph on conflict, so any partial data from
+    // the failed run is overwritten rather than duplicated.
+    spawn_document_processing(
+        state.pool.clone(),
+        workspace_id,
+        document_id,
+        file_path,
+        state.ingestion_limiter.clone(),
+    );
+
+    StatusCode::ACCEPTED.into_response()
 }
 
 async fn fetch_workspace_documents(
@@ -379,14 +474,12 @@ async fn fetch_document_preview(
 
 pub async fn upload_document(
     State(state): State<AppState>,
-    auth: AuthUser,
+    authz: Authz,
     Path(workspace_id): Path<Uuid>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    if let Err((status, message)) =
-        require_workspace_admin(&state.pool, workspace_id, &auth.user_id).await
-    {
-        return (status, message).into_response();
+    if let Err(err) = authz.require_relation(Relation::Admin, &Object::Workspace(workspace_id)).await {
+        return err.into_response();
     }
 
     let workspace_dir = state.upload_dir.join(workspace_id.to_string());
@@ -417,12 +510,13 @@ pub async fn upload_document(
 
         let document_id: Uuid = match sqlx::query_scalar(
             r#"
-            INSERT INTO documents (workspace_id, filename, status, processing_stage)
-            VALUES ($1, $2, 'PROCESSING', 'QUEUED')
+            INSERT INTO documents (workspace_id, owner_id, filename, status, processing_stage)
+            VALUES ($1, $2, $3, 'PROCESSING', 'QUEUED')
             RETURNING id
             "#,
         )
         .bind(workspace_id)
+        .bind(&authz.user_id)
         .bind(&filename)
         .fetch_one(&state.pool)
         .await
@@ -431,7 +525,7 @@ pub async fn upload_document(
             Err(err) => {
                 error!(
                     error = %err,
-                    user_id = %auth.user_id,
+                    user_id = %authz.user_id,
                     workspace_id = %workspace_id,
                     filename = %filename,
                     "Failed to insert document row during batch upload"

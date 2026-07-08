@@ -9,8 +9,7 @@ use sqlx::PgPool;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::auth::extractor::AuthUser;
-use crate::auth::rbac::require_workspace_member;
+use crate::auth::authz::{Authz, Relation, Object};
 use crate::state::AppState;
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -38,11 +37,11 @@ pub struct GraphResponse {
 
 pub async fn get_workspace_graph(
     State(state): State<AppState>,
-    auth: AuthUser,
+    authz: Authz,
     Path(workspace_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if let Err(status) = require_workspace_member(&state.pool, workspace_id, &auth.user_id).await {
-        return status.into_response();
+    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(workspace_id)).await {
+        return err.into_response();
     }
 
     match fetch_workspace_graph(&state.pool, workspace_id).await {
@@ -50,7 +49,7 @@ pub async fn get_workspace_graph(
         Err(err) => {
             error!(
                 error = %err,
-                user_id = %auth.user_id,
+                user_id = %authz.user_id,
                 workspace_id = %workspace_id,
                 "Failed to fetch workspace graph"
             );
