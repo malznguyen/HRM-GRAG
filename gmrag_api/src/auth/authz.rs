@@ -23,6 +23,7 @@ pub enum Relation {
     Member,
     CanAssignRole,
     CanManageMember,
+    Workspace,
     ExplicitViewer,
     BypassViewer,
     Tenant,
@@ -37,6 +38,7 @@ impl Relation {
             Relation::Member => "member",
             Relation::CanAssignRole => "can_assign_role",
             Relation::CanManageMember => "can_manage_member",
+            Relation::Workspace => "workspace",
             Relation::ExplicitViewer => "explicit_viewer",
             Relation::BypassViewer => "bypass_viewer",
             Relation::Tenant => "tenant",
@@ -147,6 +149,21 @@ struct CheckRequest {
 #[derive(Debug, Deserialize)]
 struct CheckResponse {
     allowed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ListObjectsRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorization_model_id: Option<String>,
+    #[serde(rename = "type")]
+    object_type: String,
+    relation: String,
+    user: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListObjectsResponse {
+    objects: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -265,6 +282,32 @@ impl AuthzClient {
         }
 
         Ok(())
+    }
+
+    pub async fn list_objects(
+        &self,
+        user: &str,
+        relation: Relation,
+        object_type: &str,
+    ) -> Result<Vec<String>, AuthzError> {
+        let url = format!("{}/stores/{}/list-objects", self.api_url, self.store_id);
+        let payload = ListObjectsRequest {
+            authorization_model_id: self.model_id.clone(),
+            object_type: object_type.to_string(),
+            relation: relation.as_str().to_string(),
+            user: user.to_string(),
+        };
+
+        let response = self.client.post(&url).json(&payload).send().await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(AuthzError::OpenFga { status, body });
+        }
+
+        let list_resp: ListObjectsResponse = response.json().await?;
+        Ok(list_resp.objects)
     }
 
     pub async fn write_tuple(

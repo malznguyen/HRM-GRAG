@@ -5,6 +5,8 @@ use uuid::Uuid;
 #[derive(Debug, sqlx::FromRow)]
 pub struct RetrievedChunk {
     pub id: Uuid,
+    pub document_id: Uuid,
+    pub access_mode: String,
     pub original_text: String,
     pub document_filename: String,
 }
@@ -47,31 +49,40 @@ pub struct StoredChatMessage {
     pub created_at: NaiveDateTime,
 }
 
-pub async fn fetch_similar_chunks(
+pub async fn fetch_chunks_by_ids(
     pool: &PgPool,
     workspace_id: Uuid,
-    embedding_literal: &str,
+    chunk_ids: &[Uuid],
 ) -> Result<Vec<RetrievedChunk>, sqlx::Error> {
-    tracing::info!(%workspace_id, "RAG retrieval: running pgvector chunk search (top 5)");
+    if chunk_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    tracing::info!(
+        %workspace_id,
+        chunk_count = chunk_ids.len(),
+        "RAG retrieval: loading SQL chunk content by Qdrant-ranked chunk ids"
+    );
 
     sqlx::query_as(
         r#"
         SELECT
             dc.id,
+            dc.document_id,
+            d.access_mode,
             dc.original_text,
             d.filename AS document_filename
         FROM document_chunks dc
         INNER JOIN documents d
             ON d.id = dc.document_id
-           AND d.workspace_id = dc.workspace_id
+            AND d.workspace_id = dc.workspace_id
         WHERE dc.workspace_id = $1
-          AND dc.embedding IS NOT NULL
-        ORDER BY dc.embedding <-> $2::vector
-        LIMIT 5
+          AND dc.id = ANY($2)
+        ORDER BY array_position($2::uuid[], dc.id)
         "#,
     )
     .bind(workspace_id)
-    .bind(embedding_literal)
+    .bind(chunk_ids)
     .fetch_all(pool)
     .await
 }
@@ -81,7 +92,12 @@ pub async fn fetch_graph_context(
     workspace_id: Uuid,
     embedding_literal: &str,
     user_message: &str,
+    visible_document_ids: &[Uuid],
 ) -> Result<GraphContext, sqlx::Error> {
+    if visible_document_ids.is_empty() {
+        return Ok(GraphContext::default());
+    }
+
     tracing::info!(%workspace_id, "RAG retrieval: running graph node vector search (top 5)");
 
     let mut nodes: Vec<GraphNodeRow> = sqlx::query_as(
@@ -94,6 +110,8 @@ pub async fn fetch_graph_context(
             SELECT 1
             FROM graph_node_sources source
             WHERE source.graph_node_id = graph_nodes.id
+              AND source.workspace_id = $1
+              AND source.document_id = ANY($3)
           )
         ORDER BY embedding <-> $2::vector
         LIMIT 5
@@ -101,6 +119,7 @@ pub async fn fetch_graph_context(
     )
     .bind(workspace_id)
     .bind(embedding_literal)
+    .bind(visible_document_ids)
     .fetch_all(pool)
     .await?;
 
@@ -119,6 +138,8 @@ pub async fn fetch_graph_context(
                 SELECT 1
                 FROM graph_node_sources source
                 WHERE source.graph_node_id = graph_nodes.id
+                  AND source.workspace_id = $1
+                  AND source.document_id = ANY($3)
               )
               AND (
                 entity_name ILIKE $2
@@ -129,6 +150,7 @@ pub async fn fetch_graph_context(
         )
         .bind(workspace_id)
         .bind(pattern)
+        .bind(visible_document_ids)
         .fetch_all(pool)
         .await?;
     }
@@ -163,12 +185,15 @@ pub async fn fetch_graph_context(
             SELECT 1
             FROM graph_edge_sources source
             WHERE source.graph_edge_id = e.id
+              AND source.workspace_id = $1
+              AND source.document_id = ANY($3)
           )
           AND (e.source_node_id = ANY($2) OR e.target_node_id = ANY($2))
         "#,
     )
     .bind(workspace_id)
     .bind(&node_ids)
+    .bind(visible_document_ids)
     .fetch_all(pool)
     .await?;
 

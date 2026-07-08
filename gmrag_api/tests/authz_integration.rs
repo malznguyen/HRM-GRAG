@@ -21,8 +21,18 @@ impl TestServer {
         
         // Force bypass settings for test execution
         unsafe {
+            std::env::set_var("APP_ENV", "test");
             std::env::set_var("TEST_BYPASS_JWT", "1");
             std::env::set_var("TEST_BYPASS_KEYCLOAK", "1");
+            std::env::set_var("S3_REGION", "us-east-1");
+            std::env::set_var("S3_BUCKET", "gmrag-documents");
+            std::env::set_var("S3_ACCESS_KEY_ID", "minioadmin");
+            std::env::set_var("S3_SECRET_ACCESS_KEY", "minioadmin");
+            std::env::set_var("S3_FORCE_PATH_STYLE", "true");
+            std::env::set_var("S3_PRESIGN_EXPIRY_SECS", "900");
+            if std::env::var_os("S3_ENDPOINT_URL").is_none() {
+                std::env::set_var("S3_ENDPOINT_URL", "http://localhost:9000");
+            }
         }
 
         let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
@@ -33,20 +43,23 @@ impl TestServer {
             .expect("Failed to connect to database");
 
         // Run migrations
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .expect("Failed to run migrations");
+        match sqlx::migrate!("./migrations").run(&pool).await {
+            Ok(_) | Err(sqlx::migrate::MigrateError::VersionMismatch(_)) => {}
+            Err(err) => panic!("Failed to run migrations: {err}"),
+        }
 
         let jwt = gmrag_api::auth::jwt::JwtValidator::from_env().unwrap();
         let authz_client = gmrag_api::auth::authz::AuthzClient::from_env().unwrap();
         let keycloak_client = gmrag_api::auth::keycloak::KeycloakClient::from_env().unwrap();
-        let upload_dir = AppState::upload_dir_from_env();
+        let storage_config = gmrag_api::storage::StorageConfig::from_env().unwrap();
+        let storage = gmrag_api::storage::StorageClient::from_config(storage_config).await;
+        let retrieval = gmrag_api::retrieval::RetrievalClient::from_env().unwrap();
 
         let state = AppState {
             pool: pool.clone(),
             jwt,
-            upload_dir,
+            storage,
+            retrieval,
             ingestion_limiter: Arc::new(Semaphore::new(1)),
             authz_client,
             keycloak_client,

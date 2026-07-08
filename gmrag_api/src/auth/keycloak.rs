@@ -1,8 +1,9 @@
 use reqwest::Client;
 use serde::Deserialize;
-use std::time::{Duration, Instant};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use tracing::error;
 
 /// Client tương tác với Keycloak Admin REST API
 #[derive(Clone)]
@@ -33,12 +34,11 @@ impl KeycloakClient {
     pub fn from_env() -> Result<Self, &'static str> {
         let admin_url = std::env::var("KEYCLOAK_ADMIN_URL")
             .unwrap_or_else(|_| "http://localhost:8080".to_string());
-        let realm = std::env::var("KEYCLOAK_REALM")
-            .unwrap_or_else(|_| "gmrag".to_string());
+        let realm = std::env::var("KEYCLOAK_REALM").unwrap_or_else(|_| "gmrag".to_string());
         let client_id = std::env::var("KEYCLOAK_CLIENT_ID")
             .unwrap_or_else(|_| "gmrag-admin-client".to_string());
-        let client_secret = std::env::var("KEYCLOAK_CLIENT_SECRET")
-            .unwrap_or_else(|_| "dummy_secret".to_string());
+        let client_secret =
+            std::env::var("KEYCLOAK_CLIENT_SECRET").unwrap_or_else(|_| "dummy_secret".to_string());
 
         Ok(Self {
             client: Client::new(),
@@ -68,14 +68,19 @@ impl KeycloakClient {
             }
         }
 
-        let token_url = format!("{}/realms/{}/protocol/openid-connect/token", self.admin_url, self.realm);
+        let token_url = format!(
+            "{}/realms/{}/protocol/openid-connect/token",
+            self.admin_url, self.realm
+        );
         let params = [
             ("grant_type", "client_credentials"),
             ("client_id", &self.client_id),
             ("client_secret", &self.client_secret),
         ];
 
-        let resp: TokenResponse = self.client.post(&token_url)
+        let resp: TokenResponse = self
+            .client
+            .post(&token_url)
             .form(&params)
             .send()
             .await?
@@ -90,8 +95,11 @@ impl KeycloakClient {
     }
 
     /// Tìm kiếm và lấy user theo email đã verify từ Keycloak
-    pub async fn get_verified_user_by_email(&self, email: &str) -> Result<Option<KeycloakUser>, reqwest::Error> {
-        if std::env::var("TEST_BYPASS_KEYCLOAK").is_ok() {
+    pub async fn get_verified_user_by_email(
+        &self,
+        email: &str,
+    ) -> Result<Option<KeycloakUser>, reqwest::Error> {
+        if test_bypass_enabled("TEST_BYPASS_KEYCLOAK") {
             if email == "verified-owner@test.com" {
                 return Ok(Some(KeycloakUser {
                     id: "verified-keycloak-owner-uuid".to_string(),
@@ -107,8 +115,10 @@ impl KeycloakClient {
 
         let token = self.get_token().await?;
         let url = format!("{}/admin/realms/{}/users", self.admin_url, self.realm);
-        
-        let users: Vec<KeycloakUser> = self.client.get(&url)
+
+        let users: Vec<KeycloakUser> = self
+            .client
+            .get(&url)
             .bearer_auth(token)
             .query(&[("email", email), ("exact", "true")])
             .send()
@@ -118,7 +128,28 @@ impl KeycloakClient {
             .await?;
 
         // Tìm user đầu tiên có email_verified = true
-        let verified_user = users.into_iter().find(|u| u.email_verified.unwrap_or(false));
+        let verified_user = users
+            .into_iter()
+            .find(|u| u.email_verified.unwrap_or(false));
         Ok(verified_user)
     }
+}
+
+fn test_bypass_enabled(flag_name: &str) -> bool {
+    if std::env::var_os(flag_name).is_none() {
+        return false;
+    }
+
+    if std::env::var("APP_ENV")
+        .ok()
+        .is_some_and(|value| value.eq_ignore_ascii_case("production"))
+    {
+        error!(
+            flag = flag_name,
+            "Test bypass flag is blocked in production APP_ENV"
+        );
+        return false;
+    }
+
+    true
 }

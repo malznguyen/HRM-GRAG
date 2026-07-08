@@ -2,8 +2,10 @@ pub mod auth;
 pub mod chat;
 pub mod ingestion;
 pub mod invite;
+pub mod retrieval;
 pub mod routes;
 pub mod state;
+pub mod storage;
 pub mod webhooks;
 
 use axum::{
@@ -22,13 +24,13 @@ use routes::documents::{
     retry_document_ingestion, upload_document,
 };
 use routes::graph::get_workspace_graph;
-use routes::users::{get_current_user, sync_current_user};
 use routes::members::{
     add_workspace_member, list_workspace_members, remove_workspace_member,
     update_workspace_member_role,
 };
+use routes::users::{get_current_user, sync_current_user};
 use routes::workspaces::{
-    create_tenant, add_tenant_owner, create_workspace, delete_workspace, list_workspaces,
+    add_tenant_owner, create_tenant, create_workspace, delete_workspace, list_workspaces,
 };
 use serde::Serialize;
 use state::AppState;

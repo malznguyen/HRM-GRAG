@@ -1,29 +1,25 @@
 use sqlx::PgPool;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-use crate::auth::jwt::JwtValidator;
 use crate::auth::authz::AuthzClient;
+use crate::auth::jwt::JwtValidator;
 use crate::auth::keycloak::KeycloakClient;
+use crate::retrieval::RetrievalClient;
+use crate::storage::StorageClient;
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     pub jwt: Arc<JwtValidator>,
-    pub upload_dir: PathBuf,
+    pub storage: StorageClient,
+    pub retrieval: RetrievalClient,
     pub ingestion_limiter: Arc<Semaphore>,
     pub authz_client: AuthzClient,
     pub keycloak_client: KeycloakClient,
 }
 
 impl AppState {
-    pub fn upload_dir_from_env() -> PathBuf {
-        std::env::var("UPLOAD_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("./data/uploads"))
-    }
-
     pub fn ingestion_limit_from_env() -> usize {
         std::env::var("GMRAG_INGESTION_DOCUMENT_CONCURRENCY")
             .ok()

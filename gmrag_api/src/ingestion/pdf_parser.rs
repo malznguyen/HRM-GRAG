@@ -37,8 +37,16 @@ pub struct PdfExtractResult {
 }
 
 pub fn extract_pdf_from_path(path: &Path) -> Result<PdfExtractResult, PdfParseError> {
-    let mut doc = Document::load(path).map_err(|e| PdfParseError::Load(e.to_string()))?;
+    let doc = Document::load(path).map_err(|e| PdfParseError::Load(e.to_string()))?;
+    extract_pdf_from_document(doc)
+}
 
+pub fn extract_pdf_from_bytes(bytes: &[u8]) -> Result<PdfExtractResult, PdfParseError> {
+    let doc = Document::load_mem(bytes).map_err(|e| PdfParseError::Load(e.to_string()))?;
+    extract_pdf_from_document(doc)
+}
+
+fn extract_pdf_from_document(mut doc: Document) -> Result<PdfExtractResult, PdfParseError> {
     if doc.is_encrypted() {
         doc.decrypt("")
             .map_err(|e| PdfParseError::Decrypt(e.to_string()))?;

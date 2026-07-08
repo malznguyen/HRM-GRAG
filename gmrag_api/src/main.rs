@@ -1,9 +1,11 @@
+use gmrag_api::auth;
+use gmrag_api::retrieval::RetrievalClient;
+use gmrag_api::state::AppState;
+use gmrag_api::storage::{StorageClient, StorageConfig};
 use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use gmrag_api::state::AppState;
-use gmrag_api::auth;
 
 #[tokio::main]
 async fn main() {
@@ -37,21 +39,23 @@ async fn main() {
     let jwt =
         auth::jwt::JwtValidator::from_env().expect("CLERK_ISSUER must be set for JWT validation");
 
-    let authz_client = auth::authz::AuthzClient::from_env()
-        .expect("Failed to initialize AuthzClient from env");
+    let authz_client =
+        auth::authz::AuthzClient::from_env().expect("Failed to initialize AuthzClient from env");
 
     let keycloak_client = auth::keycloak::KeycloakClient::from_env()
         .expect("Failed to initialize KeycloakClient from env");
 
-    let upload_dir = AppState::upload_dir_from_env();
-    tokio::fs::create_dir_all(&upload_dir)
-        .await
-        .expect("Failed to create upload directory");
+    let storage_config =
+        StorageConfig::from_env().expect("Failed to load storage configuration from env");
+    let storage = StorageClient::from_config(storage_config).await;
+    let retrieval =
+        RetrievalClient::from_env().expect("Failed to load retrieval configuration from env");
 
     let state = AppState {
         pool,
         jwt,
-        upload_dir,
+        storage,
+        retrieval,
         ingestion_limiter: Arc::new(Semaphore::new(AppState::ingestion_limit_from_env())),
         authz_client,
         keycloak_client,

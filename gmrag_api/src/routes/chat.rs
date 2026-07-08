@@ -17,11 +17,12 @@ use uuid::Uuid;
 
 use crate::auth::authz::{Authz, Relation, Object};
 use crate::chat::deepseek::{DeepseekTokenParser, next_stream_token};
-use crate::chat::retrieval::fetch_session_chat_messages;
+use crate::chat::retrieval::{StoredChatMessage, fetch_session_chat_messages};
 use crate::chat::{
     ChatPipelineError, SessionError, build_chat_context, delete_chat_session,
-    ensure_chat_session, insert_chat_message, list_user_chat_sessions, prepare_deepseek_stream,
-    resolve_chunk_index_citations, truncate_session_title, verify_chat_session_owner,
+    ensure_chat_session, filter_citations_for_user, insert_chat_message,
+    list_user_chat_sessions, prepare_deepseek_stream, resolve_chunk_index_citations,
+    truncate_session_title, verify_chat_session_owner,
 };
 use crate::state::AppState;
 
@@ -105,19 +106,20 @@ pub async fn get_workspace_chat_session_messages(
     )
     .await
     {
-        Ok(rows) => {
-            let messages: Vec<ChatHistoryMessageResponse> = rows
-                .into_iter()
-                .map(|row| ChatHistoryMessageResponse {
-                    id: row.id,
-                    role: row.role,
-                    content: row.content,
-                    citations: row.citations.0,
-                    created_at: row.created_at,
-                })
-                .collect();
-            Json(messages).into_response()
-        }
+        Ok(rows) => match build_history_messages_with_acl(
+            &state,
+            path.workspace_id,
+            &authz.user_id,
+            rows,
+        )
+        .await
+        {
+            Ok(messages) => Json(messages).into_response(),
+            Err(err) => {
+                tracing::error!(error = %err, "Failed to filter citation ACL for session messages");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        },
         Err(err) => {
             tracing::error!(error = %err, "Failed to fetch session messages");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -191,19 +193,15 @@ pub async fn workspace_chat_history(
     )
     .await
     {
-        Ok(rows) => {
-            let messages: Vec<ChatHistoryMessageResponse> = rows
-                .into_iter()
-                .map(|row| ChatHistoryMessageResponse {
-                    id: row.id,
-                    role: row.role,
-                    content: row.content,
-                    citations: row.citations.0,
-                    created_at: row.created_at,
-                })
-                .collect();
-            Json(messages).into_response()
-        }
+        Ok(rows) => match build_history_messages_with_acl(&state, workspace_id, &authz.user_id, rows)
+            .await
+        {
+            Ok(messages) => Json(messages).into_response(),
+            Err(err) => {
+                tracing::error!(error = %err, "Failed to filter citation ACL for chat history");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        },
         Err(err) => {
             tracing::error!(error = %err, "Failed to fetch chat history");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -268,9 +266,12 @@ pub async fn workspace_chat(
     let client = Client::new();
     let context = match build_chat_context(
         &state.pool,
+        &state.retrieval,
+        &state.authz_client,
         &client,
         workspace_id,
         body.session_id,
+        &authz.user_id,
         &message,
     )
     .await
@@ -291,6 +292,9 @@ pub async fn workspace_chat(
     };
 
     let pool = state.pool.clone();
+    let authz_client = state.authz_client.clone();
+    let user_id_for_acl = authz.user_id.clone();
+    let workspace_id_for_acl = workspace_id;
     let session_id = body.session_id;
     let chunk_ids = context.chunk_ids;
     let byte_stream = deepseek_response.bytes_stream();
@@ -320,6 +324,28 @@ pub async fn workspace_chat(
             let (content, citations) =
                 resolve_chunk_index_citations(&assistant_buffer, &chunk_ids);
             tokio::spawn(async move {
+                let filtered = filter_citations_for_user(
+                    &pool,
+                    &authz_client,
+                    workspace_id_for_acl,
+                    &user_id_for_acl,
+                    &content,
+                    &citations,
+                )
+                .await;
+
+                let (content, citations) = match filtered {
+                    Ok(value) => value,
+                    Err(err) => {
+                        tracing::error!(
+                            %session_id,
+                            error = %err,
+                            "Failed to re-check citations before persisting assistant message"
+                        );
+                        return;
+                    }
+                };
+
                 if let Err(err) = insert_chat_message(
                     &pool,
                     session_id,
@@ -352,10 +378,45 @@ pub async fn workspace_chat(
         .into_response()
 }
 
+async fn build_history_messages_with_acl(
+    state: &AppState,
+    workspace_id: Uuid,
+    user_id: &str,
+    rows: Vec<StoredChatMessage>,
+) -> Result<Vec<ChatHistoryMessageResponse>, ChatPipelineError> {
+    let mut messages = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let (content, citations) = filter_citations_for_user(
+            &state.pool,
+            &state.authz_client,
+            workspace_id,
+            user_id,
+            &row.content,
+            &row.citations.0,
+        )
+        .await?;
+
+        messages.push(ChatHistoryMessageResponse {
+            id: row.id,
+            role: row.role,
+            content,
+            citations,
+            created_at: row.created_at,
+        });
+    }
+
+    Ok(messages)
+}
+
 fn chat_pipeline_error_response(err: ChatPipelineError) -> axum::response::Response {
     let status = match &err {
-        ChatPipelineError::Embed(_) | ChatPipelineError::Generation(_) => StatusCode::BAD_GATEWAY,
-        ChatPipelineError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        ChatPipelineError::Embed(_)
+        | ChatPipelineError::Generation(_)
+        | ChatPipelineError::Retrieval(_) => StatusCode::BAD_GATEWAY,
+        ChatPipelineError::Database(_) | ChatPipelineError::AccessControl(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     };
 
     (status, err.to_string()).into_response()

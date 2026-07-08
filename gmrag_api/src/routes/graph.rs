@@ -10,6 +10,7 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::auth::authz::{Authz, Relation, Object};
+use crate::auth::document_acl::{collect_viewable_document_ids, fetch_workspace_document_acl_rows};
 use crate::state::AppState;
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -44,7 +45,39 @@ pub async fn get_workspace_graph(
         return err.into_response();
     }
 
-    match fetch_workspace_graph(&state.pool, workspace_id).await {
+    let acl_rows = match fetch_workspace_document_acl_rows(&state.pool, workspace_id).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                "Failed to load document ACL data for graph"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let visible_doc_ids = match collect_viewable_document_ids(
+        &state.authz_client,
+        &authz.user_id,
+        &acl_rows,
+    )
+    .await
+    {
+        Ok(ids) => ids,
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                "Failed to filter graph sources by document ACL"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    match fetch_workspace_graph(&state.pool, workspace_id, visible_doc_ids.into_iter().collect()).await {
         Ok(graph) => Json(graph).into_response(),
         Err(err) => {
             error!(
@@ -61,37 +94,54 @@ pub async fn get_workspace_graph(
 async fn fetch_workspace_graph(
     pool: &PgPool,
     workspace_id: Uuid,
+    visible_document_ids: Vec<Uuid>,
 ) -> Result<GraphResponse, sqlx::Error> {
+    if visible_document_ids.is_empty() {
+        return Ok(GraphResponse {
+            nodes: Vec::new(),
+            links: Vec::new(),
+        });
+    }
+
     let nodes = sqlx::query_as::<_, GraphNodeResponse>(
         r#"
-        SELECT id, entity_name, entity_type, description
-        FROM graph_nodes
-        WHERE workspace_id = $1
-          AND EXISTS (
-            SELECT 1
-            FROM graph_node_sources source
-            WHERE source.graph_node_id = graph_nodes.id
-          )
-        ORDER BY entity_name ASC
+        SELECT DISTINCT
+            node.id,
+            node.entity_name,
+            node.entity_type,
+            node.description
+        FROM graph_nodes node
+        INNER JOIN graph_node_sources source
+            ON source.graph_node_id = node.id
+        WHERE node.workspace_id = $1
+          AND source.workspace_id = $1
+          AND source.document_id = ANY($2)
+        ORDER BY node.entity_name ASC
         "#,
     )
     .bind(workspace_id)
+    .bind(&visible_document_ids)
     .fetch_all(pool)
     .await?;
 
     let links = sqlx::query_as::<_, GraphLinkResponse>(
         r#"
-        SELECT id, source_node_id AS source, target_node_id AS target, relationship, description
-        FROM graph_edges
-        WHERE workspace_id = $1
-          AND EXISTS (
-            SELECT 1
-            FROM graph_edge_sources source
-            WHERE source.graph_edge_id = graph_edges.id
-          )
+        SELECT DISTINCT
+            edge.id,
+            edge.source_node_id AS source,
+            edge.target_node_id AS target,
+            edge.relationship,
+            edge.description
+        FROM graph_edges edge
+        INNER JOIN graph_edge_sources source
+            ON source.graph_edge_id = edge.id
+        WHERE edge.workspace_id = $1
+          AND source.workspace_id = $1
+          AND source.document_id = ANY($2)
         "#,
     )
     .bind(workspace_id)
+    .bind(&visible_document_ids)
     .fetch_all(pool)
     .await?;
 

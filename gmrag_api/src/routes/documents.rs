@@ -6,13 +6,19 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::auth::authz::{Authz, Relation, Object};
+use crate::auth::authz::{ApiError, Authz, Object, Relation};
+use crate::auth::document_acl::{
+    DocumentAccessMode, DocumentAclRow, collect_viewable_document_ids,
+    ensure_document_workspace_relation, can_user_view_document, remove_document_workspace_relation,
+};
 use crate::ingestion::processor::spawn_document_processing;
 use crate::state::AppState;
+use crate::storage::build_original_document_object_key;
 
 #[derive(Serialize)]
 pub struct UploadedDocumentItem {
@@ -32,6 +38,16 @@ pub struct DocumentResponse {
     pub status: String,
     pub processing_stage: String,
     pub created_at: NaiveDateTime,
+}
+
+#[derive(sqlx::FromRow)]
+struct DocumentListRow {
+    id: Uuid,
+    filename: String,
+    status: String,
+    processing_stage: String,
+    created_at: NaiveDateTime,
+    access_mode: String,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -58,17 +74,89 @@ pub struct ChunkResponse {
     pub original_text: String,
 }
 
+#[derive(sqlx::FromRow)]
+struct ChunkWithDocumentAclRow {
+    id: Uuid,
+    original_text: String,
+    document_id: Uuid,
+    access_mode: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct DocumentDeleteTarget {
+    object_key: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct RetryDocumentRow {
+    status: String,
+    object_key: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct PreviewDocumentTarget {
+    status: String,
+    access_mode: String,
+}
+
 pub async fn get_document_chunk(
     State(state): State<AppState>,
     authz: Authz,
     Path((workspace_id, chunk_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(workspace_id)).await {
+    if let Err(err) = authz
+        .require_relation(Relation::Member, &Object::Workspace(workspace_id))
+        .await
+    {
         return err.into_response();
     }
 
-    match fetch_workspace_chunk(&state.pool, workspace_id, chunk_id).await {
-        Ok(Some(chunk)) => Json(chunk).into_response(),
+    match fetch_workspace_chunk_with_acl(&state.pool, workspace_id, chunk_id).await {
+        Ok(Some(chunk)) => {
+            let access_mode = match parse_access_mode_or_500(
+                chunk.document_id,
+                &chunk.access_mode,
+                &authz,
+                workspace_id,
+                Some(chunk_id),
+                "Failed to parse chunk document access_mode",
+            ) {
+                Ok(mode) => mode,
+                Err(response) => return response,
+            };
+
+            let can_view = match can_user_view_document(
+                &state.authz_client,
+                &authz.user_id,
+                chunk.document_id,
+                access_mode,
+            )
+            .await
+            {
+                Ok(allowed) => allowed,
+                Err(err) => {
+                    error!(
+                        error = %err,
+                        user_id = %authz.user_id,
+                        workspace_id = %workspace_id,
+                        chunk_id = %chunk_id,
+                        document_id = %chunk.document_id,
+                        "Failed to re-check document ACL for chunk"
+                    );
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+
+            if !can_view {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+
+            Json(ChunkResponse {
+                id: chunk.id,
+                original_text: chunk.original_text,
+            })
+            .into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(err) => {
             error!(
@@ -83,16 +171,24 @@ pub async fn get_document_chunk(
     }
 }
 
-async fn fetch_workspace_chunk(
+async fn fetch_workspace_chunk_with_acl(
     pool: &PgPool,
     workspace_id: Uuid,
     chunk_id: Uuid,
-) -> Result<Option<ChunkResponse>, sqlx::Error> {
+) -> Result<Option<ChunkWithDocumentAclRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT id, original_text
-        FROM document_chunks
-        WHERE id = $1 AND workspace_id = $2
+        SELECT
+            dc.id,
+            dc.original_text,
+            dc.document_id,
+            d.access_mode
+        FROM document_chunks dc
+        INNER JOIN documents d
+            ON d.id = dc.document_id
+           AND d.workspace_id = dc.workspace_id
+        WHERE dc.id = $1
+          AND dc.workspace_id = $2
         "#,
     )
     .bind(chunk_id)
@@ -106,13 +202,16 @@ pub async fn get_document_preview(
     authz: Authz,
     Path((workspace_id, document_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(workspace_id)).await {
+    if let Err(err) = authz
+        .require_relation(Relation::Member, &Object::Workspace(workspace_id))
+        .await
+    {
         return err.into_response();
     }
 
-    let document_status: Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
+    let preview_target: Result<Option<PreviewDocumentTarget>, sqlx::Error> = sqlx::query_as(
         r#"
-        SELECT status
+        SELECT status, access_mode
         FROM documents
         WHERE id = $1 AND workspace_id = $2
         "#,
@@ -122,9 +221,8 @@ pub async fn get_document_preview(
     .fetch_optional(&state.pool)
     .await;
 
-    match document_status {
-        Ok(Some(status)) if status == "COMPLETED" => {}
-        Ok(Some(_)) => return StatusCode::CONFLICT.into_response(),
+    let preview_target = match preview_target {
+        Ok(Some(target)) => target,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(err) => {
             error!(
@@ -136,6 +234,47 @@ pub async fn get_document_preview(
             );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+    };
+
+    let access_mode = match parse_access_mode_or_500(
+        document_id,
+        &preview_target.access_mode,
+        &authz,
+        workspace_id,
+        None,
+        "Failed to parse preview document access_mode",
+    ) {
+        Ok(mode) => mode,
+        Err(response) => return response,
+    };
+
+    let can_view = match can_user_view_document(
+        &state.authz_client,
+        &authz.user_id,
+        document_id,
+        access_mode,
+    )
+    .await
+    {
+        Ok(allowed) => allowed,
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to re-check document ACL before preview"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    if !can_view {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    if preview_target.status != "COMPLETED" {
+        return StatusCode::CONFLICT.into_response();
     }
 
     match fetch_document_preview(&state.pool, workspace_id, document_id).await {
@@ -153,17 +292,106 @@ pub async fn get_document_preview(
     }
 }
 
+fn parse_access_mode_or_500(
+    document_id: Uuid,
+    raw_mode: &str,
+    authz: &Authz,
+    workspace_id: Uuid,
+    chunk_id: Option<Uuid>,
+    context_message: &str,
+) -> Result<DocumentAccessMode, axum::response::Response> {
+    match DocumentAccessMode::parse(raw_mode) {
+        Some(mode) => Ok(mode),
+        None => {
+            error!(
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                chunk_id = ?chunk_id,
+                access_mode = %raw_mode,
+                "{}",
+                context_message,
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
 pub async fn list_documents(
     State(state): State<AppState>,
     authz: Authz,
     Path(workspace_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(workspace_id)).await {
+    if let Err(err) = authz
+        .require_relation(Relation::Member, &Object::Workspace(workspace_id))
+        .await
+    {
         return err.into_response();
     }
 
     match fetch_workspace_documents(&state.pool, workspace_id).await {
-        Ok(documents) => Json(documents).into_response(),
+        Ok(rows) => {
+            let acl_rows = match rows
+                .iter()
+                .map(|row| {
+                    let access_mode = DocumentAccessMode::parse(&row.access_mode).ok_or_else(|| {
+                        format!(
+                            "invalid access_mode '{}' for document {}",
+                            row.access_mode, row.id
+                        )
+                    })?;
+                    Ok(DocumentAclRow {
+                        document_id: row.id,
+                        access_mode,
+                    })
+                })
+                .collect::<Result<Vec<DocumentAclRow>, String>>()
+            {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    error!(
+                        error = %err,
+                        user_id = %authz.user_id,
+                        workspace_id = %workspace_id,
+                        "Failed to parse document access_mode while listing"
+                    );
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+
+            let visible_ids = match collect_viewable_document_ids(
+                &state.authz_client,
+                &authz.user_id,
+                &acl_rows,
+            )
+            .await
+            {
+                Ok(ids) => ids,
+                Err(err) => {
+                    error!(
+                        error = %err,
+                        user_id = %authz.user_id,
+                        workspace_id = %workspace_id,
+                        "Failed to apply document ACL while listing"
+                    );
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                }
+            };
+
+            let documents: Vec<DocumentResponse> = rows
+                .into_iter()
+                .filter(|row| visible_ids.contains(&row.id))
+                .map(|row| DocumentResponse {
+                    id: row.id,
+                    filename: row.filename,
+                    status: row.status,
+                    processing_stage: row.processing_stage,
+                    created_at: row.created_at,
+                })
+                .collect();
+
+            Json(documents).into_response()
+        }
         Err(err) => {
             error!(
                 error = %err,
@@ -181,7 +409,10 @@ pub async fn delete_document(
     authz: Authz,
     Path((workspace_id, document_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    if let Err(err) = authz.require_relation(Relation::Admin, &Object::Workspace(workspace_id)).await {
+    if let Err(err) = authz
+        .require_relation(Relation::Admin, &Object::Workspace(workspace_id))
+        .await
+    {
         return err.into_response();
     }
 
@@ -199,9 +430,9 @@ pub async fn delete_document(
         }
     };
 
-    let exists: Result<Option<Uuid>, sqlx::Error> = sqlx::query_scalar(
+    let delete_target: Result<Option<DocumentDeleteTarget>, sqlx::Error> = sqlx::query_as(
         r#"
-        SELECT id
+        SELECT object_key
         FROM documents
         WHERE id = $1 AND workspace_id = $2
         "#,
@@ -211,8 +442,8 @@ pub async fn delete_document(
     .fetch_optional(&mut *tx)
     .await;
 
-    match exists {
-        Ok(Some(_)) => {}
+    let delete_target = match delete_target {
+        Ok(Some(target)) => target,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(err) => {
             error!(
@@ -224,7 +455,7 @@ pub async fn delete_document(
             );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-    }
+    };
 
     let result = async {
         sqlx::query(
@@ -302,11 +533,33 @@ pub async fn delete_document(
 
     match result {
         Ok(_) => {
-            let file_path = state
-                .upload_dir
-                .join(workspace_id.to_string())
-                .join(format!("{document_id}.pdf"));
-            let _ = tokio::fs::remove_file(file_path).await;
+            if let Err(err) = remove_document_workspace_relation(
+                &state.authz_client,
+                workspace_id,
+                document_id,
+            )
+            .await
+            {
+                error!(
+                    error = %err,
+                    user_id = %authz.user_id,
+                    workspace_id = %workspace_id,
+                    document_id = %document_id,
+                    "Failed to delete document workspace relation in OpenFGA"
+                );
+            }
+
+            if let Err(err) = state.storage.delete_object(&delete_target.object_key).await {
+                // TODO: Phase 3 can bo sung cleanup worker/outbox de xu ly object con sot sau delete.
+                error!(
+                    error = %err,
+                    user_id = %authz.user_id,
+                    workspace_id = %workspace_id,
+                    document_id = %document_id,
+                    object_key = %delete_target.object_key,
+                    "Failed to delete document object after database cleanup"
+                );
+            }
             StatusCode::NO_CONTENT.into_response()
         }
         Err(err) => {
@@ -327,15 +580,16 @@ pub async fn retry_document_ingestion(
     authz: Authz,
     Path((workspace_id, document_id)): Path<(Uuid, Uuid)>,
 ) -> impl IntoResponse {
-    if let Err(err) = authz.require_relation(Relation::Admin, &Object::Workspace(workspace_id)).await {
+    if let Err(err) = authz
+        .require_relation(Relation::Admin, &Object::Workspace(workspace_id))
+        .await
+    {
         return err.into_response();
     }
 
-    // Only documents stuck in FAILED can be re-queued; anything else would
-    // race with an in-flight ingestion.
-    let document_status: Result<Option<String>, sqlx::Error> = sqlx::query_scalar(
+    let document_row: Result<Option<RetryDocumentRow>, sqlx::Error> = sqlx::query_as(
         r#"
-        SELECT status
+        SELECT status, object_key
         FROM documents
         WHERE id = $1 AND workspace_id = $2
         "#,
@@ -345,16 +599,9 @@ pub async fn retry_document_ingestion(
     .fetch_optional(&state.pool)
     .await;
 
-    match document_status {
+    let document_row = match document_row {
+        Ok(Some(row)) => row,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Ok(Some(status)) if status == "FAILED" => {}
-        Ok(Some(_)) => {
-            return (
-                StatusCode::CONFLICT,
-                "Document is not in a failed state",
-            )
-                .into_response();
-        }
         Err(err) => {
             error!(
                 error = %err,
@@ -365,23 +612,32 @@ pub async fn retry_document_ingestion(
             );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+    };
+
+    if document_row.status != "FAILED" {
+        return (StatusCode::CONFLICT, "Document is not in a failed state").into_response();
     }
 
-    // The original PDF is kept on disk until the document is deleted, so a
-    // FAILED document can be reprocessed from its existing upload.
-    let file_path = state
-        .upload_dir
-        .join(workspace_id.to_string())
-        .join(format!("{document_id}.pdf"));
-
-    match tokio::fs::metadata(&file_path).await {
-        Ok(_) => {}
-        Err(_) => {
-            return (
-                StatusCode::GONE,
-                "Document source file is missing",
-            )
-                .into_response();
+    match state.storage.object_exists(&document_row.object_key).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return ApiError {
+                status: StatusCode::GONE,
+                code: "DOCUMENT_OBJECT_MISSING",
+                message: "Original document object is missing".to_string(),
+            }
+            .into_response();
+        }
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                object_key = %document_row.object_key,
+                "Failed to verify document object before retry"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
 
@@ -407,13 +663,12 @@ pub async fn retry_document_ingestion(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    // Ingestion upserts chunks/graph on conflict, so any partial data from
-    // the failed run is overwritten rather than duplicated.
     spawn_document_processing(
         state.pool.clone(),
+        state.storage.clone(),
+        state.retrieval.clone(),
         workspace_id,
         document_id,
-        file_path,
         state.ingestion_limiter.clone(),
     );
 
@@ -423,10 +678,10 @@ pub async fn retry_document_ingestion(
 async fn fetch_workspace_documents(
     pool: &PgPool,
     workspace_id: Uuid,
-) -> Result<Vec<DocumentResponse>, sqlx::Error> {
+) -> Result<Vec<DocumentListRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT id, filename, status, processing_stage, created_at
+        SELECT id, filename, status, processing_stage, created_at, access_mode
         FROM documents
         WHERE workspace_id = $1
         ORDER BY created_at DESC
@@ -478,14 +733,26 @@ pub async fn upload_document(
     Path(workspace_id): Path<Uuid>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
-    if let Err(err) = authz.require_relation(Relation::Admin, &Object::Workspace(workspace_id)).await {
+    if let Err(err) = authz
+        .require_relation(Relation::Admin, &Object::Workspace(workspace_id))
+        .await
+    {
         return err.into_response();
     }
 
-    let workspace_dir = state.upload_dir.join(workspace_id.to_string());
-    if tokio::fs::create_dir_all(&workspace_dir).await.is_err() {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    let tenant_id = match fetch_workspace_tenant_id(&state.pool, workspace_id).await {
+        Ok(Some(tenant_id)) => tenant_id,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                "Failed to resolve tenant_id for workspace upload"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
     let mut uploaded: Vec<UploadedDocumentItem> = Vec::new();
 
@@ -499,6 +766,8 @@ pub async fn upload_document(
             .map(sanitize_filename)
             .unwrap_or_else(|| "upload.pdf".to_string());
 
+        let content_type = field.content_type().map(|value| value.to_string());
+
         let pdf_bytes = match field.bytes().await {
             Ok(bytes) => bytes.to_vec(),
             Err(_) => continue,
@@ -508,43 +777,143 @@ pub async fn upload_document(
             continue;
         }
 
-        let document_id: Uuid = match sqlx::query_scalar(
-            r#"
-            INSERT INTO documents (workspace_id, owner_id, filename, status, processing_stage)
-            VALUES ($1, $2, $3, 'PROCESSING', 'QUEUED')
-            RETURNING id
-            "#,
-        )
-        .bind(workspace_id)
-        .bind(&authz.user_id)
-        .bind(&filename)
-        .fetch_one(&state.pool)
-        .await
+        let document_id = Uuid::new_v4();
+        let object_key = build_original_document_object_key(tenant_id, workspace_id, document_id);
+        let checksum_sha256 = checksum_sha256_hex(&pdf_bytes);
+        let size_bytes = i64::try_from(pdf_bytes.len()).unwrap_or(i64::MAX);
+
+        let storage_etag = match state
+            .storage
+            .put_original_document(&object_key, &pdf_bytes, content_type.as_deref())
+            .await
         {
-            Ok(id) => id,
+            Ok(result) => result.etag,
             Err(err) => {
                 error!(
                     error = %err,
                     user_id = %authz.user_id,
                     workspace_id = %workspace_id,
                     filename = %filename,
-                    "Failed to insert document row during batch upload"
+                    document_id = %document_id,
+                    object_key = %object_key,
+                    "Failed to upload document object"
                 );
                 continue;
             }
         };
 
-        let file_path = workspace_dir.join(format!("{document_id}.pdf"));
-        if tokio::fs::write(&file_path, &pdf_bytes).await.is_err() {
-            let _ = mark_upload_failed(&state.pool, workspace_id, document_id).await;
+        let insert_result = sqlx::query(
+            r#"
+            INSERT INTO documents (
+                id,
+                workspace_id,
+                owner_id,
+                filename,
+                status,
+                processing_stage,
+                object_key,
+                bucket,
+                content_type,
+                size_bytes,
+                checksum_sha256,
+                storage_etag,
+                uploaded_by
+            )
+            VALUES ($1, $2, $3, $4, 'PROCESSING', 'QUEUED', $5, $6, $7, $8, $9, $10, $11)
+            "#,
+        )
+        .bind(document_id)
+        .bind(workspace_id)
+        .bind(&authz.user_id)
+        .bind(&filename)
+        .bind(&object_key)
+        .bind(state.storage.bucket())
+        .bind(content_type.as_deref())
+        .bind(size_bytes)
+        .bind(&checksum_sha256)
+        .bind(storage_etag.as_deref())
+        .bind(&authz.user_id)
+        .execute(&state.pool)
+        .await;
+
+        if let Err(err) = insert_result {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                filename = %filename,
+                document_id = %document_id,
+                object_key = %object_key,
+                "Failed to insert document row during upload"
+            );
+
+            if let Err(storage_err) = state.storage.delete_object(&object_key).await {
+                error!(
+                    error = %storage_err,
+                    user_id = %authz.user_id,
+                    workspace_id = %workspace_id,
+                    document_id = %document_id,
+                    object_key = %object_key,
+                    "Failed to cleanup object after database insert failure"
+                );
+            }
+            continue;
+        }
+
+        if let Err(err) = ensure_document_workspace_relation(
+            &state.authz_client,
+            workspace_id,
+            document_id,
+        )
+        .await
+        {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to sync document workspace relation to OpenFGA"
+            );
+
+            if let Err(db_err) = sqlx::query(
+                r#"
+                DELETE FROM documents
+                WHERE id = $1 AND workspace_id = $2
+                "#,
+            )
+            .bind(document_id)
+            .bind(workspace_id)
+            .execute(&state.pool)
+            .await
+            {
+                error!(
+                    error = %db_err,
+                    user_id = %authz.user_id,
+                    workspace_id = %workspace_id,
+                    document_id = %document_id,
+                    "Failed to cleanup document row after OpenFGA sync failure"
+                );
+            }
+
+            if let Err(storage_err) = state.storage.delete_object(&object_key).await {
+                error!(
+                    error = %storage_err,
+                    user_id = %authz.user_id,
+                    workspace_id = %workspace_id,
+                    document_id = %document_id,
+                    object_key = %object_key,
+                    "Failed to cleanup object after OpenFGA sync failure"
+                );
+            }
             continue;
         }
 
         spawn_document_processing(
             state.pool.clone(),
+            state.storage.clone(),
+            state.retrieval.clone(),
             workspace_id,
             document_id,
-            file_path,
             state.ingestion_limiter.clone(),
         );
 
@@ -590,21 +959,23 @@ fn is_pdf_upload(filename: &str, data: &[u8]) -> bool {
     magic_ok || ext_ok
 }
 
-async fn mark_upload_failed(
-    pool: &sqlx::PgPool,
+fn checksum_sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("{:x}", digest)
+}
+
+async fn fetch_workspace_tenant_id(
+    pool: &PgPool,
     workspace_id: Uuid,
-    document_id: Uuid,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
         r#"
-        UPDATE documents
-        SET status = 'FAILED'
-        WHERE id = $1 AND workspace_id = $2
+        SELECT tenant_id
+        FROM workspaces
+        WHERE id = $1
         "#,
     )
-    .bind(document_id)
     .bind(workspace_id)
-    .execute(pool)
-    .await?;
-    Ok(())
+    .fetch_optional(pool)
+    .await
 }

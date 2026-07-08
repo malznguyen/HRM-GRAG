@@ -10,11 +10,17 @@ use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::auth::authz::AuthzClient;
+use crate::auth::document_acl::{
+    DocumentAccessMode, DocumentAclError, can_user_view_document, collect_viewable_document_ids,
+    fetch_workspace_document_acl_rows,
+};
 use crate::ingestion::embedding::{EmbedError, embed_text, format_pgvector};
+use crate::retrieval::{RetrievalClient, RetrievalError};
 
 use self::deepseek::{ChatMessage, DeepseekStreamError, stream_chat_completion};
 use self::retrieval::{
-    GraphContext, RetrievedChunk, fetch_chat_history, fetch_graph_context, fetch_similar_chunks,
+    GraphContext, RetrievedChunk, fetch_chat_history, fetch_chunks_by_ids, fetch_graph_context,
 };
 
 pub const CITATION_INSTRUCTION: &str = "When citing information from a chunk, you MUST append [chunk:1], [chunk:2], etc., at the exact end of the sentence based on its CHUNK INDEX number. Do not output raw UUIDs under any circumstance.";
@@ -83,6 +89,8 @@ pub fn extract_chunk_citations(text: &str) -> Vec<Uuid> {
 pub enum ChatPipelineError {
     Embed(EmbedError),
     Generation(DeepseekStreamError),
+    Retrieval(RetrievalError),
+    AccessControl(DocumentAclError),
     Database(sqlx::Error),
 }
 
@@ -91,6 +99,8 @@ impl std::fmt::Display for ChatPipelineError {
         match self {
             ChatPipelineError::Embed(e) => write!(f, "{e}"),
             ChatPipelineError::Generation(e) => write!(f, "{e}"),
+            ChatPipelineError::Retrieval(e) => write!(f, "{e}"),
+            ChatPipelineError::AccessControl(e) => write!(f, "{e}"),
             ChatPipelineError::Database(e) => write!(f, "database error: {e}"),
         }
     }
@@ -104,6 +114,18 @@ impl From<sqlx::Error> for ChatPipelineError {
     }
 }
 
+impl From<RetrievalError> for ChatPipelineError {
+    fn from(value: RetrievalError) -> Self {
+        ChatPipelineError::Retrieval(value)
+    }
+}
+
+impl From<DocumentAclError> for ChatPipelineError {
+    fn from(value: DocumentAclError) -> Self {
+        ChatPipelineError::AccessControl(value)
+    }
+}
+
 pub struct ChatContext {
     pub system_prompt: String,
     pub messages: Vec<ChatMessage>,
@@ -113,9 +135,12 @@ pub struct ChatContext {
 
 pub async fn build_chat_context(
     pool: &PgPool,
+    retrieval: &RetrievalClient,
+    authz_client: &AuthzClient,
     client: &reqwest::Client,
     workspace_id: Uuid,
     session_id: Uuid,
+    user_id: &str,
     user_message: &str,
 ) -> Result<ChatContext, ChatPipelineError> {
     tracing::info!(
@@ -136,10 +161,35 @@ pub async fn build_chat_context(
         "RAG pipeline: query embedding complete"
     );
 
-    let chunks = fetch_similar_chunks(pool, workspace_id, &embedding_literal).await?;
+    let acl_rows = fetch_workspace_document_acl_rows(pool, workspace_id).await?;
+    let visible_document_ids = collect_viewable_document_ids(authz_client, user_id, &acl_rows)
+        .await?
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    retrieval.ensure_workspace_backfilled(pool, workspace_id).await?;
+
+    let retrieved_chunk_ids = retrieval
+        .search_chunk_ids(
+            workspace_id,
+            &visible_document_ids,
+            &embedding,
+            retrieval.top_k(),
+        )
+        .await?;
+
+    let qdrant_chunks = fetch_chunks_by_ids(pool, workspace_id, &retrieved_chunk_ids).await?;
+    let chunks = recheck_retrieved_chunks(authz_client, user_id, qdrant_chunks).await?;
     log_retrieved_chunks(workspace_id, &chunks);
 
-    let graph = fetch_graph_context(pool, workspace_id, &embedding_literal, user_message).await?;
+    let graph = fetch_graph_context(
+        pool,
+        workspace_id,
+        &embedding_literal,
+        user_message,
+        &visible_document_ids,
+    )
+    .await?;
     log_graph_context(workspace_id, &graph);
 
     let history = fetch_chat_history(pool, session_id, workspace_id).await?;
@@ -199,6 +249,123 @@ pub async fn prepare_deepseek_stream(
     stream_chat_completion(client, &context.system_prompt, &context.messages)
         .await
         .map_err(ChatPipelineError::Generation)
+}
+
+#[derive(sqlx::FromRow)]
+struct CitationChunkAclRow {
+    chunk_id: Uuid,
+    document_id: Uuid,
+    access_mode: String,
+}
+
+pub async fn filter_citation_ids_for_user(
+    pool: &PgPool,
+    authz_client: &AuthzClient,
+    workspace_id: Uuid,
+    user_id: &str,
+    citations: &[Uuid],
+) -> Result<Vec<Uuid>, ChatPipelineError> {
+    if citations.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rows: Vec<CitationChunkAclRow> = sqlx::query_as(
+        r#"
+        SELECT
+            dc.id AS chunk_id,
+            dc.document_id,
+            d.access_mode
+        FROM document_chunks dc
+        INNER JOIN documents d
+            ON d.id = dc.document_id
+           AND d.workspace_id = dc.workspace_id
+        WHERE dc.workspace_id = $1
+          AND dc.id = ANY($2)
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(citations)
+    .fetch_all(pool)
+    .await?;
+
+    let row_by_chunk: std::collections::HashMap<Uuid, CitationChunkAclRow> = rows
+        .into_iter()
+        .map(|row| (row.chunk_id, row))
+        .collect();
+
+    let mut allowed = Vec::new();
+    for citation in citations {
+        let Some(row) = row_by_chunk.get(citation) else {
+            continue;
+        };
+
+        let access_mode = DocumentAccessMode::parse(&row.access_mode).ok_or_else(|| {
+            ChatPipelineError::AccessControl(DocumentAclError::InvalidAccessMode {
+                document_id: row.document_id,
+                raw_mode: row.access_mode.clone(),
+            })
+        })?;
+
+        if can_user_view_document(authz_client, user_id, row.document_id, access_mode).await? {
+            allowed.push(*citation);
+        }
+    }
+
+    Ok(allowed)
+}
+
+pub async fn filter_citations_for_user(
+    pool: &PgPool,
+    authz_client: &AuthzClient,
+    workspace_id: Uuid,
+    user_id: &str,
+    assistant_text: &str,
+    citations: &[Uuid],
+) -> Result<(String, Vec<Uuid>), ChatPipelineError> {
+    let allowed = filter_citation_ids_for_user(
+        pool,
+        authz_client,
+        workspace_id,
+        user_id,
+        citations,
+    )
+    .await?;
+
+    let allowed_set: HashSet<Uuid> = allowed.iter().copied().collect();
+    let mut sanitized = assistant_text.to_string();
+    for citation in citations {
+        if allowed_set.contains(citation) {
+            continue;
+        }
+
+        let marker = format!("[chunk:{citation}]");
+        sanitized = sanitized.replace(&marker, "");
+    }
+
+    Ok((sanitized, allowed))
+}
+
+async fn recheck_retrieved_chunks(
+    authz_client: &AuthzClient,
+    user_id: &str,
+    chunks: Vec<RetrievedChunk>,
+) -> Result<Vec<RetrievedChunk>, ChatPipelineError> {
+    let mut allowed_chunks = Vec::with_capacity(chunks.len());
+
+    for chunk in chunks {
+        let access_mode = DocumentAccessMode::parse(&chunk.access_mode).ok_or_else(|| {
+            ChatPipelineError::AccessControl(DocumentAclError::InvalidAccessMode {
+                document_id: chunk.document_id,
+                raw_mode: chunk.access_mode.clone(),
+            })
+        })?;
+
+        if can_user_view_document(authz_client, user_id, chunk.document_id, access_mode).await? {
+            allowed_chunks.push(chunk);
+        }
+    }
+
+    Ok(allowed_chunks)
 }
 
 fn log_retrieved_chunks(workspace_id: Uuid, chunks: &[RetrievedChunk]) {

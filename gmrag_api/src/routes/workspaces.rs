@@ -317,6 +317,8 @@ pub async fn delete_workspace(
                     error!(error = %err, workspace_id = %workspace_id, "Failed to delete workspace tenant from OpenFGA");
                 }
             }
+
+            // TODO: Phase 3 se bo sung cleanup worker de don object prefix tenants/{tenant_id}/workspaces/{workspace_id}/.
             StatusCode::NO_CONTENT.into_response()
         }
         Err(err) => {

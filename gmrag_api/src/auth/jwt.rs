@@ -44,8 +44,8 @@ pub struct JwtValidator {
 
 impl JwtValidator {
     pub fn from_env() -> Result<Arc<Self>, JwtError> {
-        let issuer = std::env::var("CLERK_ISSUER")
-            .unwrap_or_else(|_| "http://test-bypass-jwt".to_string());
+        let issuer =
+            std::env::var("CLERK_ISSUER").unwrap_or_else(|_| "http://test-bypass-jwt".to_string());
         let issuer = issuer.trim_end_matches('/').to_string();
         let jwks_url = format!("{issuer}/.well-known/jwks.json");
 
@@ -58,7 +58,7 @@ impl JwtValidator {
     }
 
     pub async fn validate(&self, token: &str) -> Result<String, JwtError> {
-        if std::env::var("TEST_BYPASS_JWT").is_ok() {
+        if test_bypass_enabled("TEST_BYPASS_JWT") {
             return Ok(token.to_string());
         }
         let header = decode_header(token).map_err(|err| {
@@ -158,4 +158,23 @@ impl JwtValidator {
 fn rsa_decoding_key(n: &str, e: &str) -> Result<DecodingKey, jsonwebtoken::errors::Error> {
     // JWK `n`/`e` are base64url-encoded; jsonwebtoken expects the same encoding.
     DecodingKey::from_rsa_components(n, e)
+}
+
+fn test_bypass_enabled(flag_name: &str) -> bool {
+    if std::env::var_os(flag_name).is_none() {
+        return false;
+    }
+
+    if std::env::var("APP_ENV")
+        .ok()
+        .is_some_and(|value| value.eq_ignore_ascii_case("production"))
+    {
+        error!(
+            flag = flag_name,
+            "Test bypass flag is blocked in production APP_ENV"
+        );
+        return false;
+    }
+
+    true
 }

@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,13 +14,16 @@ use super::graph::{
     GraphElement, GraphError, GraphWriteBatch, bulk_upsert_graph, extract_graph_elements,
 };
 use super::ocr::vision_ocr_fallback;
-use super::pdf_parser::{PdfParseError, extract_pdf_from_path};
+use super::pdf_parser::{PdfParseError, extract_pdf_from_bytes};
+use crate::retrieval::{ChunkPoint, RetrievalClient, RetrievalError};
+use crate::storage::{StorageClient, StorageError};
 
 pub fn spawn_document_processing(
     pool: PgPool,
+    storage: StorageClient,
+    retrieval: RetrievalClient,
     workspace_id: Uuid,
     document_id: Uuid,
-    file_path: PathBuf,
     limiter: Arc<Semaphore>,
 ) {
     tokio::spawn(async move {
@@ -37,8 +39,14 @@ pub fn spawn_document_processing(
             }
         };
 
-        if let Err(err) =
-            process_document(pool.clone(), workspace_id, document_id, file_path.clone()).await
+        if let Err(err) = process_document(
+            pool.clone(),
+            storage.clone(),
+            retrieval.clone(),
+            workspace_id,
+            document_id,
+        )
+        .await
         {
             tracing::error!(
                 %workspace_id,
@@ -60,12 +68,27 @@ pub fn spawn_document_processing(
 
 async fn process_document(
     pool: PgPool,
+    storage: StorageClient,
+    retrieval: RetrievalClient,
     workspace_id: Uuid,
     document_id: Uuid,
-    file_path: PathBuf,
 ) -> Result<(), ProcessError> {
     let document_started = Instant::now();
     set_processing_stage(&pool, workspace_id, document_id, "PARSING").await?;
+
+    let storage_metadata = fetch_document_storage_metadata(&pool, workspace_id, document_id)
+        .await?
+        .ok_or(ProcessError::DocumentNotFound { document_id })?;
+
+    let pdf_bytes = storage
+        .get_original_document(&storage_metadata.object_key)
+        .await
+        .map_err(|err| match err {
+            StorageError::ObjectNotFound { .. } => ProcessError::DocumentObjectMissing {
+                object_key: storage_metadata.object_key.clone(),
+            },
+            _ => ProcessError::Storage(err),
+        })?;
 
     let parse_started = Instant::now();
     let parse_timeout = Duration::from_secs(pdf_parse_timeout_secs());
@@ -79,7 +102,7 @@ async fn process_document(
 
     let extracted = timeout(
         parse_timeout,
-        tokio::task::spawn_blocking(move || extract_pdf_from_path(&file_path)),
+        tokio::task::spawn_blocking(move || extract_pdf_from_bytes(&pdf_bytes)),
     )
     .await
     .map_err(|_| ProcessError::ParseTimeout {
@@ -234,6 +257,15 @@ async fn process_document(
         elapsed_ms = db_started.elapsed().as_millis(),
         "Bulk database transaction committed"
     );
+
+    let points = build_chunk_points_for_retrieval(&pool, workspace_id, document_id, &chunk_rows)
+        .await
+        .map_err(ProcessError::Retrieval)?;
+
+    retrieval
+        .upsert_chunk_points(&points)
+        .await
+        .map_err(ProcessError::Retrieval)?;
 
     tracing::info!(
         %workspace_id,
@@ -504,6 +536,79 @@ async fn bulk_upsert_document_chunks(
     Ok(())
 }
 
+#[derive(sqlx::FromRow)]
+struct PersistedChunkRow {
+    id: Uuid,
+    chunk_index: i32,
+}
+
+async fn build_chunk_points_for_retrieval(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    document_id: Uuid,
+    rows: &[ChunkRow],
+) -> Result<Vec<ChunkPoint>, RetrievalError> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let persisted_rows: Vec<PersistedChunkRow> = sqlx::query_as(
+        r#"
+        SELECT id, chunk_index
+        FROM document_chunks
+        WHERE workspace_id = $1 AND document_id = $2
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(document_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut embeddings_by_index: std::collections::HashMap<i32, Vec<f32>> = rows
+        .iter()
+        .map(|row| (row.index, row.embedding.clone()))
+        .collect();
+
+    let mut points = Vec::with_capacity(persisted_rows.len());
+    for persisted in persisted_rows {
+        if let Some(embedding) = embeddings_by_index.remove(&persisted.chunk_index) {
+            points.push(ChunkPoint {
+                chunk_id: persisted.id,
+                workspace_id,
+                document_id,
+                chunk_index: persisted.chunk_index,
+                embedding,
+            });
+        }
+    }
+
+    Ok(points)
+}
+
+#[derive(sqlx::FromRow)]
+struct DocumentStorageMetadata {
+    object_key: String,
+}
+
+async fn fetch_document_storage_metadata(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    document_id: Uuid,
+) -> Result<Option<DocumentStorageMetadata>, ProcessError> {
+    sqlx::query_as(
+        r#"
+        SELECT object_key
+        FROM documents
+        WHERE id = $1 AND workspace_id = $2
+        "#,
+    )
+    .bind(document_id)
+    .bind(workspace_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(ProcessError::Database)
+}
+
 async fn set_processing_stage(
     pool: &PgPool,
     workspace_id: Uuid,
@@ -653,6 +758,9 @@ struct ChunkRow {
 #[derive(Debug)]
 enum ProcessError {
     Join,
+    DocumentNotFound { document_id: Uuid },
+    DocumentObjectMissing { object_key: String },
+    Storage(StorageError),
     Parse(PdfParseError),
     ParseTimeout { timeout_secs: u64 },
     Chunk(ChunkError),
@@ -661,6 +769,7 @@ enum ProcessError {
     MissingEmbedding { chunk_index: usize },
     Graph(GraphError),
     GraphTimeout { timeout_secs: u64 },
+    Retrieval(RetrievalError),
     Database(sqlx::Error),
 }
 
@@ -668,6 +777,13 @@ impl std::fmt::Display for ProcessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProcessError::Join => write!(f, "background task panicked"),
+            ProcessError::DocumentNotFound { document_id } => {
+                write!(f, "document not found in database: {document_id}")
+            }
+            ProcessError::DocumentObjectMissing { object_key } => {
+                write!(f, "document object missing in storage: {object_key}")
+            }
+            ProcessError::Storage(err) => write!(f, "storage error: {err}"),
             ProcessError::Parse(e) => write!(f, "{e}"),
             ProcessError::ParseTimeout { timeout_secs } => {
                 write!(f, "PDF parsing timed out after {timeout_secs}s")
@@ -687,6 +803,7 @@ impl std::fmt::Display for ProcessError {
             ProcessError::GraphTimeout { timeout_secs } => {
                 write!(f, "graph extraction timed out after {timeout_secs}s")
             }
+            ProcessError::Retrieval(err) => write!(f, "retrieval error: {err}"),
             ProcessError::Database(e) => write!(f, "database error: {e}"),
         }
     }
