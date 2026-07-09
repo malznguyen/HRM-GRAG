@@ -3,6 +3,7 @@ pub mod auth;
 pub mod chat;
 pub mod ingestion;
 pub mod invite;
+pub mod invite_cleanup;
 pub mod retrieval;
 pub mod routes;
 pub mod state;

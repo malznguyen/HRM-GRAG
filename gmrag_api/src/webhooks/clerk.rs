@@ -7,7 +7,7 @@ use axum::{
 use serde::Deserialize;
 use tracing::error;
 
-use crate::invite::{normalize_email, reconcile_pending_invites};
+use crate::invite::{normalize_email, upsert_user};
 use crate::state::AppState;
 use svix::webhooks::Webhook;
 
@@ -29,6 +29,11 @@ struct ClerkEmailAddress {
     email_address: String,
 }
 
+/// LEGACY compatibility surface.
+///
+/// Trước đây webhook này gọi `reconcile_pending_invites` để gắn membership
+/// placeholder → user thật. Flow đó đã gỡ vì gây desync OpenFGA.
+/// Giờ chỉ upsert row `users` nếu event vẫn còn được gửi tới API.
 pub async fn handle_clerk_webhook(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -67,14 +72,14 @@ pub async fn handle_clerk_webhook(
         _ => return StatusCode::BAD_REQUEST,
     };
 
-    match reconcile_pending_invites(&state.pool, &event.data.id, &email).await {
+    match upsert_user(&state.pool, &event.data.id, &email).await {
         Ok(()) => StatusCode::NO_CONTENT,
         Err(err) => {
             error!(
                 error = %err,
                 clerk_user_id = %event.data.id,
                 email = %email,
-                "Failed to reconcile user invite memberships"
+                "Failed to upsert user from legacy clerk webhook"
             );
             StatusCode::INTERNAL_SERVER_ERROR
         }

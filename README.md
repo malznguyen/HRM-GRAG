@@ -6,7 +6,7 @@ Current live architecture after Phase 1.5:
 
 - tenant and workspace hierarchy in PostgreSQL,
 - OpenFGA as the authorization source of truth,
-- Keycloak-backed tenant-owner bootstrap,
+- Keycloak-backed tenant-owner bootstrap and workspace member addition (verified users only),
 - original PDF storage in MinIO/S3 through `aws-sdk-s3` v1,
 - Qdrant vector retrieval for ACL-aware search,
 - document-level ACL and Qdrant retrieval are now live in Phase 2.
@@ -27,7 +27,7 @@ Historical v1 audit snapshots are archived under `docs/archive/v1/`.
 
 | Area | Current state |
 | --- | --- |
-| Identity and admin lookup | Keycloak-backed owner bootstrap; bearer JWT validation is live in the backend |
+| Identity and admin lookup | Keycloak-backed owner bootstrap + member addition (verified users only); bearer JWT validation is live in the backend |
 | Authorization | OpenFGA via `AuthzClient` and route-level relation checks |
 | Original document storage | S3-compatible object storage; MinIO in local development |
 | Current retrieval path | Qdrant vector search (ACL-aware filtering) and PostgreSQL graph tables |
@@ -43,8 +43,12 @@ Historical v1 audit snapshots are archived under `docs/archive/v1/`.
 - OpenFGA server
 - MinIO
 - minio-init bucket creation
+- Qdrant (REST `6333`, gRPC `6334`)
+- Keycloak (`8080`, `start-dev` + realm import for Admin API)
 
-Keycloak is not part of the current compose file and must be provided separately when you need real owner lookup or real bearer-token validation.
+**Keycloak scope in local compose:** the container is for **Admin API lookup** used by tenant-owner bootstrap and workspace member addition (`KeycloakClient.get_verified_user_by_email`). JWT validation still uses `CLERK_ISSUER` / the existing `test-bypass-jwt` path — Keycloak is **not** used for login or bearer-token validation in the current backend.
+
+Local Keycloak admin console: `http://localhost:8080` (default demo credentials `admin` / `admin`). Realm `gmrag` and confidential client `gmrag-admin-client` are imported from `docker/keycloak/gmrag-realm.json` on first start.
 
 ## Backend Environment
 
@@ -79,6 +83,17 @@ Copy `gmrag_api/.env.example` to `gmrag_api/.env` and fill in the values for:
    cargo run --bin seed-platform-admin -- --user-id=<keycloak_sub_id>
    ```
 
+4. **Member management (breaking change vs invite placeholders):** users must **sign up and verify email in identity first**, then a workspace admin can add them by email via `POST /workspaces/{id}/members`. The API resolves the real Keycloak `sub` and writes SQL + OpenFGA together. Adding someone who has not registered returns `USER_NOT_FOUND_IN_IDENTITY`. There is no invite-placeholder / pending-member flow — Keycloak is the identity source of truth so SQL and OpenFGA never desync on fake `invite_*` ids.
+
+5. **Upgrade cleanup (legacy DBs only):** if this environment previously used invite placeholders, run the operator cleanup **after deploying** the build that stopped creating them:
+
+   ```bash
+   cargo run --bin cleanup-invite-placeholders -- --dry-run
+   cargo run --bin cleanup-invite-placeholders -- --delete
+   ```
+
+   Default is dry-run; nothing is deleted without `--delete`. Safe to re-run. See `docs/RUNBOOK.md` §5.
+
 ## Phase 3A Hardening Commands
 
 Run these from `gmrag_api/`:
@@ -89,6 +104,8 @@ cargo run --bin cleanup-storage-objects -- --dry-run
 cargo run --bin cleanup-storage-objects -- --delete-orphans --delete
 cargo run --bin cleanup-storage-objects -- --workspace-id <workspace_uuid> --delete
 cargo run --bin cleanup-storage-objects -- --tenant-id <tenant_uuid> --delete
+cargo run --bin cleanup-invite-placeholders -- --dry-run
+cargo run --bin cleanup-invite-placeholders -- --delete
 cargo run --bin backfill-document-workspace-tuples
 ```
 

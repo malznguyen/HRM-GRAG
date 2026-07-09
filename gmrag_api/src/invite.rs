@@ -1,12 +1,16 @@
 use sqlx::PgPool;
 use std::hash::{Hash, Hasher};
 
-/// Normalizes emails for consistent lookup, invite ids, and reconciliation.
+/// Chuẩn hoá email để lookup nhất quán (trim + lowercase).
 pub fn normalize_email(email: &str) -> String {
     email.trim().to_lowercase()
 }
 
-/// Stable placeholder `users.id` for pending invites (must match webhook reconciliation).
+/// LEGACY — chỉ dùng cho migration dữ liệu cũ còn `invite_*`.
+///
+/// Flow placeholder invite đã bị gỡ: không được tạo user `invite_{email}` mới.
+/// Hàm này còn lại để nhận diện id placeholder trong migration một lần.
+#[deprecated(note = "Placeholder invites removed; only for one-time legacy migration")]
 pub fn invite_placeholder_user_id(email: &str) -> String {
     let email = normalize_email(email);
     let candidate = format!("invite_{email}");
@@ -19,9 +23,9 @@ pub fn invite_placeholder_user_id(email: &str) -> String {
     format!("invite_{:016x}", hasher.finish())
 }
 
-async fn upsert_clerk_user(
+async fn upsert_identity_user(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    clerk_user_id: &str,
+    user_id: &str,
     email: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -31,7 +35,7 @@ async fn upsert_clerk_user(
         ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email
         "#,
     )
-    .bind(clerk_user_id)
+    .bind(user_id)
     .bind(email)
     .execute(&mut **tx)
     .await?;
@@ -42,7 +46,7 @@ async fn upsert_clerk_user(
 async fn migrate_user_id(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     old_user_id: &str,
-    clerk_user_id: &str,
+    real_user_id: &str,
     email: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -57,7 +61,7 @@ async fn migrate_user_id(
           )
         "#,
     )
-    .bind(clerk_user_id)
+    .bind(real_user_id)
     .bind(old_user_id)
     .execute(&mut **tx)
     .await?;
@@ -69,7 +73,7 @@ async fn migrate_user_id(
         WHERE user_id = $2
         "#,
     )
-    .bind(clerk_user_id)
+    .bind(real_user_id)
     .bind(old_user_id)
     .execute(&mut **tx)
     .await?;
@@ -81,7 +85,7 @@ async fn migrate_user_id(
         WHERE user_id = $2
         "#,
     )
-    .bind(clerk_user_id)
+    .bind(real_user_id)
     .bind(old_user_id)
     .execute(&mut **tx)
     .await?;
@@ -91,15 +95,16 @@ async fn migrate_user_id(
         .execute(&mut **tx)
         .await?;
 
-    upsert_clerk_user(tx, clerk_user_id, email).await
+    upsert_identity_user(tx, real_user_id, email).await
 }
 
 async fn reconcile_invite_placeholder(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    clerk_user_id: &str,
+    real_user_id: &str,
     email: &str,
     placeholder_id: &str,
 ) -> Result<(), sqlx::Error> {
+    // Giải phóng unique email trước khi insert user thật
     sqlx::query(
         r#"
         UPDATE users
@@ -111,7 +116,7 @@ async fn reconcile_invite_placeholder(
     .execute(&mut **tx)
     .await?;
 
-    upsert_clerk_user(tx, clerk_user_id, email).await?;
+    upsert_identity_user(tx, real_user_id, email).await?;
 
     sqlx::query(
         r#"
@@ -125,7 +130,7 @@ async fn reconcile_invite_placeholder(
           )
         "#,
     )
-    .bind(clerk_user_id)
+    .bind(real_user_id)
     .bind(placeholder_id)
     .execute(&mut **tx)
     .await?;
@@ -137,7 +142,7 @@ async fn reconcile_invite_placeholder(
         WHERE user_id = $2
         "#,
     )
-    .bind(clerk_user_id)
+    .bind(real_user_id)
     .bind(placeholder_id)
     .execute(&mut **tx)
     .await?;
@@ -150,14 +155,27 @@ async fn reconcile_invite_placeholder(
     Ok(())
 }
 
-/// After Clerk signup, attach pending `workspace_members` rows to the real user id.
+/// LEGACY MIGRATION ONLY — không gọi từ request path thông thường.
+///
+/// Lý do gỡ placeholder invite: `reconcile_pending_invites` chỉ cập nhật SQL,
+/// không rewrite tuple OpenFGA → user thật bị 403 dù vẫn hiện trong member list.
+///
+/// Dùng một lần cho dữ liệu cũ còn `users.id LIKE 'invite_%'`. Sau migration,
+/// member addition chỉ chấp nhận user đã tồn tại (verified) trong Keycloak.
+///
+/// **Cảnh báo:** hàm này không ghi OpenFGA. Sau khi chạy, operator phải
+/// kiểm tra/sửa tuple workspace membership cho user thật nếu còn desync.
+#[deprecated(
+    note = "One-time legacy migration only; not called from normal request flows"
+)]
 pub async fn reconcile_pending_invites(
     pool: &PgPool,
-    clerk_user_id: &str,
+    real_user_id: &str,
     email: &str,
 ) -> Result<(), sqlx::Error> {
+    #[allow(deprecated)]
+    let expected_placeholder_id = invite_placeholder_user_id(email);
     let email = normalize_email(email);
-    let expected_placeholder_id = invite_placeholder_user_id(&email);
     let mut tx = pool.begin().await?;
 
     let placeholder_id: Option<String> = sqlx::query_scalar(
@@ -175,7 +193,7 @@ pub async fn reconcile_pending_invites(
     .await?;
 
     if let Some(placeholder_id) = placeholder_id {
-        reconcile_invite_placeholder(&mut tx, clerk_user_id, &email, &placeholder_id).await?;
+        reconcile_invite_placeholder(&mut tx, real_user_id, &email, &placeholder_id).await?;
     } else {
         let conflicting_user_id: Option<String> = sqlx::query_scalar(
             r#"
@@ -187,17 +205,35 @@ pub async fn reconcile_pending_invites(
             "#,
         )
         .bind(&email)
-        .bind(clerk_user_id)
+        .bind(real_user_id)
         .fetch_optional(&mut *tx)
         .await?;
 
         if let Some(old_user_id) = conflicting_user_id {
-            migrate_user_id(&mut tx, &old_user_id, clerk_user_id, &email).await?;
+            migrate_user_id(&mut tx, &old_user_id, real_user_id, &email).await?;
         } else {
-            upsert_clerk_user(&mut tx, clerk_user_id, &email).await?;
+            upsert_identity_user(&mut tx, real_user_id, &email).await?;
         }
     }
 
     tx.commit().await?;
+    Ok(())
+}
+
+/// Upsert user SQL theo identity id (JWT `sub` / Keycloak `sub`).
+/// Dùng cho sync profile — không liên quan placeholder invite.
+pub async fn upsert_user(pool: &PgPool, user_id: &str, email: &str) -> Result<(), sqlx::Error> {
+    let email = normalize_email(email);
+    sqlx::query(
+        r#"
+        INSERT INTO users (id, email)
+        VALUES ($1, $2)
+        ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email
+        "#,
+    )
+    .bind(user_id)
+    .bind(&email)
+    .execute(pool)
+    .await?;
     Ok(())
 }
