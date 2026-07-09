@@ -1,3 +1,4 @@
+pub mod backfill_node_embeddings;
 pub mod chunking;
 pub mod embedding;
 pub mod graph;
