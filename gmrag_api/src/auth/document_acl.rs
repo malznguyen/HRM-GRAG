@@ -1,9 +1,11 @@
 use std::collections::HashSet;
 
+use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::authz::{AuthzClient, AuthzError, Object, Relation};
+use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentAccessMode {
@@ -17,6 +19,13 @@ impl DocumentAccessMode {
             "workspace_default" => Some(Self::WorkspaceDefault),
             "restricted" => Some(Self::Restricted),
             _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WorkspaceDefault => "workspace_default",
+            Self::Restricted => "restricted",
         }
     }
 
@@ -150,10 +159,10 @@ pub async fn collect_viewable_document_ids(
         return Ok(visible_ids);
     }
 
-    let explicit_ids = list_document_relation_ids(authz_client, user_id, Relation::ExplicitViewer)
-        .await?;
-    let bypass_ids = list_document_relation_ids(authz_client, user_id, Relation::BypassViewer)
-        .await?;
+    let explicit_ids =
+        list_document_relation_ids(authz_client, user_id, Relation::ExplicitViewer).await?;
+    let bypass_ids =
+        list_document_relation_ids(authz_client, user_id, Relation::BypassViewer).await?;
 
     for doc_id in explicit_ids
         .into_iter()
@@ -261,6 +270,67 @@ pub async fn backfill_document_workspace_relations(
         inserted_relations,
         existing_relations,
     })
+}
+
+/// Đổi access_mode của document; trả về `None` nếu document không tồn tại trong workspace.
+pub async fn set_document_access_mode(
+    pool: &PgPool,
+    document_id: Uuid,
+    workspace_id: Uuid,
+    access_mode: DocumentAccessMode,
+    actor_user_id: &str,
+) -> Result<Option<()>, DocumentAclError> {
+    let current_raw: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT access_mode
+        FROM documents
+        WHERE id = $1 AND workspace_id = $2
+        "#,
+    )
+    .bind(document_id)
+    .bind(workspace_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(current_raw) = current_raw else {
+        return Ok(None);
+    };
+
+    let previous_mode = DocumentAccessMode::parse(&current_raw).ok_or(
+        DocumentAclError::InvalidAccessMode {
+            document_id,
+            raw_mode: current_raw,
+        },
+    )?;
+
+    sqlx::query(
+        r#"
+        UPDATE documents
+        SET access_mode = $1
+        WHERE id = $2 AND workspace_id = $3
+        "#,
+    )
+    .bind(access_mode.as_str())
+    .bind(document_id)
+    .bind(workspace_id)
+    .execute(pool)
+    .await?;
+
+    insert_audit_event(
+        pool,
+        AuditEventRecord::new(AuditEventType::DocumentAccessModeChanged)
+            .with_actor_user_id(actor_user_id.to_string())
+            .with_workspace_id(workspace_id)
+            .with_document_id(document_id)
+            .with_target("document", document_id.to_string())
+            .with_metadata(json!({
+                "previous_access_mode": previous_mode.as_str(),
+                "access_mode": access_mode.as_str(),
+            })),
+    )
+    .await?;
+
+    Ok(Some(()))
 }
 
 pub async fn grant_document_explicit_viewer(

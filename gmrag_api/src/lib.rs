@@ -22,7 +22,8 @@ use routes::chat::{
 };
 use routes::documents::{
     delete_document, get_document_chunk, get_document_preview, list_documents,
-    retry_document_ingestion, upload_document,
+    patch_document_access_mode, retry_document_ingestion, revoke_document_share, share_document,
+    upload_document,
 };
 use routes::graph::get_workspace_graph;
 use routes::members::{
@@ -87,6 +88,14 @@ pub fn app_router(state: AppState) -> Router {
         .route(
             "/workspaces/{workspace_id}/documents/{document_id}/retry",
             post(retry_document_ingestion),
+        )
+        .route(
+            "/workspaces/{workspace_id}/documents/{document_id}/access-mode",
+            axum::routing::patch(patch_document_access_mode),
+        )
+        .route(
+            "/workspaces/{workspace_id}/documents/{document_id}/shares/{user_id}",
+            post(share_document).delete(revoke_document_share),
         )
         .route(
             "/workspaces/{workspace_id}/documents/{document_id}/preview",

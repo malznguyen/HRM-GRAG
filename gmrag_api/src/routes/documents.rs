@@ -5,20 +5,29 @@ use axum::{
     response::IntoResponse,
 };
 use chrono::NaiveDateTime;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::auth::authz::{ApiError, Authz, Object, Relation};
+use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event};
+use crate::auth::authz::{ApiError, Authz, Object, Relation, TupleKey};
 use crate::auth::document_acl::{
-    DocumentAccessMode, DocumentAclRow, collect_viewable_document_ids,
-    ensure_document_workspace_relation, can_user_view_document, remove_document_workspace_relation,
+    DocumentAccessMode, DocumentAclRow, can_user_view_document, collect_viewable_document_ids,
+    ensure_document_workspace_relation, grant_document_explicit_viewer,
+    remove_document_workspace_relation, revoke_document_explicit_viewer, set_document_access_mode,
 };
+use crate::auth::outbox::enqueue_tuple_delete;
 use crate::ingestion::processor::spawn_document_processing;
 use crate::state::AppState;
 use crate::storage::build_original_document_object_key;
+
+#[derive(Deserialize)]
+pub struct SetDocumentAccessModeRequest {
+    pub access_mode: String,
+}
 
 #[derive(Serialize)]
 pub struct UploadedDocumentItem {
@@ -334,12 +343,13 @@ pub async fn list_documents(
             let acl_rows = match rows
                 .iter()
                 .map(|row| {
-                    let access_mode = DocumentAccessMode::parse(&row.access_mode).ok_or_else(|| {
-                        format!(
-                            "invalid access_mode '{}' for document {}",
-                            row.access_mode, row.id
-                        )
-                    })?;
+                    let access_mode =
+                        DocumentAccessMode::parse(&row.access_mode).ok_or_else(|| {
+                            format!(
+                                "invalid access_mode '{}' for document {}",
+                                row.access_mode, row.id
+                            )
+                        })?;
                     Ok(DocumentAclRow {
                         document_id: row.id,
                         access_mode,
@@ -359,24 +369,21 @@ pub async fn list_documents(
                 }
             };
 
-            let visible_ids = match collect_viewable_document_ids(
-                &state.authz_client,
-                &authz.user_id,
-                &acl_rows,
-            )
-            .await
-            {
-                Ok(ids) => ids,
-                Err(err) => {
-                    error!(
-                        error = %err,
-                        user_id = %authz.user_id,
-                        workspace_id = %workspace_id,
-                        "Failed to apply document ACL while listing"
-                    );
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            };
+            let visible_ids =
+                match collect_viewable_document_ids(&state.authz_client, &authz.user_id, &acl_rows)
+                    .await
+                {
+                    Ok(ids) => ids,
+                    Err(err) => {
+                        error!(
+                            error = %err,
+                            user_id = %authz.user_id,
+                            workspace_id = %workspace_id,
+                            "Failed to apply document ACL while listing"
+                        );
+                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                    }
+                };
 
             let documents: Vec<DocumentResponse> = rows
                 .into_iter()
@@ -402,6 +409,255 @@ pub async fn list_documents(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+pub async fn patch_document_access_mode(
+    State(state): State<AppState>,
+    authz: Authz,
+    Path((workspace_id, document_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<SetDocumentAccessModeRequest>,
+) -> impl IntoResponse {
+    if let Err(err) = authz
+        .require_relation(Relation::Admin, &Object::Workspace(workspace_id))
+        .await
+    {
+        return err.into_response();
+    }
+
+    let access_mode = match DocumentAccessMode::parse(&body.access_mode) {
+        Some(mode) => mode,
+        None => {
+            return ApiError {
+                status: StatusCode::BAD_REQUEST,
+                code: "INVALID_ACCESS_MODE",
+                message: "access_mode must be workspace_default or restricted".to_string(),
+            }
+            .into_response();
+        }
+    };
+
+    match set_document_access_mode(
+        &state.pool,
+        document_id,
+        workspace_id,
+        access_mode,
+        &authz.user_id,
+    )
+    .await
+    {
+        Ok(Some(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to set document access_mode"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn share_document(
+    State(state): State<AppState>,
+    authz: Authz,
+    Path((workspace_id, document_id, user_id)): Path<(Uuid, Uuid, String)>,
+) -> impl IntoResponse {
+    if let Err(err) = authz
+        .require_relation(Relation::Admin, &Object::Workspace(workspace_id))
+        .await
+    {
+        return err.into_response();
+    }
+
+    match document_exists_in_workspace(&state.pool, workspace_id, document_id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to verify document before share"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
+    match is_workspace_member(&state.pool, workspace_id, &user_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return ApiError {
+                status: StatusCode::BAD_REQUEST,
+                code: "USER_NOT_WORKSPACE_MEMBER",
+                message: "Target user is not a member of this workspace".to_string(),
+            }
+            .into_response();
+        }
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                target_user_id = %user_id,
+                "Failed to verify workspace membership before document share"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
+    if let Err(err) =
+        grant_document_explicit_viewer(&state.pool, &state.authz_client, document_id, &user_id)
+            .await
+    {
+        error!(
+            error = %err,
+            user_id = %authz.user_id,
+            workspace_id = %workspace_id,
+            document_id = %document_id,
+            target_user_id = %user_id,
+            "Failed to grant document explicit viewer"
+        );
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    if let Err(err) = insert_audit_event(
+        &state.pool,
+        AuditEventRecord::new(AuditEventType::DocumentShared)
+            .with_actor_user_id(authz.user_id.clone())
+            .with_workspace_id(workspace_id)
+            .with_document_id(document_id)
+            .with_target("document_share", user_id.clone())
+            .with_metadata(json!({
+                "shared_with_user_id": user_id,
+            })),
+    )
+    .await
+    {
+        error!(
+            error = %err,
+            actor_user_id = %authz.user_id,
+            workspace_id = %workspace_id,
+            document_id = %document_id,
+            "Failed to write audit event for document share"
+        );
+    }
+
+    StatusCode::CREATED.into_response()
+}
+
+pub async fn revoke_document_share(
+    State(state): State<AppState>,
+    authz: Authz,
+    Path((workspace_id, document_id, user_id)): Path<(Uuid, Uuid, String)>,
+) -> impl IntoResponse {
+    if let Err(err) = authz
+        .require_relation(Relation::Admin, &Object::Workspace(workspace_id))
+        .await
+    {
+        return err.into_response();
+    }
+
+    match document_exists_in_workspace(&state.pool, workspace_id, document_id).await {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to verify document before revoke share"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
+    if let Err(err) =
+        revoke_document_explicit_viewer(&state.pool, &state.authz_client, document_id, &user_id)
+            .await
+    {
+        error!(
+            error = %err,
+            user_id = %authz.user_id,
+            workspace_id = %workspace_id,
+            document_id = %document_id,
+            target_user_id = %user_id,
+            "Failed to revoke document explicit viewer"
+        );
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    if let Err(err) = insert_audit_event(
+        &state.pool,
+        AuditEventRecord::new(AuditEventType::DocumentShareRevoked)
+            .with_actor_user_id(authz.user_id.clone())
+            .with_workspace_id(workspace_id)
+            .with_document_id(document_id)
+            .with_target("document_share", user_id.clone())
+            .with_metadata(json!({
+                "revoked_user_id": user_id,
+            })),
+    )
+    .await
+    {
+        error!(
+            error = %err,
+            actor_user_id = %authz.user_id,
+            workspace_id = %workspace_id,
+            document_id = %document_id,
+            "Failed to write audit event for document share revoke"
+        );
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn document_exists_in_workspace(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    document_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let exists: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM documents
+            WHERE id = $1 AND workspace_id = $2
+        )
+        "#,
+    )
+    .bind(document_id)
+    .bind(workspace_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(exists)
+}
+
+async fn is_workspace_member(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    user_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let exists: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM workspace_members
+            WHERE workspace_id = $1 AND user_id = $2
+        )
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(exists)
 }
 
 pub async fn delete_document(
@@ -533,12 +789,9 @@ pub async fn delete_document(
 
     match result {
         Ok(_) => {
-            if let Err(err) = remove_document_workspace_relation(
-                &state.authz_client,
-                workspace_id,
-                document_id,
-            )
-            .await
+            if let Err(err) =
+                remove_document_workspace_relation(&state.authz_client, workspace_id, document_id)
+                    .await
             {
                 error!(
                     error = %err,
@@ -547,19 +800,62 @@ pub async fn delete_document(
                     document_id = %document_id,
                     "Failed to delete document workspace relation in OpenFGA"
                 );
+
+                let tuple = TupleKey {
+                    user: format!("workspace:{workspace_id}"),
+                    relation: Relation::Workspace.as_str().to_string(),
+                    object: Object::Document(document_id).to_string(),
+                };
+
+                if let Err(outbox_err) = enqueue_tuple_delete(&state.pool, &tuple).await {
+                    error!(
+                        error = %outbox_err,
+                        user_id = %authz.user_id,
+                        workspace_id = %workspace_id,
+                        document_id = %document_id,
+                        "Failed to enqueue authz outbox recovery event for document delete"
+                    );
+                }
             }
 
-            if let Err(err) = state.storage.delete_object(&delete_target.object_key).await {
-                // TODO: Phase 3 can bo sung cleanup worker/outbox de xu ly object con sot sau delete.
+            let storage_delete_succeeded =
+                if let Err(err) = state.storage.delete_object(&delete_target.object_key).await {
+                    // TODO: Phase 3 can bo sung cleanup worker/outbox de xu ly object con sot sau delete.
+                    error!(
+                        error = %err,
+                        user_id = %authz.user_id,
+                        workspace_id = %workspace_id,
+                        document_id = %document_id,
+                        object_key = %delete_target.object_key,
+                        "Failed to delete document object after database cleanup"
+                    );
+                    false
+                } else {
+                    true
+                };
+
+            if let Err(err) = insert_audit_event(
+                &state.pool,
+                AuditEventRecord::new(AuditEventType::DocumentDeleted)
+                    .with_actor_user_id(authz.user_id.clone())
+                    .with_workspace_id(workspace_id)
+                    .with_document_id(document_id)
+                    .with_target("document", document_id.to_string())
+                    .with_metadata(json!({
+                        "storage_delete_succeeded": storage_delete_succeeded
+                    })),
+            )
+            .await
+            {
                 error!(
                     error = %err,
-                    user_id = %authz.user_id,
+                    actor_user_id = %authz.user_id,
                     workspace_id = %workspace_id,
                     document_id = %document_id,
-                    object_key = %delete_target.object_key,
-                    "Failed to delete document object after database cleanup"
+                    "Failed to write audit event for document delete"
                 );
             }
+
             StatusCode::NO_CONTENT.into_response()
         }
         Err(err) => {
@@ -671,6 +967,25 @@ pub async fn retry_document_ingestion(
         document_id,
         state.ingestion_limiter.clone(),
     );
+
+    if let Err(err) = insert_audit_event(
+        &state.pool,
+        AuditEventRecord::new(AuditEventType::DocumentRetryStarted)
+            .with_actor_user_id(authz.user_id.clone())
+            .with_workspace_id(workspace_id)
+            .with_document_id(document_id)
+            .with_target("document", document_id.to_string()),
+    )
+    .await
+    {
+        error!(
+            error = %err,
+            actor_user_id = %authz.user_id,
+            workspace_id = %workspace_id,
+            document_id = %document_id,
+            "Failed to write audit event for document retry"
+        );
+    }
 
     StatusCode::ACCEPTED.into_response()
 }
@@ -860,12 +1175,8 @@ pub async fn upload_document(
             continue;
         }
 
-        if let Err(err) = ensure_document_workspace_relation(
-            &state.authz_client,
-            workspace_id,
-            document_id,
-        )
-        .await
+        if let Err(err) =
+            ensure_document_workspace_relation(&state.authz_client, workspace_id, document_id).await
         {
             error!(
                 error = %err,
@@ -916,6 +1227,32 @@ pub async fn upload_document(
             document_id,
             state.ingestion_limiter.clone(),
         );
+
+        if let Err(err) = insert_audit_event(
+            &state.pool,
+            AuditEventRecord::new(AuditEventType::DocumentUploaded)
+                .with_actor_user_id(authz.user_id.clone())
+                .with_tenant_id(tenant_id)
+                .with_workspace_id(workspace_id)
+                .with_document_id(document_id)
+                .with_target("document", document_id.to_string())
+                .with_metadata(json!({
+                    "filename": filename.clone(),
+                    "size_bytes": size_bytes,
+                    "content_type": content_type.clone()
+                })),
+        )
+        .await
+        {
+            error!(
+                error = %err,
+                actor_user_id = %authz.user_id,
+                tenant_id = %tenant_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to write audit event for document upload"
+            );
+        }
 
         uploaded.push(UploadedDocumentItem {
             document_id,

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::{
     Json, Router,
@@ -18,6 +18,11 @@ use gmrag_api::auth::document_acl::backfill_document_workspace_relations;
 use gmrag_api::state::AppState;
 
 const EMBEDDING_DIM: usize = 768;
+static PHASE2_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn phase2_test_lock() -> &'static Mutex<()> {
+    PHASE2_TEST_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 #[derive(Default)]
 struct QdrantMockInner {
@@ -136,6 +141,7 @@ impl TestServer {
 
 #[tokio::test]
 async fn phase2_document_acl_and_qdrant_enforcement() {
+    let _guard = phase2_test_lock().lock().await;
     let server = TestServer::bootstrap().await;
 
     let tenant_id = Uuid::new_v4();
@@ -160,7 +166,12 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         .await
         .unwrap();
 
-    for user in [&platform_admin, &tenant_owner, &member_user, &explicit_viewer] {
+    for user in [
+        &platform_admin,
+        &tenant_owner,
+        &member_user,
+        &explicit_viewer,
+    ] {
         sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
             .bind(user)
             .bind(format!("{user}@test.local"))
@@ -176,26 +187,32 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         .await
         .unwrap();
 
-    sqlx::query("INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'MEMBER')")
-        .bind(workspace_id)
-        .bind(&member_user)
-        .execute(&server.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'MEMBER')",
+    )
+    .bind(workspace_id)
+    .bind(&member_user)
+    .execute(&server.pool)
+    .await
+    .unwrap();
 
-    sqlx::query("INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'MEMBER')")
-        .bind(workspace_id)
-        .bind(&explicit_viewer)
-        .execute(&server.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'MEMBER')",
+    )
+    .bind(workspace_id)
+    .bind(&explicit_viewer)
+    .execute(&server.pool)
+    .await
+    .unwrap();
 
-    sqlx::query("INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'ADMIN')")
-        .bind(workspace_id)
-        .bind(&tenant_owner)
-        .execute(&server.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'ADMIN')",
+    )
+    .bind(workspace_id)
+    .bind(&tenant_owner)
+    .execute(&server.pool)
+    .await
+    .unwrap();
 
     let public_doc_id = Uuid::new_v4();
     let legacy_public_doc_id = Uuid::new_v4();
@@ -290,7 +307,10 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
 
     // List filtering and restricted allow/deny.
     let member_docs = client
-        .get(format!("{}/workspaces/{workspace_id}/documents", server.addr))
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents",
+            server.addr
+        ))
         .bearer_auth(&member_user)
         .send()
         .await
@@ -330,7 +350,10 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
     assert_eq!(legacy_chunk.status(), reqwest::StatusCode::OK);
 
     let viewer_docs = client
-        .get(format!("{}/workspaces/{workspace_id}/documents", server.addr))
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents",
+            server.addr
+        ))
         .bearer_auth(&explicit_viewer)
         .send()
         .await
@@ -346,7 +369,10 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
     assert!(viewer_doc_ids.contains(&restricted_doc_id.to_string()));
 
     let owner_docs = client
-        .get(format!("{}/workspaces/{workspace_id}/documents", server.addr))
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents",
+            server.addr
+        ))
         .bearer_auth(&tenant_owner)
         .send()
         .await
@@ -481,7 +507,11 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         .as_array()
         .unwrap_or(&Vec::new())
         .iter()
-        .filter_map(|node| node.get("entity_name").and_then(Value::as_str).map(str::to_string))
+        .filter_map(|node| {
+            node.get("entity_name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .collect();
     assert!(member_node_names.contains(&"PublicEntity".to_string()));
     assert!(!member_node_names.contains(&"SecretEntity".to_string()));
@@ -498,20 +528,26 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         .as_array()
         .unwrap_or(&Vec::new())
         .iter()
-        .filter_map(|node| node.get("entity_name").and_then(Value::as_str).map(str::to_string))
+        .filter_map(|node| {
+            node.get("entity_name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
         .collect();
     assert!(viewer_node_names.contains(&"SecretEntity".to_string()));
 
     // Citation-facing endpoint re-check for historical messages.
     let history_session_member = Uuid::new_v4();
-    sqlx::query("INSERT INTO chat_sessions (id, workspace_id, user_id, title) VALUES ($1, $2, $3, $4)")
-        .bind(history_session_member)
-        .bind(workspace_id)
-        .bind(&member_user)
-        .bind("acl-history")
-        .execute(&server.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO chat_sessions (id, workspace_id, user_id, title) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(history_session_member)
+    .bind(workspace_id)
+    .bind(&member_user)
+    .bind("acl-history")
+    .execute(&server.pool)
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO chat_messages (session_id, role, content, citations) VALUES ($1, 'assistant', $2, $3)",
     )
@@ -574,7 +610,10 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
     assert!(!system_prompt.contains("secret beta content"));
 
     let qdrant_payload = server.qdrant_mock.latest_search_payload().await.unwrap();
-    let must_conditions = qdrant_payload["filter"]["must"].as_array().cloned().unwrap_or_default();
+    let must_conditions = qdrant_payload["filter"]["must"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let workspace_filter = must_conditions
         .iter()
         .find(|cond| cond.get("key").and_then(Value::as_str) == Some("workspace_id"))
@@ -632,6 +671,7 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
 
 #[tokio::test]
 async fn legacy_restricted_docs_need_backfill_for_owner_bypass() {
+    let _guard = phase2_test_lock().lock().await;
     let server = TestServer::bootstrap().await;
     let client = Client::new();
 
@@ -740,6 +780,298 @@ async fn legacy_restricted_docs_need_backfill_for_owner_bypass() {
         .await
         .unwrap();
     assert_eq!(after.status(), reqwest::StatusCode::OK);
+}
+
+#[tokio::test]
+async fn phase2_access_mode_and_share_endpoints_allow_and_deny() {
+    let _guard = phase2_test_lock().lock().await;
+    let server = TestServer::bootstrap().await;
+
+    let tenant_id = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
+    let platform_admin = format!("phase2-mgmt-platform-{}", Uuid::new_v4());
+    let workspace_admin = format!("phase2-mgmt-admin-{}", Uuid::new_v4());
+    let member_user = format!("phase2-mgmt-member-{}", Uuid::new_v4());
+    let share_target = format!("phase2-mgmt-share-{}", Uuid::new_v4());
+
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(tenant_id)
+        .bind(format!("Mgmt Tenant {tenant_id}"))
+        .execute(&server.pool)
+        .await
+        .unwrap();
+
+    sqlx::query("INSERT INTO workspaces (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(workspace_id)
+        .bind(tenant_id)
+        .bind(format!("Mgmt Workspace {workspace_id}"))
+        .execute(&server.pool)
+        .await
+        .unwrap();
+
+    for user in [
+        &platform_admin,
+        &workspace_admin,
+        &member_user,
+        &share_target,
+    ] {
+        sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
+            .bind(user)
+            .bind(format!("{user}@test.local"))
+            .execute(&server.pool)
+            .await
+            .unwrap();
+    }
+
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'ADMIN')",
+    )
+    .bind(workspace_id)
+    .bind(&workspace_admin)
+    .execute(&server.pool)
+    .await
+    .unwrap();
+
+    for member in [&member_user, &share_target] {
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'MEMBER')",
+        )
+        .bind(workspace_id)
+        .bind(member)
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    }
+
+    let document_id = Uuid::new_v4();
+    insert_document(
+        &server.pool,
+        workspace_id,
+        document_id,
+        &workspace_admin,
+        "mgmt-doc.pdf",
+        "workspace_default",
+    )
+    .await;
+
+    let chunk_id = Uuid::new_v4();
+    insert_chunk(
+        &server.pool,
+        chunk_id,
+        document_id,
+        workspace_id,
+        0,
+        "mgmt secret content",
+        0.42,
+    )
+    .await;
+
+    server
+        .state
+        .authz_client
+        .write_tuple(
+            &format!("user:{platform_admin}"),
+            Relation::Admin,
+            &Object::Platform,
+        )
+        .await
+        .unwrap();
+    server
+        .state
+        .authz_client
+        .write_tuple(
+            "platform:system",
+            Relation::Platform,
+            &Object::Tenant(tenant_id),
+        )
+        .await
+        .unwrap();
+    server
+        .state
+        .authz_client
+        .write_tuple(
+            &format!("tenant:{tenant_id}"),
+            Relation::Tenant,
+            &Object::Workspace(workspace_id),
+        )
+        .await
+        .unwrap();
+    server
+        .state
+        .authz_client
+        .write_tuple(
+            &format!("user:{workspace_admin}"),
+            Relation::Admin,
+            &Object::Workspace(workspace_id),
+        )
+        .await
+        .unwrap();
+    for member in [&member_user, &share_target] {
+        server
+            .state
+            .authz_client
+            .write_tuple(
+                &format!("user:{member}"),
+                Relation::Member,
+                &Object::Workspace(workspace_id),
+            )
+            .await
+            .unwrap();
+    }
+    write_tuple_idempotent(
+        &server.state,
+        &format!("workspace:{workspace_id}"),
+        Relation::Workspace,
+        &Object::Document(document_id),
+    )
+    .await;
+
+    let client = Client::new();
+
+    // Deny: member cannot patch access_mode.
+    let member_patch = client
+        .patch(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/access-mode",
+            server.addr
+        ))
+        .bearer_auth(&member_user)
+        .json(&json!({ "access_mode": "restricted" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(member_patch.status(), reqwest::StatusCode::FORBIDDEN);
+    let member_patch_body: Value = member_patch.json().await.unwrap();
+    assert_eq!(
+        member_patch_body["error"]["code"],
+        json!("WORKSPACE_ADMIN_REQUIRED")
+    );
+
+    // Allow: admin sets restricted; document becomes hidden from ordinary member.
+    let admin_patch = client
+        .patch(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/access-mode",
+            server.addr
+        ))
+        .bearer_auth(&workspace_admin)
+        .json(&json!({ "access_mode": "restricted" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_patch.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let access_mode: String = sqlx::query_scalar(
+        "SELECT access_mode FROM documents WHERE id = $1 AND workspace_id = $2",
+    )
+    .bind(document_id)
+    .bind(workspace_id)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(access_mode, "restricted");
+
+    let member_preview_before_share = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/preview",
+            server.addr
+        ))
+        .bearer_auth(&member_user)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        member_preview_before_share.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    // Deny: member cannot share.
+    let member_share = client
+        .post(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/shares/{share_target}",
+            server.addr
+        ))
+        .bearer_auth(&member_user)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(member_share.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // Allow: admin shares with target member; target can preview.
+    let admin_share = client
+        .post(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/shares/{share_target}",
+            server.addr
+        ))
+        .bearer_auth(&workspace_admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_share.status(), reqwest::StatusCode::CREATED);
+
+    let share_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM document_shares WHERE document_id = $1 AND user_id = $2",
+    )
+    .bind(document_id)
+    .bind(&share_target)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(share_count, 1);
+
+    let shared_preview = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/preview",
+            server.addr
+        ))
+        .bearer_auth(&share_target)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shared_preview.status(), reqwest::StatusCode::OK);
+
+    // Deny: member cannot revoke.
+    let member_revoke = client
+        .delete(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/shares/{share_target}",
+            server.addr
+        ))
+        .bearer_auth(&member_user)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(member_revoke.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // Allow: admin revokes; target can no longer preview.
+    let admin_revoke = client
+        .delete(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/shares/{share_target}",
+            server.addr
+        ))
+        .bearer_auth(&workspace_admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_revoke.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let share_count_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM document_shares WHERE document_id = $1 AND user_id = $2",
+    )
+    .bind(document_id)
+    .bind(&share_target)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(share_count_after, 0);
+
+    let revoked_preview = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/preview",
+            server.addr
+        ))
+        .bearer_auth(&share_target)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(revoked_preview.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
 async fn insert_document(
@@ -983,25 +1315,21 @@ async fn seed_openfga(
         .await
         .unwrap();
 
-    state
-        .authz_client
-        .write_tuple(
-            &format!("workspace:{workspace_id}"),
-            Relation::Workspace,
-            &Object::Document(public_doc_id),
-        )
-        .await
-        .unwrap();
+    write_tuple_idempotent(
+        state,
+        &format!("workspace:{workspace_id}"),
+        Relation::Workspace,
+        &Object::Document(public_doc_id),
+    )
+    .await;
 
-    state
-        .authz_client
-        .write_tuple(
-            &format!("workspace:{workspace_id}"),
-            Relation::Workspace,
-            &Object::Document(restricted_doc_id),
-        )
-        .await
-        .unwrap();
+    write_tuple_idempotent(
+        state,
+        &format!("workspace:{workspace_id}"),
+        Relation::Workspace,
+        &Object::Document(restricted_doc_id),
+    )
+    .await;
 
     state
         .authz_client
@@ -1012,6 +1340,15 @@ async fn seed_openfga(
         )
         .await
         .unwrap();
+}
+
+async fn write_tuple_idempotent(state: &AppState, user: &str, relation: Relation, object: &Object) {
+    match state.authz_client.write_tuple(user, relation, object).await {
+        Ok(()) => {}
+        Err(gmrag_api::auth::authz::AuthzError::OpenFga { body, .. })
+            if body.to_ascii_lowercase().contains("already exists") => {}
+        Err(err) => panic!("failed to write tuple: {err}"),
+    }
 }
 
 fn init_test_env(qdrant_addr: &str, ollama_addr: &str, deepseek_addr: &str) {
@@ -1062,7 +1399,10 @@ async fn qdrant_upsert_points(
     Path(_collection): Path<String>,
     Json(_payload): Json<Value>,
 ) -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({"status":"ok","result":{"operation_id":1}})))
+    (
+        StatusCode::OK,
+        Json(json!({"status":"ok","result":{"operation_id":1}})),
+    )
 }
 
 async fn qdrant_search_points(
@@ -1078,7 +1418,10 @@ async fn qdrant_search_points(
         .map(|chunk_id| json!({"id": chunk_id.to_string(), "score": 0.9}))
         .collect::<Vec<_>>();
 
-    (StatusCode::OK, Json(json!({"status":"ok","result":results})))
+    (
+        StatusCode::OK,
+        Json(json!({"status":"ok","result":results})),
+    )
 }
 
 fn ollama_router() -> Router {
@@ -1120,10 +1463,7 @@ async fn deepseek_chat_completion(
     });
     let body = format!("data: {chunk}\n\ndata: [DONE]\n\n");
 
-    (
-        [(header::CONTENT_TYPE, "text/event-stream")],
-        body,
-    )
+    ([(header::CONTENT_TYPE, "text/event-stream")], body)
 }
 
 async fn spawn_mock_server(router: Router) -> String {
