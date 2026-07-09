@@ -29,6 +29,8 @@ pub enum AuditEventType {
     InvitePlaceholderCleanupDryRun,
     InvitePlaceholderCleanupCompleted,
     InvitePlaceholderCleanupFailed,
+    GraphNodeEmbeddingBackfillCompleted,
+    GraphNodeEmbeddingBackfillFailed,
 }
 
 impl AuditEventType {
@@ -67,6 +69,12 @@ impl AuditEventType {
                 "invite_placeholder_cleanup_completed"
             }
             AuditEventType::InvitePlaceholderCleanupFailed => "invite_placeholder_cleanup_failed",
+            AuditEventType::GraphNodeEmbeddingBackfillCompleted => {
+                "graph_node_embedding_backfill_completed"
+            }
+            AuditEventType::GraphNodeEmbeddingBackfillFailed => {
+                "graph_node_embedding_backfill_failed"
+            }
         }
     }
 }
