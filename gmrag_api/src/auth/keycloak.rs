@@ -100,17 +100,21 @@ impl KeycloakClient {
         email: &str,
     ) -> Result<Option<KeycloakUser>, reqwest::Error> {
         if test_bypass_enabled("TEST_BYPASS_KEYCLOAK") {
-            if email == "verified-owner@test.com" {
-                return Ok(Some(KeycloakUser {
-                    id: "verified-keycloak-owner-uuid".to_string(),
-                    email: Some(email.to_string()),
-                    email_verified: Some(true),
-                }));
-            } else if email == "unverified-owner@test.com" {
-                return Ok(None);
-            } else {
-                return Ok(None);
-            }
+            // Map email cố định cho integration test (tenant owner + member add)
+            let bypass_user = match email {
+                "verified-owner@test.com" => Some(("verified-keycloak-owner-uuid", email)),
+                "member@test.com" => Some(("test-workspace-member-id", email)),
+                "new_member@test.com" => Some(("test-new-member-id", email)),
+                "admin@test.com" => Some(("test-workspace-admin-id", email)),
+                "unverified-owner@test.com" => None,
+                _ => None,
+            };
+
+            return Ok(bypass_user.map(|(id, email)| KeycloakUser {
+                id: id.to_string(),
+                email: Some(email.to_string()),
+                email_verified: Some(true),
+            }));
         }
 
         let token = self.get_token().await?;

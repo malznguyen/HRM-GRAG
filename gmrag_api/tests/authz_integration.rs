@@ -264,15 +264,8 @@ async fn test_authz_enforcement_suite() {
     assert_eq!(list_docs_by_admin.status(), reqwest::StatusCode::FORBIDDEN);
 
     // Verification 2b: Tenant Owner can add workspace member
+    // Email được Keycloak test-bypass resolve → test-workspace-member-id
     let workspace_member_id = "test-workspace-member-id";
-    // Sync member in user DB first so axum doesn't reject as non-existent user
-    let _ = sqlx::query(
-        "INSERT INTO users (id, email) VALUES ($1, 'member@test.com') ON CONFLICT DO NOTHING",
-    )
-    .bind(workspace_member_id)
-    .execute(&test_server.pool)
-    .await
-    .unwrap();
 
     let add_member_resp = client
         .post(&format!(
@@ -288,6 +281,27 @@ async fn test_authz_enforcement_suite() {
         .await
         .unwrap();
     assert_eq!(add_member_resp.status(), reqwest::StatusCode::CREATED);
+
+    // Verification 2b-not-found: email chưa có trong Keycloak → USER_NOT_FOUND_IN_IDENTITY
+    let missing_member_resp = client
+        .post(&format!(
+            "{}/workspaces/{}/members",
+            test_server.addr, workspace_id
+        ))
+        .bearer_auth(tenant_owner_id)
+        .json(&json!({
+            "email": "never-signed-up@test.com",
+            "role": "MEMBER"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_member_resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let missing_body: serde_json::Value = missing_member_resp.json().await.unwrap();
+    assert_eq!(
+        missing_body["error"]["code"],
+        "USER_NOT_FOUND_IN_IDENTITY"
+    );
 
     // Verification 2c: Tenant Owner can patch member role
     let patch_role_resp = client
@@ -358,14 +372,8 @@ async fn test_authz_enforcement_suite() {
         .unwrap();
 
     // Verification 3a: Workspace Admin can add/remove workspace members
+    // Keycloak test-bypass map new_member@test.com → test-new-member-id
     let new_member_id = "test-new-member-id";
-    let _ = sqlx::query(
-        "INSERT INTO users (id, email) VALUES ($1, 'new_member@test.com') ON CONFLICT DO NOTHING",
-    )
-    .bind(new_member_id)
-    .execute(&test_server.pool)
-    .await
-    .unwrap();
 
     let admin_add_resp = client
         .post(&format!(

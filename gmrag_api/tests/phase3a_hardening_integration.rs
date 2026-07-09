@@ -10,6 +10,9 @@ use gmrag_api::auth::authz::{AuthzClient, Object, Relation, TupleKey};
 use gmrag_api::auth::outbox::{
     AuthzOutboxProcessorConfig, enqueue_tuple_delete, enqueue_tuple_write, process_authz_outbox,
 };
+use gmrag_api::invite_cleanup::{
+    InvitePlaceholderCleanupOptions, cleanup_invite_placeholders, find_invite_placeholders,
+};
 use gmrag_api::state::AppState;
 use gmrag_api::storage::cleanup::{
     StorageCleanupOptions, build_tenant_prefix, build_workspace_prefix, cleanup_prefix,
@@ -418,6 +421,154 @@ async fn member_role_change_writes_audit_event() {
             Relation::Admin,
             &Object::Workspace(workspace_id),
         )
+        .await;
+}
+
+#[tokio::test]
+async fn invite_placeholder_cleanup_dry_run_does_not_delete() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    let authz_client = AuthzClient::from_env().unwrap();
+
+    let suffix = Uuid::new_v4();
+    let placeholder_id = format!("invite_cleanup-test-{suffix}@example.com");
+    let email = format!("cleanup-test-{suffix}@example.com");
+    let workspace_id = Uuid::new_v4();
+    let tenant_id = Uuid::new_v4();
+
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(tenant_id)
+        .bind("invite-cleanup-tenant")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO workspaces (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(workspace_id)
+        .bind(tenant_id)
+        .bind("invite-cleanup-ws")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
+        .bind(&placeholder_id)
+        .bind(&email)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'MEMBER')",
+    )
+    .bind(workspace_id)
+    .bind(&placeholder_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    authz_client
+        .write_tuple(
+            &format!("user:{placeholder_id}"),
+            Relation::Member,
+            &Object::Workspace(workspace_id),
+        )
+        .await
+        .unwrap();
+
+    // Dry-run: báo cáo có placeholder nhưng không xoá.
+    let report = cleanup_invite_placeholders(
+        &pool,
+        &authz_client,
+        InvitePlaceholderCleanupOptions {
+            allow_delete: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        report
+            .placeholders
+            .iter()
+            .any(|p| p.user_id == placeholder_id),
+        "dry-run should report the seeded placeholder"
+    );
+    assert!(!report.deleted);
+    assert_eq!(report.users_deleted, 0);
+    assert_eq!(report.openfga_tuples_deleted, 0);
+
+    let still_exists: Option<String> =
+        sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
+            .bind(&placeholder_id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    assert_eq!(still_exists.as_deref(), Some(placeholder_id.as_str()));
+
+    let still_member: Option<String> = sqlx::query_scalar(
+        "SELECT user_id FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(workspace_id)
+    .bind(&placeholder_id)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert!(still_member.is_some());
+
+    let still_allowed = authz_client
+        .check_fga(
+            &format!("user:{placeholder_id}"),
+            Relation::Member,
+            &Object::Workspace(workspace_id),
+        )
+        .await
+        .unwrap();
+    assert!(still_allowed);
+
+    // Cleanup test fixtures (delete path — also validates --delete is non-destructive to dry-run).
+    let delete_report = cleanup_invite_placeholders(
+        &pool,
+        &authz_client,
+        InvitePlaceholderCleanupOptions {
+            allow_delete: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(delete_report.deleted);
+    assert!(delete_report.users_deleted >= 1);
+    assert!(delete_report.errors.is_empty(), "{:?}", delete_report.errors);
+
+    let after: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
+        .bind(&placeholder_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert!(after.is_none());
+
+    // Idempotent re-run: không lỗi khi không còn placeholder.
+    let second = cleanup_invite_placeholders(
+        &pool,
+        &authz_client,
+        InvitePlaceholderCleanupOptions {
+            allow_delete: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.users_deleted, 0);
+    assert!(second.errors.is_empty());
+
+    // Đảm bảo find helper không còn trả id test này
+    let remaining = find_invite_placeholders(&pool).await.unwrap();
+    assert!(!remaining.iter().any(|u| u.id == placeholder_id));
+
+    let _ = sqlx::query("DELETE FROM workspaces WHERE id = $1")
+        .bind(workspace_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(tenant_id)
+        .execute(&pool)
         .await;
 }
 

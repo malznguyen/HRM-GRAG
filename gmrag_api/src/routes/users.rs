@@ -1,9 +1,9 @@
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::auth::authz::{Authz, Object, Relation};
-use crate::invite::{normalize_email, reconcile_pending_invites};
+use crate::invite::{normalize_email, upsert_user};
 use crate::state::AppState;
 
 #[derive(Serialize)]
@@ -30,14 +30,6 @@ pub async fn get_current_user(State(state): State<AppState>, authz: Authz) -> im
         return (StatusCode::NOT_FOUND, "User not found").into_response();
     };
 
-    if let Err(err) = reconcile_pending_invites(&state.pool, &authz.user_id, &email).await {
-        warn!(
-            error = %err,
-            user_id = %authz.user_id,
-            "Failed to reconcile pending invites on current user fetch"
-        );
-    }
-
     // Check Platform Admin via OpenFGA
     let is_super_admin = match authz.check(Relation::Admin, &Object::Platform).await {
         Ok(allowed) => allowed,
@@ -56,6 +48,7 @@ pub async fn get_current_user(State(state): State<AppState>, authz: Authz) -> im
     Json(user_resp).into_response()
 }
 
+/// Upsert profile SQL theo JWT `sub`. Không còn reconcile placeholder invite.
 pub async fn sync_current_user(
     State(state): State<AppState>,
     authz: Authz,
@@ -66,12 +59,13 @@ pub async fn sync_current_user(
         return (StatusCode::BAD_REQUEST, "Valid email is required").into_response();
     }
 
-    if let Err(err) = reconcile_pending_invites(&state.pool, &authz.user_id, &email).await {
+    // user_id lấy từ JWT đã verify; email body vẫn là debt legacy (xem CURRENT_API_CONTRACT)
+    if let Err(err) = upsert_user(&state.pool, &authz.user_id, &email).await {
         error!(
             error = %err,
             user_id = %authz.user_id,
             email = %email,
-            "Failed to reconcile pending invites during sync"
+            "Failed to upsert user during sync"
         );
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -12,9 +12,9 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event};
-use crate::auth::authz::{Authz, Object, Relation, TupleKey};
+use crate::auth::authz::{ApiError, Authz, Object, Relation, TupleKey};
 use crate::auth::outbox::{enqueue_tuple_delete, enqueue_tuple_write};
-use crate::invite::{invite_placeholder_user_id, normalize_email};
+use crate::invite::normalize_email;
 use crate::state::AppState;
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -43,7 +43,6 @@ pub async fn list_workspace_members(
     authz: Authz,
     Path(workspace_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    // Check Member
     if let Err(err) = authz
         .require_relation(Relation::Member, &Object::Workspace(workspace_id))
         .await
@@ -66,14 +65,16 @@ pub async fn list_workspace_members(
 }
 
 /// POST /workspaces/{workspace_id}/members
-/// Thêm thành viên mới vào workspace
+/// Thêm thành viên đã có tài khoản Keycloak (verified) vào workspace.
+///
+/// Không tạo placeholder `invite_{email}` — Keycloak là source of truth;
+/// chỉ ghi SQL + OpenFGA với `sub` thật để tránh desync authz.
 pub async fn add_workspace_member(
     State(state): State<AppState>,
     authz: Authz,
     Path(workspace_id): Path<Uuid>,
     Json(body): Json<AddWorkspaceMemberRequest>,
 ) -> impl IntoResponse {
-    // Check CanManageMember
     if let Err(err) = authz
         .require_relation(Relation::CanManageMember, &Object::Workspace(workspace_id))
         .await
@@ -97,7 +98,31 @@ pub async fn add_workspace_member(
         }
     };
 
-    match insert_workspace_member(&state.pool, workspace_id, &email, role).await {
+    // Chỉ chấp nhận user đã đăng ký + verify email trong Keycloak
+    let keycloak_user = match state
+        .keycloak_client
+        .get_verified_user_by_email(&email)
+        .await
+    {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            return ApiError {
+                status: StatusCode::NOT_FOUND,
+                code: "USER_NOT_FOUND_IN_IDENTITY",
+                message: "User has not signed up yet. Please ask them to register first."
+                    .to_string(),
+            }
+            .into_response();
+        }
+        Err(err) => {
+            error!(error = %err, email = %email, "Failed to lookup user in Keycloak");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let member_user_id = keycloak_user.id;
+
+    match insert_workspace_member(&state.pool, workspace_id, &member_user_id, &email, role).await {
         Ok(member) => {
             let member_id = member.id.clone();
 
@@ -107,6 +132,7 @@ pub async fn add_workspace_member(
                 Relation::Member
             };
 
+            // Ghi tuple OpenFGA ngay với user id thật (Keycloak sub)
             let tuple = TupleKey {
                 user: format!("user:{member_id}"),
                 relation: fga_relation.as_str().to_string(),
@@ -162,6 +188,7 @@ pub async fn add_workspace_member(
                 error = %err,
                 user_id = %authz.user_id,
                 workspace_id = %workspace_id,
+                member_user_id = %member_user_id,
                 email = %email,
                 "Failed to add workspace member"
             );
@@ -178,7 +205,6 @@ pub async fn update_workspace_member_role(
     Path((workspace_id, member_id)): Path<(Uuid, String)>,
     Json(body): Json<UpdateWorkspaceMemberRoleRequest>,
 ) -> impl IntoResponse {
-    // Check CanAssignRole (chỉ Tenant Owner mới có quyền đổi role)
     if let Err(err) = authz
         .require_relation(Relation::CanAssignRole, &Object::Workspace(workspace_id))
         .await
@@ -197,7 +223,6 @@ pub async fn update_workspace_member_role(
         }
     };
 
-    // Lấy role hiện tại của user trong DB
     let current_role: Option<String> = sqlx::query_scalar(
         "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
     )
@@ -223,7 +248,6 @@ pub async fn update_workspace_member_role(
         }
     };
 
-    // Cập nhật SQL
     if let Err(err) = sqlx::query(
         "UPDATE workspace_members SET role = $1 WHERE workspace_id = $2 AND user_id = $3",
     )
@@ -237,7 +261,6 @@ pub async fn update_workspace_member_role(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    // Cập nhật OpenFGA bằng cách thay thế tuple cũ bằng tuple mới
     let old_relation = if current_role_str == "ADMIN" {
         Relation::Admin
     } else {
@@ -306,7 +329,6 @@ pub async fn remove_workspace_member(
     authz: Authz,
     Path((workspace_id, member_id)): Path<(Uuid, String)>,
 ) -> impl IntoResponse {
-    // Check CanManageMember
     if let Err(err) = authz
         .require_relation(Relation::CanManageMember, &Object::Workspace(workspace_id))
         .await
@@ -437,48 +459,42 @@ enum MemberInsertError {
     Database(sqlx::Error),
 }
 
+/// Chèn membership với `user_id` thật từ Keycloak (không tạo placeholder).
 async fn insert_workspace_member(
     pool: &PgPool,
     workspace_id: Uuid,
+    user_id: &str,
     email: &str,
     role: &str,
 ) -> Result<WorkspaceMemberResponse, MemberInsertError> {
     let mut tx = pool.begin().await.map_err(MemberInsertError::Database)?;
 
-    let user_id: String = match sqlx::query_scalar::<_, String>(
-        "SELECT id FROM users WHERE lower(email) = lower($1)",
+    // Đồng bộ users row với Keycloak sub trước khi ghi membership
+    sqlx::query(
+        r#"
+        INSERT INTO users (id, email)
+        VALUES ($1, $2)
+        ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email
+        "#,
     )
+    .bind(user_id)
     .bind(email)
-    .fetch_optional(&mut *tx)
+    .execute(&mut *tx)
     .await
-    .map_err(MemberInsertError::Database)?
-    {
-        Some(existing_id) => existing_id,
-        None => {
-            let invite_id = invite_placeholder_user_id(email);
-            sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
-                .bind(&invite_id)
-                .bind(email)
-                .execute(&mut *tx)
-                .await
-                .map_err(MemberInsertError::Database)?;
-            invite_id
-        }
-    };
+    .map_err(MemberInsertError::Database)?;
 
     let already_member: bool = sqlx::query_scalar(
         r#"
         SELECT EXISTS(
             SELECT 1
-            FROM workspace_members wm
-            INNER JOIN users u ON u.id = wm.user_id
-            WHERE wm.workspace_id = $1
-              AND lower(u.email) = lower($2)
+            FROM workspace_members
+            WHERE workspace_id = $1
+              AND user_id = $2
         )
         "#,
     )
     .bind(workspace_id)
-    .bind(email)
+    .bind(user_id)
     .fetch_one(&mut *tx)
     .await
     .map_err(MemberInsertError::Database)?;
@@ -495,7 +511,7 @@ async fn insert_workspace_member(
         "#,
     )
     .bind(workspace_id)
-    .bind(&user_id)
+    .bind(user_id)
     .bind(role)
     .bind(email)
     .fetch_one(&mut *tx)

@@ -26,6 +26,9 @@ pub enum AuditEventType {
     StorageCleanupDryRun,
     StorageCleanupCompleted,
     StorageCleanupFailed,
+    InvitePlaceholderCleanupDryRun,
+    InvitePlaceholderCleanupCompleted,
+    InvitePlaceholderCleanupFailed,
 }
 
 impl AuditEventType {
@@ -59,6 +62,11 @@ impl AuditEventType {
             AuditEventType::StorageCleanupDryRun => "storage_cleanup_dry_run",
             AuditEventType::StorageCleanupCompleted => "storage_cleanup_completed",
             AuditEventType::StorageCleanupFailed => "storage_cleanup_failed",
+            AuditEventType::InvitePlaceholderCleanupDryRun => "invite_placeholder_cleanup_dry_run",
+            AuditEventType::InvitePlaceholderCleanupCompleted => {
+                "invite_placeholder_cleanup_completed"
+            }
+            AuditEventType::InvitePlaceholderCleanupFailed => "invite_placeholder_cleanup_failed",
         }
     }
 }
