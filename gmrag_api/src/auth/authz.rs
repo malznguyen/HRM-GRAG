@@ -109,10 +109,7 @@ where
 {
     type Rejection = std::convert::Infallible;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         if let Some(cache) = parts.extensions.get::<RequestAuthzCache>() {
             Ok(cache.clone())
         } else {
@@ -192,8 +189,8 @@ impl AuthzClient {
     pub fn from_env() -> Result<Self, &'static str> {
         let api_url = std::env::var("OPENFGA_API_URL")
             .unwrap_or_else(|_| "http://localhost:8080".to_string());
-        let store_id = std::env::var("OPENFGA_STORE_ID")
-            .map_err(|_| "OPENFGA_STORE_ID must be set")?;
+        let store_id =
+            std::env::var("OPENFGA_STORE_ID").map_err(|_| "OPENFGA_STORE_ID must be set")?;
         let model_id = std::env::var("OPENFGA_MODEL_ID").ok();
 
         Ok(Self::new(api_url, store_id, model_id))
@@ -234,7 +231,11 @@ impl AuthzClient {
         relation: Relation,
         object: &Object,
     ) -> Result<bool, AuthzError> {
-        let key = (user.to_string(), relation.as_str().to_string(), object.to_string());
+        let key = (
+            user.to_string(),
+            relation.as_str().to_string(),
+            object.to_string(),
+        );
         {
             let guard = cache.cache.lock().await;
             if let Some(&allowed) = guard.get(&key) {
@@ -255,17 +256,19 @@ impl AuthzClient {
         deletes: Vec<TupleKey>,
     ) -> Result<(), AuthzError> {
         let url = format!("{}/stores/{}/write", self.api_url, self.store_id);
-        
+
         let writes_payload = if writes.is_empty() {
             None
         } else {
             Some(TupleKeys { tuple_keys: writes })
         };
-        
+
         let deletes_payload = if deletes.is_empty() {
             None
         } else {
-            Some(TupleKeys { tuple_keys: deletes })
+            Some(TupleKeys {
+                tuple_keys: deletes,
+            })
         };
 
         let payload = WriteRequest {
@@ -386,11 +389,20 @@ pub struct Authz {
 impl Authz {
     pub async fn check(&self, relation: Relation, object: &Object) -> Result<bool, AuthzError> {
         self.client
-            .check_with_cache(&self.cache, &format!("user:{}", self.user_id), relation, object)
+            .check_with_cache(
+                &self.cache,
+                &format!("user:{}", self.user_id),
+                relation,
+                object,
+            )
             .await
     }
 
-    pub async fn require_relation(&self, relation: Relation, object: &Object) -> Result<(), ApiError> {
+    pub async fn require_relation(
+        &self,
+        relation: Relation,
+        object: &Object,
+    ) -> Result<(), ApiError> {
         let allowed = self.check(relation, object).await.map_err(|err| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "AUTHZ_ERROR",
@@ -411,7 +423,9 @@ impl Authz {
                 Relation::Admin => "Workspace admin access required".to_string(),
                 Relation::Owner => "Tenant owner access required".to_string(),
                 Relation::CanAssignRole => "Only tenant owners can assign roles".to_string(),
-                Relation::CanManageMember => "Workspace admin or tenant owner access required to manage members".to_string(),
+                Relation::CanManageMember => {
+                    "Workspace admin or tenant owner access required to manage members".to_string()
+                }
                 _ => "Access denied".to_string(),
             };
             Err(ApiError {

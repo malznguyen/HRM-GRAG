@@ -15,14 +15,14 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::auth::authz::{Authz, Relation, Object};
+use crate::auth::authz::{Authz, Object, Relation};
 use crate::chat::deepseek::{DeepseekTokenParser, next_stream_token};
 use crate::chat::retrieval::{StoredChatMessage, fetch_session_chat_messages};
 use crate::chat::{
-    ChatPipelineError, SessionError, build_chat_context, delete_chat_session,
-    ensure_chat_session, filter_citations_for_user, insert_chat_message,
-    list_user_chat_sessions, prepare_deepseek_stream, resolve_chunk_index_citations,
-    truncate_session_title, verify_chat_session_owner,
+    ChatPipelineError, SessionError, build_chat_context, delete_chat_session, ensure_chat_session,
+    filter_citations_for_user, insert_chat_message, list_user_chat_sessions,
+    prepare_deepseek_stream, resolve_chunk_index_citations, truncate_session_title,
+    verify_chat_session_owner,
 };
 use crate::state::AppState;
 
@@ -57,7 +57,10 @@ pub async fn list_workspace_chat_sessions(
     authz: Authz,
     Path(workspace_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(workspace_id)).await {
+    if let Err(err) = authz
+        .require_relation(Relation::Member, &Object::Workspace(workspace_id))
+        .await
+    {
         return err.into_response();
     }
 
@@ -75,7 +78,10 @@ pub async fn get_workspace_chat_session_messages(
     authz: Authz,
     Path(path): Path<WorkspaceChatSessionPath>,
 ) -> impl IntoResponse {
-    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(path.workspace_id)).await {
+    if let Err(err) = authz
+        .require_relation(Relation::Member, &Object::Workspace(path.workspace_id))
+        .await
+    {
         return err.into_response();
     }
 
@@ -106,20 +112,17 @@ pub async fn get_workspace_chat_session_messages(
     )
     .await
     {
-        Ok(rows) => match build_history_messages_with_acl(
-            &state,
-            path.workspace_id,
-            &authz.user_id,
-            rows,
-        )
-        .await
-        {
-            Ok(messages) => Json(messages).into_response(),
-            Err(err) => {
-                tracing::error!(error = %err, "Failed to filter citation ACL for session messages");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        Ok(rows) => {
+            match build_history_messages_with_acl(&state, path.workspace_id, &authz.user_id, rows)
+                .await
+            {
+                Ok(messages) => Json(messages).into_response(),
+                Err(err) => {
+                    tracing::error!(error = %err, "Failed to filter citation ACL for session messages");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
             }
-        },
+        }
         Err(err) => {
             tracing::error!(error = %err, "Failed to fetch session messages");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -132,7 +135,10 @@ pub async fn delete_workspace_chat_session(
     authz: Authz,
     Path(path): Path<WorkspaceChatSessionPath>,
 ) -> impl IntoResponse {
-    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(path.workspace_id)).await {
+    if let Err(err) = authz
+        .require_relation(Relation::Member, &Object::Workspace(path.workspace_id))
+        .await
+    {
         return err.into_response();
     }
 
@@ -162,17 +168,15 @@ pub async fn workspace_chat_history(
     Path(workspace_id): Path<Uuid>,
     Query(query): Query<ChatHistoryQuery>,
 ) -> impl IntoResponse {
-    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(workspace_id)).await {
+    if let Err(err) = authz
+        .require_relation(Relation::Member, &Object::Workspace(workspace_id))
+        .await
+    {
         return err.into_response();
     }
 
-    match verify_chat_session_owner(
-        &state.pool,
-        query.session_id,
-        workspace_id,
-        &authz.user_id,
-    )
-    .await
+    match verify_chat_session_owner(&state.pool, query.session_id, workspace_id, &authz.user_id)
+        .await
     {
         Ok(true) => {}
         Ok(false) => return Json(Vec::<ChatHistoryMessageResponse>::new()).into_response(),
@@ -185,23 +189,19 @@ pub async fn workspace_chat_history(
         }
     }
 
-    match fetch_session_chat_messages(
-        &state.pool,
-        query.session_id,
-        workspace_id,
-        &authz.user_id,
-    )
-    .await
+    match fetch_session_chat_messages(&state.pool, query.session_id, workspace_id, &authz.user_id)
+        .await
     {
-        Ok(rows) => match build_history_messages_with_acl(&state, workspace_id, &authz.user_id, rows)
-            .await
-        {
-            Ok(messages) => Json(messages).into_response(),
-            Err(err) => {
-                tracing::error!(error = %err, "Failed to filter citation ACL for chat history");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        Ok(rows) => {
+            match build_history_messages_with_acl(&state, workspace_id, &authz.user_id, rows).await
+            {
+                Ok(messages) => Json(messages).into_response(),
+                Err(err) => {
+                    tracing::error!(error = %err, "Failed to filter citation ACL for chat history");
+                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                }
             }
-        },
+        }
         Err(err) => {
             tracing::error!(error = %err, "Failed to fetch chat history");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -222,7 +222,10 @@ pub async fn workspace_chat(
         "Chat request received"
     );
 
-    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(workspace_id)).await {
+    if let Err(err) = authz
+        .require_relation(Relation::Member, &Object::Workspace(workspace_id))
+        .await
+    {
         tracing::warn!(
             %workspace_id,
             user_id = %authz.user_id,
@@ -256,8 +259,7 @@ pub async fn workspace_chat(
         }
     }
 
-    if let Err(err) =
-        insert_chat_message(&state.pool, body.session_id, "user", &message, &[]).await
+    if let Err(err) = insert_chat_message(&state.pool, body.session_id, "user", &message, &[]).await
     {
         tracing::error!(error = %err, "Failed to insert user chat message");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();

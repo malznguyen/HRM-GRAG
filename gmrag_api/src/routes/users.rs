@@ -2,7 +2,7 @@ use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde::{Deserialize, Serialize};
 use tracing::{error, warn};
 
-use crate::auth::authz::{Authz, Relation, Object};
+use crate::auth::authz::{Authz, Object, Relation};
 use crate::invite::{normalize_email, reconcile_pending_invites};
 use crate::state::AppState;
 
@@ -18,17 +18,13 @@ pub struct SyncUserRequest {
     pub email: String,
 }
 
-pub async fn get_current_user(
-    State(state): State<AppState>,
-    authz: Authz,
-) -> impl IntoResponse {
-    let db_user: Option<(String, String)> = sqlx::query_as(
-        "SELECT id, email FROM users WHERE id = $1"
-    )
-    .bind(&authz.user_id)
-    .fetch_optional(&state.pool)
-    .await
-    .unwrap_or(None);
+pub async fn get_current_user(State(state): State<AppState>, authz: Authz) -> impl IntoResponse {
+    let db_user: Option<(String, String)> =
+        sqlx::query_as("SELECT id, email FROM users WHERE id = $1")
+            .bind(&authz.user_id)
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap_or(None);
 
     let Some((id, email)) = db_user else {
         return (StatusCode::NOT_FOUND, "User not found").into_response();

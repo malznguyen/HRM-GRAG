@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::auth::authz::{Authz, Relation, Object};
+use crate::auth::authz::{Authz, Object, Relation};
 use crate::auth::document_acl::{collect_viewable_document_ids, fetch_workspace_document_acl_rows};
 use crate::state::AppState;
 
@@ -41,7 +41,10 @@ pub async fn get_workspace_graph(
     authz: Authz,
     Path(workspace_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(workspace_id)).await {
+    if let Err(err) = authz
+        .require_relation(Relation::Member, &Object::Workspace(workspace_id))
+        .await
+    {
         return err.into_response();
     }
 
@@ -58,26 +61,27 @@ pub async fn get_workspace_graph(
         }
     };
 
-    let visible_doc_ids = match collect_viewable_document_ids(
-        &state.authz_client,
-        &authz.user_id,
-        &acl_rows,
+    let visible_doc_ids =
+        match collect_viewable_document_ids(&state.authz_client, &authz.user_id, &acl_rows).await {
+            Ok(ids) => ids,
+            Err(err) => {
+                error!(
+                    error = %err,
+                    user_id = %authz.user_id,
+                    workspace_id = %workspace_id,
+                    "Failed to filter graph sources by document ACL"
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+
+    match fetch_workspace_graph(
+        &state.pool,
+        workspace_id,
+        visible_doc_ids.into_iter().collect(),
     )
     .await
     {
-        Ok(ids) => ids,
-        Err(err) => {
-            error!(
-                error = %err,
-                user_id = %authz.user_id,
-                workspace_id = %workspace_id,
-                "Failed to filter graph sources by document ACL"
-            );
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-
-    match fetch_workspace_graph(&state.pool, workspace_id, visible_doc_ids.into_iter().collect()).await {
         Ok(graph) => Json(graph).into_response(),
         Err(err) => {
             error!(

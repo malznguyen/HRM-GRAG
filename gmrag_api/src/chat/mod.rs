@@ -167,7 +167,9 @@ pub async fn build_chat_context(
         .into_iter()
         .collect::<Vec<_>>();
 
-    retrieval.ensure_workspace_backfilled(pool, workspace_id).await?;
+    retrieval
+        .ensure_workspace_backfilled(pool, workspace_id)
+        .await?;
 
     let retrieved_chunk_ids = retrieval
         .search_chunk_ids(
@@ -288,10 +290,8 @@ pub async fn filter_citation_ids_for_user(
     .fetch_all(pool)
     .await?;
 
-    let row_by_chunk: std::collections::HashMap<Uuid, CitationChunkAclRow> = rows
-        .into_iter()
-        .map(|row| (row.chunk_id, row))
-        .collect();
+    let row_by_chunk: std::collections::HashMap<Uuid, CitationChunkAclRow> =
+        rows.into_iter().map(|row| (row.chunk_id, row)).collect();
 
     let mut allowed = Vec::new();
     for citation in citations {
@@ -322,14 +322,8 @@ pub async fn filter_citations_for_user(
     assistant_text: &str,
     citations: &[Uuid],
 ) -> Result<(String, Vec<Uuid>), ChatPipelineError> {
-    let allowed = filter_citation_ids_for_user(
-        pool,
-        authz_client,
-        workspace_id,
-        user_id,
-        citations,
-    )
-    .await?;
+    let allowed =
+        filter_citation_ids_for_user(pool, authz_client, workspace_id, user_id, citations).await?;
 
     let allowed_set: HashSet<Uuid> = allowed.iter().copied().collect();
     let mut sanitized = assistant_text.to_string();
@@ -509,10 +503,7 @@ pub fn truncate_session_title(message: &str) -> String {
         return trimmed.to_string();
     }
 
-    let truncated: String = trimmed
-        .chars()
-        .take(SESSION_TITLE_MAX_CHARS)
-        .collect();
+    let truncated: String = trimmed.chars().take(SESSION_TITLE_MAX_CHARS).collect();
     format!("{truncated}...")
 }
 
@@ -678,9 +669,7 @@ mod tests {
 
         assert_eq!(
             resolved,
-            format!(
-                "First fact.[chunk:{u1}] Second fact.[chunk:{u2}] Repeat.[chunk:{u1}]"
-            )
+            format!("First fact.[chunk:{u1}] Second fact.[chunk:{u2}] Repeat.[chunk:{u1}]")
         );
         assert_eq!(citations, vec![u1, u2]);
     }
@@ -693,7 +682,10 @@ mod tests {
 
         let (resolved, citations) = resolve_chunk_index_citations(text, &chunk_ids);
 
-        assert_eq!(resolved, format!("Valid.[chunk:{u1}] Invalid.[chunk:99] Zero.[chunk:0]"));
+        assert_eq!(
+            resolved,
+            format!("Valid.[chunk:{u1}] Invalid.[chunk:99] Zero.[chunk:0]")
+        );
         assert_eq!(citations, vec![u1]);
     }
 

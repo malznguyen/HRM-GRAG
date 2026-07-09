@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 use std::fmt;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -92,8 +95,12 @@ pub enum RetrievalError {
         body: String,
         operation: &'static str,
     },
-    InvalidPointId { raw_id: Value },
-    InvalidEmbeddingLiteral { literal: String },
+    InvalidPointId {
+        raw_id: Value,
+    },
+    InvalidEmbeddingLiteral {
+        literal: String,
+    },
     Database(sqlx::Error),
 }
 
@@ -197,12 +204,9 @@ impl RetrievalClient {
             self.config.qdrant_url, self.config.collection_name
         );
 
-        let request = self
-            .http
-            .put(url)
-            .json(&QdrantUpsertRequest {
-                points: qdrant_points,
-            });
+        let request = self.http.put(url).json(&QdrantUpsertRequest {
+            points: qdrant_points,
+        });
 
         let response = self.with_auth_header(request).send().await?;
         if !response.status().is_success() {
@@ -466,7 +470,10 @@ fn parse_point_id(raw_id: Value) -> Result<Uuid, RetrievalError> {
 
 fn parse_pgvector_literal(literal: &str) -> Result<Vec<f32>, RetrievalError> {
     let trimmed = literal.trim();
-    let Some(body) = trimmed.strip_prefix('[').and_then(|value| value.strip_suffix(']')) else {
+    let Some(body) = trimmed
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+    else {
         return Err(RetrievalError::InvalidEmbeddingLiteral {
             literal: literal.to_string(),
         });
@@ -476,8 +483,7 @@ fn parse_pgvector_literal(literal: &str) -> Result<Vec<f32>, RetrievalError> {
         return Ok(Vec::new());
     }
 
-    body
-        .split(',')
+    body.split(',')
         .map(|token| {
             token
                 .trim()
