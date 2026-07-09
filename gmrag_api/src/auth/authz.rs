@@ -129,7 +129,7 @@ pub struct AuthzClient {
     model_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TupleKey {
     pub user: String,
     pub relation: String,

@@ -19,6 +19,7 @@ Use these files as the source of truth:
 - `docs/CURRENT_ARCHITECTURE.md`
 - `docs/CURRENT_DATABASE_SCHEMA.md`
 - `docs/CURRENT_API_CONTRACT.md`
+- `docs/RUNBOOK.md`
 
 Historical v1 audit snapshots are archived under `docs/archive/v1/`.
 
@@ -52,6 +53,7 @@ Copy `gmrag_api/.env.example` to `gmrag_api/.env` and fill in the values for:
 - database connection
 - bearer-token issuer and JWKS configuration used by the current backend
 - OpenFGA: `OPENFGA_API_URL`, `OPENFGA_STORE_ID`, `OPENFGA_MODEL_ID`
+- Outbox worker: `AUTHZ_OUTBOX_BATCH_SIZE`, `AUTHZ_OUTBOX_MAX_RETRIES`
 - Keycloak admin lookup: `KEYCLOAK_ADMIN_URL`, `KEYCLOAK_REALM`, `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET`
 - S3/MinIO: `S3_ENDPOINT_URL`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_FORCE_PATH_STYLE`, `S3_PRESIGN_EXPIRY_SECS`
 - DeepSeek and Ollama settings for chat, graph extraction, and embeddings
@@ -77,6 +79,19 @@ Copy `gmrag_api/.env.example` to `gmrag_api/.env` and fill in the values for:
    cargo run --bin seed-platform-admin -- --user-id=<keycloak_sub_id>
    ```
 
+## Phase 3A Hardening Commands
+
+Run these from `gmrag_api/`:
+
+```bash
+cargo run --bin process-authz-outbox
+cargo run --bin cleanup-storage-objects -- --dry-run
+cargo run --bin cleanup-storage-objects -- --delete-orphans --delete
+cargo run --bin cleanup-storage-objects -- --workspace-id <workspace_uuid> --delete
+cargo run --bin cleanup-storage-objects -- --tenant-id <tenant_uuid> --delete
+cargo run --bin backfill-document-workspace-tuples
+```
+
 ## Test Commands
 
 Run these from `gmrag_api/`:
@@ -86,6 +101,7 @@ cargo check
 cargo test
 cargo test --test authz_integration
 cargo test --test storage_integration
+cargo test --test phase3a_hardening_integration
 ```
 
 ## Current Implementation Notes

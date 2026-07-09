@@ -40,8 +40,8 @@ async fn main() {
 
     println!("Bắt đầu seed Platform Admin cho user_id: {}", uid);
 
-    let api_url = std::env::var("OPENFGA_API_URL")
-        .unwrap_or_else(|_| "http://localhost:8081".to_string());
+    let api_url =
+        std::env::var("OPENFGA_API_URL").unwrap_or_else(|_| "http://localhost:8081".to_string());
     let store_id = match std::env::var("OPENFGA_STORE_ID") {
         Ok(id) => id,
         Err(_) => {
@@ -50,7 +50,11 @@ async fn main() {
         }
     };
 
-    let url = format!("{}/stores/{}/write", api_url.trim_end_matches('/'), store_id);
+    let url = format!(
+        "{}/stores/{}/write",
+        api_url.trim_end_matches('/'),
+        store_id
+    );
     let payload = WriteRequest {
         writes: Some(TupleKeys {
             tuple_keys: vec![TupleKey {
@@ -66,7 +70,10 @@ async fn main() {
     match client.post(&url).json(&payload).send().await {
         Ok(response) => {
             if response.status().is_success() {
-                println!("Đã seed thành công Platform Admin tuple cho user:{} trong OpenFGA!", uid);
+                println!(
+                    "Đã seed thành công Platform Admin tuple cho user:{} trong OpenFGA!",
+                    uid
+                );
             } else {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();

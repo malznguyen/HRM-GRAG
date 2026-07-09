@@ -1,7 +1,10 @@
+pub mod cleanup;
+
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use std::fmt;
 use uuid::Uuid;
 
@@ -138,6 +141,12 @@ pub struct PutObjectResult {
     pub etag: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageObjectInfo {
+    pub key: String,
+    pub size_bytes: Option<i64>,
+}
+
 #[derive(Clone)]
 pub struct StorageClient {
     client: Client,
@@ -265,6 +274,123 @@ impl StorageClient {
                 ),
             }),
         }
+    }
+
+    pub async fn list_objects(
+        &self,
+        prefix: Option<&str>,
+    ) -> Result<Vec<StorageObjectInfo>, StorageError> {
+        let mut continuation_token: Option<String> = None;
+        let mut objects: Vec<StorageObjectInfo> = Vec::new();
+
+        loop {
+            let mut request = self.client.list_objects_v2().bucket(&self.bucket);
+            if let Some(prefix) = prefix {
+                request = request.prefix(prefix);
+            }
+            if let Some(token) = continuation_token.as_deref() {
+                request = request.continuation_token(token);
+            }
+
+            let response = request
+                .send()
+                .await
+                .map_err(|err| StorageError::OperationFailed {
+                    message: format!(
+                        "S3 list_objects_v2 failed for bucket={} prefix={}: {}",
+                        self.bucket,
+                        prefix.unwrap_or_default(),
+                        err
+                    ),
+                })?;
+
+            for object in response.contents() {
+                let Some(key) = object.key() else {
+                    continue;
+                };
+
+                objects.push(StorageObjectInfo {
+                    key: key.to_string(),
+                    size_bytes: object.size(),
+                });
+            }
+
+            if !response.is_truncated().unwrap_or(false) {
+                break;
+            }
+
+            continuation_token = response.next_continuation_token().map(ToString::to_string);
+
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+
+        Ok(objects)
+    }
+
+    pub async fn delete_objects(&self, object_keys: &[String]) -> Result<usize, StorageError> {
+        if object_keys.is_empty() {
+            return Ok(0);
+        }
+
+        let mut deleted_count = 0usize;
+
+        for chunk in object_keys.chunks(1000) {
+            let object_identifiers = chunk
+                .iter()
+                .map(|object_key| {
+                    ObjectIdentifier::builder()
+                        .key(object_key)
+                        .build()
+                        .map_err(|err| StorageError::OperationFailed {
+                            message: format!("Failed to build object identifier: {err}"),
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let delete_payload = Delete::builder()
+                .set_objects(Some(object_identifiers))
+                .build()
+                .map_err(|err| StorageError::OperationFailed {
+                    message: format!("Failed to build delete payload: {err}"),
+                })?;
+
+            let response = self
+                .client
+                .delete_objects()
+                .bucket(&self.bucket)
+                .delete(delete_payload)
+                .send()
+                .await
+                .map_err(|err| StorageError::OperationFailed {
+                    message: format!(
+                        "S3 delete_objects failed for bucket={}: {}",
+                        self.bucket, err
+                    ),
+                })?;
+
+            for err in response.errors() {
+                if err
+                    .code()
+                    .is_some_and(|code| matches!(code, "NoSuchKey" | "NotFound" | "404"))
+                {
+                    continue;
+                }
+
+                return Err(StorageError::OperationFailed {
+                    message: format!(
+                        "S3 delete_objects returned error code={} message={}",
+                        err.code().unwrap_or("unknown"),
+                        err.message().unwrap_or("unknown")
+                    ),
+                });
+            }
+
+            deleted_count += response.deleted().len();
+        }
+
+        Ok(deleted_count)
     }
 }
 

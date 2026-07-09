@@ -6,11 +6,14 @@ use axum::{
 };
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::PgPool;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::auth::authz::{Authz, Relation, Object, TupleKey};
+use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event};
+use crate::auth::authz::{Authz, Object, Relation, TupleKey};
+use crate::auth::outbox::{enqueue_tuple_delete, enqueue_tuple_write};
 use crate::invite::{invite_placeholder_user_id, normalize_email};
 use crate::state::AppState;
 
@@ -41,7 +44,10 @@ pub async fn list_workspace_members(
     Path(workspace_id): Path<Uuid>,
 ) -> impl IntoResponse {
     // Check Member
-    if let Err(err) = authz.require_relation(Relation::Member, &Object::Workspace(workspace_id)).await {
+    if let Err(err) = authz
+        .require_relation(Relation::Member, &Object::Workspace(workspace_id))
+        .await
+    {
         return err.into_response();
     }
 
@@ -68,7 +74,10 @@ pub async fn add_workspace_member(
     Json(body): Json<AddWorkspaceMemberRequest>,
 ) -> impl IntoResponse {
     // Check CanManageMember
-    if let Err(err) = authz.require_relation(Relation::CanManageMember, &Object::Workspace(workspace_id)).await {
+    if let Err(err) = authz
+        .require_relation(Relation::CanManageMember, &Object::Workspace(workspace_id))
+        .await
+    {
         return err.into_response();
     }
 
@@ -90,18 +99,57 @@ pub async fn add_workspace_member(
 
     match insert_workspace_member(&state.pool, workspace_id, &email, role).await {
         Ok(member) => {
-            // Ghi quyền vào OpenFGA
+            let member_id = member.id.clone();
+
             let fga_relation = if role == "ADMIN" {
                 Relation::Admin
             } else {
                 Relation::Member
             };
-            if let Err(err) = state.authz_client.write_tuple(
-                &format!("user:{}", member.id),
-                fga_relation,
-                &Object::Workspace(workspace_id)
-            ).await {
-                error!(error = %err, workspace_id = %workspace_id, user_id = %member.id, "Failed to write workspace member to OpenFGA");
+
+            let tuple = TupleKey {
+                user: format!("user:{member_id}"),
+                relation: fga_relation.as_str().to_string(),
+                object: Object::Workspace(workspace_id).to_string(),
+            };
+
+            if let Err(err) = state
+                .authz_client
+                .write_tuples(vec![tuple.clone()], Vec::new())
+                .await
+            {
+                error!(error = %err, workspace_id = %workspace_id, user_id = %member_id, "Failed to write workspace member to OpenFGA");
+
+                if let Err(outbox_err) = enqueue_tuple_write(&state.pool, &tuple).await {
+                    error!(
+                        error = %outbox_err,
+                        workspace_id = %workspace_id,
+                        user_id = %member_id,
+                        "Failed to enqueue authz outbox recovery event for member add"
+                    );
+                }
+            }
+
+            if let Err(err) = insert_audit_event(
+                &state.pool,
+                AuditEventRecord::new(AuditEventType::MemberAdded)
+                    .with_actor_user_id(authz.user_id.clone())
+                    .with_workspace_id(workspace_id)
+                    .with_target("workspace_member", member_id.clone())
+                    .with_metadata(json!({
+                        "role": role,
+                        "member_user_id": member_id,
+                        "member_email": email
+                    })),
+            )
+            .await
+            {
+                error!(
+                    error = %err,
+                    actor_user_id = %authz.user_id,
+                    workspace_id = %workspace_id,
+                    "Failed to write audit event for member add"
+                );
             }
 
             (StatusCode::CREATED, Json(member)).into_response()
@@ -131,7 +179,10 @@ pub async fn update_workspace_member_role(
     Json(body): Json<UpdateWorkspaceMemberRoleRequest>,
 ) -> impl IntoResponse {
     // Check CanAssignRole (chỉ Tenant Owner mới có quyền đổi role)
-    if let Err(err) = authz.require_relation(Relation::CanAssignRole, &Object::Workspace(workspace_id)).await {
+    if let Err(err) = authz
+        .require_relation(Relation::CanAssignRole, &Object::Workspace(workspace_id))
+        .await
+    {
         return err.into_response();
     }
 
@@ -148,7 +199,7 @@ pub async fn update_workspace_member_role(
 
     // Lấy role hiện tại của user trong DB
     let current_role: Option<String> = sqlx::query_scalar(
-        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2"
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
     )
     .bind(workspace_id)
     .bind(&member_id)
@@ -174,33 +225,46 @@ pub async fn update_workspace_member_role(
 
     // Cập nhật SQL
     if let Err(err) = sqlx::query(
-        "UPDATE workspace_members SET role = $1 WHERE workspace_id = $2 AND user_id = $3"
+        "UPDATE workspace_members SET role = $1 WHERE workspace_id = $2 AND user_id = $3",
     )
     .bind(new_role)
     .bind(workspace_id)
     .bind(&member_id)
     .execute(&mut *tx)
-    .await {
+    .await
+    {
         error!(error = %err, workspace_id = %workspace_id, user_id = %member_id, "Failed to update member role in DB");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     // Cập nhật OpenFGA bằng cách thay thế tuple cũ bằng tuple mới
-    let old_relation = if current_role_str == "ADMIN" { Relation::Admin } else { Relation::Member };
-    let new_relation = if new_role == "ADMIN" { Relation::Admin } else { Relation::Member };
+    let old_relation = if current_role_str == "ADMIN" {
+        Relation::Admin
+    } else {
+        Relation::Member
+    };
+    let new_relation = if new_role == "ADMIN" {
+        Relation::Admin
+    } else {
+        Relation::Member
+    };
 
-    if let Err(err) = state.authz_client.write_tuples(
-        vec![TupleKey {
-            user: format!("user:{}", member_id),
-            relation: new_relation.as_str().to_string(),
-            object: Object::Workspace(workspace_id).to_string(),
-        }],
-        vec![TupleKey {
-            user: format!("user:{}", member_id),
-            relation: old_relation.as_str().to_string(),
-            object: Object::Workspace(workspace_id).to_string(),
-        }],
-    ).await {
+    if let Err(err) = state
+        .authz_client
+        .write_tuples(
+            vec![TupleKey {
+                user: format!("user:{}", member_id),
+                relation: new_relation.as_str().to_string(),
+                object: Object::Workspace(workspace_id).to_string(),
+            }],
+            vec![TupleKey {
+                user: format!("user:{}", member_id),
+                relation: old_relation.as_str().to_string(),
+                object: Object::Workspace(workspace_id).to_string(),
+            }],
+        )
+        .await
+    {
         error!(error = %err, workspace_id = %workspace_id, user_id = %member_id, "Failed to sync role update to OpenFGA");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -208,6 +272,28 @@ pub async fn update_workspace_member_role(
     if let Err(err) = tx.commit().await {
         error!(error = %err, "Failed to commit transaction");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    if let Err(err) = insert_audit_event(
+        &state.pool,
+        AuditEventRecord::new(AuditEventType::MemberRoleChanged)
+            .with_actor_user_id(authz.user_id.clone())
+            .with_workspace_id(workspace_id)
+            .with_target("workspace_member", member_id.clone())
+            .with_metadata(json!({
+                "member_user_id": member_id,
+                "old_role": current_role_str,
+                "new_role": new_role
+            })),
+    )
+    .await
+    {
+        error!(
+            error = %err,
+            actor_user_id = %authz.user_id,
+            workspace_id = %workspace_id,
+            "Failed to write audit event for member role change"
+        );
     }
 
     StatusCode::NO_CONTENT.into_response()
@@ -221,7 +307,10 @@ pub async fn remove_workspace_member(
     Path((workspace_id, member_id)): Path<(Uuid, String)>,
 ) -> impl IntoResponse {
     // Check CanManageMember
-    if let Err(err) = authz.require_relation(Relation::CanManageMember, &Object::Workspace(workspace_id)).await {
+    if let Err(err) = authz
+        .require_relation(Relation::CanManageMember, &Object::Workspace(workspace_id))
+        .await
+    {
         return err.into_response();
     }
 
@@ -234,7 +323,7 @@ pub async fn remove_workspace_member(
     }
 
     let role: Option<String> = sqlx::query_scalar(
-        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2"
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
     )
     .bind(workspace_id)
     .bind(&member_id)
@@ -260,18 +349,54 @@ pub async fn remove_workspace_member(
     match result {
         Ok(outcome) if outcome.rows_affected() == 0 => StatusCode::NOT_FOUND.into_response(),
         Ok(_) => {
-            // Xoá tuple trong OpenFGA
             let fga_relation = if role_str == "ADMIN" {
                 Relation::Admin
             } else {
                 Relation::Member
             };
-            if let Err(err) = state.authz_client.delete_tuple(
-                &format!("user:{}", member_id),
-                fga_relation,
-                &Object::Workspace(workspace_id)
-            ).await {
+
+            let tuple = TupleKey {
+                user: format!("user:{member_id}"),
+                relation: fga_relation.as_str().to_string(),
+                object: Object::Workspace(workspace_id).to_string(),
+            };
+
+            if let Err(err) = state
+                .authz_client
+                .write_tuples(Vec::new(), vec![tuple.clone()])
+                .await
+            {
                 error!(error = %err, workspace_id = %workspace_id, user_id = %member_id, "Failed to delete workspace member from OpenFGA");
+
+                if let Err(outbox_err) = enqueue_tuple_delete(&state.pool, &tuple).await {
+                    error!(
+                        error = %outbox_err,
+                        workspace_id = %workspace_id,
+                        user_id = %member_id,
+                        "Failed to enqueue authz outbox recovery event for member remove"
+                    );
+                }
+            }
+
+            if let Err(err) = insert_audit_event(
+                &state.pool,
+                AuditEventRecord::new(AuditEventType::MemberRemoved)
+                    .with_actor_user_id(authz.user_id.clone())
+                    .with_workspace_id(workspace_id)
+                    .with_target("workspace_member", member_id.clone())
+                    .with_metadata(json!({
+                        "member_user_id": member_id,
+                        "removed_role": role_str
+                    })),
+            )
+            .await
+            {
+                error!(
+                    error = %err,
+                    actor_user_id = %authz.user_id,
+                    workspace_id = %workspace_id,
+                    "Failed to write audit event for member remove"
+                );
             }
 
             StatusCode::NO_CONTENT.into_response()
