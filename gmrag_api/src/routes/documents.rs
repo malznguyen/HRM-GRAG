@@ -438,6 +438,7 @@ pub async fn patch_document_access_mode(
 
     match set_document_access_mode(
         &state.pool,
+        &state.authz_client,
         document_id,
         workspace_id,
         access_mode,
@@ -834,6 +835,25 @@ pub async fn delete_document(
                     true
                 };
 
+            // Best-effort giống storage: SQL đã commit thì không fail cả request nếu Qdrant down.
+            let qdrant_delete_succeeded = if let Err(err) = state
+                .retrieval
+                .delete_points_by_document(workspace_id, document_id)
+                .await
+            {
+                // TODO: cleanup worker/outbox cho orphan vectors nếu Qdrant delete fail lặp lại.
+                error!(
+                    error = %err,
+                    user_id = %authz.user_id,
+                    workspace_id = %workspace_id,
+                    document_id = %document_id,
+                    "Failed to delete document points from Qdrant after database cleanup"
+                );
+                false
+            } else {
+                true
+            };
+
             if let Err(err) = insert_audit_event(
                 &state.pool,
                 AuditEventRecord::new(AuditEventType::DocumentDeleted)
@@ -842,7 +862,8 @@ pub async fn delete_document(
                     .with_document_id(document_id)
                     .with_target("document", document_id.to_string())
                     .with_metadata(json!({
-                        "storage_delete_succeeded": storage_delete_succeeded
+                        "storage_delete_succeeded": storage_delete_succeeded,
+                        "qdrant_delete_succeeded": qdrant_delete_succeeded
                     })),
             )
             .await
@@ -1069,28 +1090,67 @@ pub async fn upload_document(
         }
     };
 
-    let mut uploaded: Vec<UploadedDocumentItem> = Vec::new();
+    // Drain multipart trước khi insert để access_mode không phụ thuộc thứ tự field.
+    let mut access_mode = DocumentAccessMode::WorkspaceDefault;
+    let mut pending_files: Vec<PendingUploadFile> = Vec::new();
 
     while let Ok(Some(field)) = multipart.next_field().await {
-        if field.name() != Some("file") {
-            continue;
+        match field.name() {
+            Some("access_mode") => {
+                let raw = match field.text().await {
+                    Ok(text) => text.trim().to_string(),
+                    Err(_) => {
+                        return ApiError {
+                            status: StatusCode::BAD_REQUEST,
+                            code: "INVALID_ACCESS_MODE",
+                            message: "access_mode must be workspace_default or restricted"
+                                .to_string(),
+                        }
+                        .into_response();
+                    }
+                };
+                match DocumentAccessMode::parse(&raw) {
+                    Some(mode) => access_mode = mode,
+                    None => {
+                        return ApiError {
+                            status: StatusCode::BAD_REQUEST,
+                            code: "INVALID_ACCESS_MODE",
+                            message: "access_mode must be workspace_default or restricted"
+                                .to_string(),
+                        }
+                        .into_response();
+                    }
+                }
+            }
+            Some("file") => {
+                let filename = field
+                    .file_name()
+                    .map(sanitize_filename)
+                    .unwrap_or_else(|| "upload.pdf".to_string());
+                let content_type = field.content_type().map(|value| value.to_string());
+                let pdf_bytes = match field.bytes().await {
+                    Ok(bytes) => bytes.to_vec(),
+                    Err(_) => continue,
+                };
+                if pdf_bytes.is_empty() || !is_pdf_upload(&filename, &pdf_bytes) {
+                    continue;
+                }
+                pending_files.push(PendingUploadFile {
+                    filename,
+                    content_type,
+                    pdf_bytes,
+                });
+            }
+            _ => continue,
         }
+    }
 
-        let filename = field
-            .file_name()
-            .map(sanitize_filename)
-            .unwrap_or_else(|| "upload.pdf".to_string());
+    let mut uploaded: Vec<UploadedDocumentItem> = Vec::new();
 
-        let content_type = field.content_type().map(|value| value.to_string());
-
-        let pdf_bytes = match field.bytes().await {
-            Ok(bytes) => bytes.to_vec(),
-            Err(_) => continue,
-        };
-
-        if pdf_bytes.is_empty() || !is_pdf_upload(&filename, &pdf_bytes) {
-            continue;
-        }
+    for file in pending_files {
+        let filename = file.filename;
+        let content_type = file.content_type;
+        let pdf_bytes = file.pdf_bytes;
 
         let document_id = Uuid::new_v4();
         let object_key = build_original_document_object_key(tenant_id, workspace_id, document_id);
@@ -1126,6 +1186,7 @@ pub async fn upload_document(
                 filename,
                 status,
                 processing_stage,
+                access_mode,
                 object_key,
                 bucket,
                 content_type,
@@ -1134,13 +1195,14 @@ pub async fn upload_document(
                 storage_etag,
                 uploaded_by
             )
-            VALUES ($1, $2, $3, $4, 'PROCESSING', 'QUEUED', $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, 'PROCESSING', 'QUEUED', $5, $6, $7, $8, $9, $10, $11, $12)
             "#,
         )
         .bind(document_id)
         .bind(workspace_id)
         .bind(&authz.user_id)
         .bind(&filename)
+        .bind(access_mode.as_str())
         .bind(&object_key)
         .bind(state.storage.bucket())
         .bind(content_type.as_deref())
@@ -1239,7 +1301,8 @@ pub async fn upload_document(
                 .with_metadata(json!({
                     "filename": filename.clone(),
                     "size_bytes": size_bytes,
-                    "content_type": content_type.clone()
+                    "content_type": content_type.clone(),
+                    "access_mode": access_mode.as_str(),
                 })),
         )
         .await
@@ -1271,6 +1334,12 @@ pub async fn upload_document(
         }),
     )
         .into_response()
+}
+
+struct PendingUploadFile {
+    filename: String,
+    content_type: Option<String>,
+    pdf_bytes: Vec<u8>,
 }
 
 fn sanitize_filename(name: &str) -> String {

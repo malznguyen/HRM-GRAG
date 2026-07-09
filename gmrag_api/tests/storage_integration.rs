@@ -7,6 +7,7 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use gmrag_api::auth::authz::{Object, Relation};
+use gmrag_api::retrieval::{ChunkPoint, RetrievalClient, RetrievalConfig};
 use gmrag_api::state::AppState;
 use gmrag_api::storage::build_original_document_object_key;
 
@@ -31,6 +32,10 @@ struct SeededDocument {
 
 impl TestServer {
     async fn bootstrap() -> Self {
+        Self::bootstrap_with_retrieval(None).await
+    }
+
+    async fn bootstrap_with_retrieval(retrieval: Option<RetrievalClient>) -> Self {
         dotenvy::dotenv().ok();
         init_test_env();
 
@@ -51,7 +56,8 @@ impl TestServer {
         let keycloak_client = gmrag_api::auth::keycloak::KeycloakClient::from_env().unwrap();
         let storage_config = gmrag_api::storage::StorageConfig::from_env().unwrap();
         let storage = gmrag_api::storage::StorageClient::from_config(storage_config).await;
-        let retrieval = gmrag_api::retrieval::RetrievalClient::from_env().unwrap();
+        let retrieval =
+            retrieval.unwrap_or_else(|| RetrievalClient::from_env().expect("retrieval config"));
 
         let state = AppState {
             pool: pool.clone(),
@@ -126,6 +132,43 @@ impl TestServer {
             workspace_id,
             admin_user_id,
         }
+    }
+
+    /// Tenant Owner có `can_assign_role` trên workspace (cần cho DELETE /workspaces/{id}).
+    async fn seed_tenant_owner_workspace(&self) -> WorkspaceSeed {
+        let seed = self.seed_workspace_admin().await;
+
+        sqlx::query(
+            "INSERT INTO tenant_members (tenant_id, user_id, role) VALUES ($1, $2, 'OWNER') ON CONFLICT DO NOTHING",
+        )
+        .bind(seed.tenant_id)
+        .bind(&seed.admin_user_id)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+
+        // can_assign_role = owner from tenant; cần cả tuple tenant -> workspace.
+        self.state
+            .authz_client
+            .write_tuple(
+                &format!("user:{}", seed.admin_user_id),
+                Relation::Owner,
+                &Object::Tenant(seed.tenant_id),
+            )
+            .await
+            .unwrap();
+
+        self.state
+            .authz_client
+            .write_tuple(
+                &format!("tenant:{}", seed.tenant_id),
+                Relation::Tenant,
+                &Object::Workspace(seed.workspace_id),
+            )
+            .await
+            .unwrap();
+
+        seed
     }
 
     async fn insert_failed_document(
@@ -220,9 +263,9 @@ async fn upload_pdf_persists_object_and_metadata() {
     let document_id =
         Uuid::parse_str(payload["documents"][0]["document_id"].as_str().unwrap()).unwrap();
 
-    let row: (String, String, Option<i64>, Option<String>) = sqlx::query_as(
+    let row: (String, String, Option<i64>, Option<String>, String) = sqlx::query_as(
         r#"
-        SELECT object_key, bucket, size_bytes, checksum_sha256
+        SELECT object_key, bucket, size_bytes, checksum_sha256, access_mode
         FROM documents
         WHERE id = $1 AND workspace_id = $2
         "#,
@@ -238,9 +281,83 @@ async fn upload_pdf_persists_object_and_metadata() {
     assert_eq!(row.2, Some(i64::try_from(file_bytes.len()).unwrap()));
     let expected_checksum = hex_sha256(&file_bytes);
     assert_eq!(row.3.as_deref(), Some(expected_checksum.as_str()));
+    assert_eq!(row.4, "workspace_default");
 
     let exists = server.state.storage.object_exists(&row.0).await.unwrap();
     assert!(exists);
+}
+
+#[tokio::test]
+async fn upload_accepts_access_mode_restricted() {
+    let server = TestServer::bootstrap().await;
+    let seed = server.seed_workspace_admin().await;
+
+    let form = reqwest::multipart::Form::new()
+        .text("access_mode", "restricted")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(sample_pdf_bytes())
+                .file_name("secret.pdf")
+                .mime_str("application/pdf")
+                .unwrap(),
+        );
+
+    let response = Client::new()
+        .post(format!(
+            "{}/workspaces/{}/documents/upload",
+            server.addr, seed.workspace_id
+        ))
+        .bearer_auth(&seed.admin_user_id)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    let payload: serde_json::Value = response.json().await.unwrap();
+    let document_id =
+        Uuid::parse_str(payload["documents"][0]["document_id"].as_str().unwrap()).unwrap();
+
+    let access_mode: String = sqlx::query_scalar(
+        "SELECT access_mode FROM documents WHERE id = $1 AND workspace_id = $2",
+    )
+    .bind(document_id)
+    .bind(seed.workspace_id)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(access_mode, "restricted");
+}
+
+#[tokio::test]
+async fn upload_rejects_invalid_access_mode() {
+    let server = TestServer::bootstrap().await;
+    let seed = server.seed_workspace_admin().await;
+
+    let form = reqwest::multipart::Form::new()
+        .text("access_mode", "private")
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(sample_pdf_bytes())
+                .file_name("bad-mode.pdf")
+                .mime_str("application/pdf")
+                .unwrap(),
+        );
+
+    let response = Client::new()
+        .post(format!(
+            "{}/workspaces/{}/documents/upload",
+            server.addr, seed.workspace_id
+        ))
+        .bearer_auth(&seed.admin_user_id)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "INVALID_ACCESS_MODE");
 }
 
 #[tokio::test]
@@ -344,6 +461,342 @@ async fn delete_document_removes_db_row_and_storage_object() {
         .await
         .unwrap();
     assert!(!exists_after_object);
+}
+
+#[tokio::test]
+async fn delete_document_also_removes_qdrant_points() {
+    let server = TestServer::bootstrap().await;
+    let seed = server.seed_workspace_admin().await;
+    let seeded_document = server.insert_failed_document(&seed, true).await;
+
+    let chunk_id = Uuid::new_v4();
+    let vector_size = std::env::var("QDRANT_VECTOR_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(768);
+    let embedding = vec![0.02_f32; vector_size];
+
+    server
+        .state
+        .retrieval
+        .upsert_chunk_points(&[ChunkPoint {
+            chunk_id,
+            workspace_id: seed.workspace_id,
+            document_id: seeded_document.document_id,
+            chunk_index: 0,
+            embedding: embedding.clone(),
+        }])
+        .await
+        .expect("seed Qdrant points before document delete");
+
+    let before = server
+        .state
+        .retrieval
+        .search_chunk_ids(
+            seed.workspace_id,
+            &[seeded_document.document_id],
+            &embedding,
+            5,
+        )
+        .await
+        .expect("search before delete");
+    assert!(
+        before.contains(&chunk_id),
+        "seeded point must be searchable before delete"
+    );
+
+    let response = Client::new()
+        .delete(format!(
+            "{}/workspaces/{}/documents/{}",
+            server.addr, seed.workspace_id, seeded_document.document_id
+        ))
+        .bearer_auth(&seed.admin_user_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let after = server
+        .state
+        .retrieval
+        .search_chunk_ids(
+            seed.workspace_id,
+            &[seeded_document.document_id],
+            &embedding,
+            5,
+        )
+        .await
+        .expect("search after delete");
+    assert!(
+        after.is_empty(),
+        "Qdrant points for deleted document must be removed"
+    );
+}
+
+#[tokio::test]
+async fn delete_document_succeeds_when_qdrant_unavailable() {
+    // Retrieval client trỏ tới port chết — SQL/storage delete vẫn phải thành công.
+    let broken_retrieval = RetrievalClient::from_config(RetrievalConfig {
+        qdrant_url: "http://127.0.0.1:1".to_string(),
+        collection_name: "gmrag_document_chunks".to_string(),
+        vector_size: 768,
+        top_k: 5,
+        api_key: None,
+    });
+    let server = TestServer::bootstrap_with_retrieval(Some(broken_retrieval)).await;
+    let seed = server.seed_workspace_admin().await;
+    let seeded_document = server.insert_failed_document(&seed, true).await;
+
+    let response = Client::new()
+        .delete(format!(
+            "{}/workspaces/{}/documents/{}",
+            server.addr, seed.workspace_id, seeded_document.document_id
+        ))
+        .bearer_auth(&seed.admin_user_id)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let exists_after_db: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM documents WHERE id = $1 AND workspace_id = $2)",
+    )
+    .bind(seeded_document.document_id)
+    .bind(seed.workspace_id)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert!(!exists_after_db);
+
+    let exists_after_object = server
+        .state
+        .storage
+        .object_exists(&seeded_document.object_key)
+        .await
+        .unwrap();
+    assert!(!exists_after_object);
+
+    let audit_metadata: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"
+        SELECT metadata
+        FROM audit_events
+        WHERE event_type = 'document_deleted'
+          AND document_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(seeded_document.document_id)
+    .fetch_optional(&server.pool)
+    .await
+    .unwrap();
+
+    if let Some(metadata) = audit_metadata {
+        assert_eq!(metadata["qdrant_delete_succeeded"], false);
+        assert_eq!(metadata["storage_delete_succeeded"], true);
+    }
+}
+
+#[tokio::test]
+async fn delete_workspace_also_removes_qdrant_points() {
+    let server = TestServer::bootstrap().await;
+    let seed = server.seed_tenant_owner_workspace().await;
+
+    let document_id = Uuid::new_v4();
+    let chunk_id = Uuid::new_v4();
+    let other_workspace_id = Uuid::new_v4();
+    let other_document_id = Uuid::new_v4();
+    let other_chunk_id = Uuid::new_v4();
+    let vector_size = std::env::var("QDRANT_VECTOR_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(768);
+    let embedding = vec![0.03_f32; vector_size];
+
+    server
+        .state
+        .retrieval
+        .upsert_chunk_points(&[
+            ChunkPoint {
+                chunk_id,
+                workspace_id: seed.workspace_id,
+                document_id,
+                chunk_index: 0,
+                embedding: embedding.clone(),
+            },
+            // Point workspace khác — không được bị xoá khi xoá seed.workspace_id.
+            ChunkPoint {
+                chunk_id: other_chunk_id,
+                workspace_id: other_workspace_id,
+                document_id: other_document_id,
+                chunk_index: 0,
+                embedding: embedding.clone(),
+            },
+        ])
+        .await
+        .expect("seed Qdrant points before workspace delete");
+
+    let before = server
+        .state
+        .retrieval
+        .search_chunk_ids(seed.workspace_id, &[document_id], &embedding, 5)
+        .await
+        .expect("search before workspace delete");
+    assert!(
+        before.contains(&chunk_id),
+        "seeded point must be searchable before workspace delete"
+    );
+
+    let response = Client::new()
+        .delete(format!("{}/workspaces/{}", server.addr, seed.workspace_id))
+        .bearer_auth(&seed.admin_user_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let exists_after_db: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)")
+            .bind(seed.workspace_id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert!(!exists_after_db);
+
+    let after = server
+        .state
+        .retrieval
+        .search_chunk_ids(seed.workspace_id, &[document_id], &embedding, 5)
+        .await
+        .expect("search after workspace delete");
+    assert!(
+        after.is_empty(),
+        "Qdrant points for deleted workspace must be removed"
+    );
+
+    let other_after = server
+        .state
+        .retrieval
+        .search_chunk_ids(other_workspace_id, &[other_document_id], &embedding, 5)
+        .await
+        .expect("search other workspace after delete");
+    assert!(
+        other_after.contains(&other_chunk_id),
+        "points outside deleted workspace must remain"
+    );
+
+    let audit_metadata: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"
+        SELECT metadata
+        FROM audit_events
+        WHERE event_type = 'workspace_deleted'
+          AND workspace_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(seed.workspace_id)
+    .fetch_optional(&server.pool)
+    .await
+    .unwrap();
+
+    if let Some(metadata) = audit_metadata {
+        assert_eq!(metadata["qdrant_workspace_delete_succeeded"], true);
+    }
+}
+
+#[tokio::test]
+async fn delete_workspace_succeeds_when_qdrant_unavailable() {
+    let broken_retrieval = RetrievalClient::from_config(RetrievalConfig {
+        qdrant_url: "http://127.0.0.1:1".to_string(),
+        collection_name: "gmrag_document_chunks".to_string(),
+        vector_size: 768,
+        top_k: 5,
+        api_key: None,
+    });
+    let server = TestServer::bootstrap_with_retrieval(Some(broken_retrieval)).await;
+    let seed = server.seed_tenant_owner_workspace().await;
+
+    let response = Client::new()
+        .delete(format!("{}/workspaces/{}", server.addr, seed.workspace_id))
+        .bearer_auth(&seed.admin_user_id)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let exists_after_db: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)")
+            .bind(seed.workspace_id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert!(!exists_after_db);
+
+    let audit_metadata: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"
+        SELECT metadata
+        FROM audit_events
+        WHERE event_type = 'workspace_deleted'
+          AND workspace_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(seed.workspace_id)
+    .fetch_optional(&server.pool)
+    .await
+    .unwrap();
+
+    if let Some(metadata) = audit_metadata {
+        assert_eq!(metadata["qdrant_workspace_delete_succeeded"], false);
+    }
+}
+
+#[tokio::test]
+async fn delete_workspace_is_idempotent_when_no_qdrant_points() {
+    let server = TestServer::bootstrap().await;
+    let seed = server.seed_tenant_owner_workspace().await;
+
+    // Không seed point — delete filter vẫn best-effort Ok và HTTP 204.
+    let response = Client::new()
+        .delete(format!("{}/workspaces/{}", server.addr, seed.workspace_id))
+        .bearer_auth(&seed.admin_user_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let exists_after_db: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1)")
+            .bind(seed.workspace_id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert!(!exists_after_db);
+
+    let audit_metadata: Option<serde_json::Value> = sqlx::query_scalar(
+        r#"
+        SELECT metadata
+        FROM audit_events
+        WHERE event_type = 'workspace_deleted'
+          AND workspace_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(seed.workspace_id)
+    .fetch_optional(&server.pool)
+    .await
+    .unwrap();
+
+    if let Some(metadata) = audit_metadata {
+        // Collection có thể chưa tồn tại: Qdrant thường vẫn 2xx cho filter delete empty,
+        // hoặc trả lỗi API — dù vậy HTTP delete workspace đã thành công.
+        assert!(metadata.get("qdrant_workspace_delete_succeeded").is_some());
+    }
 }
 
 fn init_test_env() {

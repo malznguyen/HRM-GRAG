@@ -46,6 +46,14 @@ Historical v1 audit snapshots are archived under `docs/archive/v1/`.
 - Qdrant (REST `6333`, gRPC `6334`)
 - Keycloak (`8080`, `start-dev` + realm import for Admin API)
 
+**Ollama is not in Docker.** Install Ollama on the host and pull the ADR-21 embedding model before ingestion or chat retrieval:
+
+```bash
+ollama pull AITeamVN/Vietnamese_Embedding
+```
+
+This model is the default for both chunk embedding (ingestion) and query embedding (chat). It outputs **768** dimensions (matches Postgres `vector(768)` and Qdrant). Override with `OLLAMA_EMBED_MODEL` only if you accept retrieval-quality risk and a full re-embed. See `docs/RUNBOOK.md` §6.
+
 **Keycloak scope in local compose:** the container is for **Admin API lookup** used by tenant-owner bootstrap and workspace member addition (`KeycloakClient.get_verified_user_by_email`). JWT validation still uses `CLERK_ISSUER` / the existing `test-bypass-jwt` path — Keycloak is **not** used for login or bearer-token validation in the current backend.
 
 Local Keycloak admin console: `http://localhost:8080` (default demo credentials `admin` / `admin`). Realm `gmrag` and confidential client `gmrag-admin-client` are imported from `docker/keycloak/gmrag-realm.json` on first start.
@@ -60,7 +68,7 @@ Copy `gmrag_api/.env.example` to `gmrag_api/.env` and fill in the values for:
 - Outbox worker: `AUTHZ_OUTBOX_BATCH_SIZE`, `AUTHZ_OUTBOX_MAX_RETRIES`
 - Keycloak admin lookup: `KEYCLOAK_ADMIN_URL`, `KEYCLOAK_REALM`, `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET`
 - S3/MinIO: `S3_ENDPOINT_URL`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_FORCE_PATH_STYLE`, `S3_PRESIGN_EXPIRY_SECS`
-- DeepSeek and Ollama settings for chat, graph extraction, and embeddings
+- DeepSeek and Ollama settings for chat, graph extraction, and embeddings (`OLLAMA_EMBED_MODEL=AITeamVN/Vietnamese_Embedding` recommended)
 
 ## Local Bootstrap
 
@@ -70,22 +78,28 @@ Copy `gmrag_api/.env.example` to `gmrag_api/.env` and fill in the values for:
    docker compose up -d
    ```
 
-2. Configure backend environment:
+2. Pull the embedding model on the host (Ollama is outside Docker):
+
+   ```bash
+   ollama pull AITeamVN/Vietnamese_Embedding
+   ```
+
+3. Configure backend environment and run the API:
 
    ```bash
    cd gmrag_api
    cargo run
    ```
 
-3. Bootstrap a platform admin tuple in OpenFGA for a real user id:
+4. Bootstrap a platform admin tuple in OpenFGA for a real user id:
 
    ```bash
    cargo run --bin seed-platform-admin -- --user-id=<keycloak_sub_id>
    ```
 
-4. **Member management (breaking change vs invite placeholders):** users must **sign up and verify email in identity first**, then a workspace admin can add them by email via `POST /workspaces/{id}/members`. The API resolves the real Keycloak `sub` and writes SQL + OpenFGA together. Adding someone who has not registered returns `USER_NOT_FOUND_IN_IDENTITY`. There is no invite-placeholder / pending-member flow — Keycloak is the identity source of truth so SQL and OpenFGA never desync on fake `invite_*` ids.
+5. **Member management (breaking change vs invite placeholders):** users must **sign up and verify email in identity first**, then a workspace admin can add them by email via `POST /workspaces/{id}/members`. The API resolves the real Keycloak `sub` and writes SQL + OpenFGA together. Adding someone who has not registered returns `USER_NOT_FOUND_IN_IDENTITY`. There is no invite-placeholder / pending-member flow — Keycloak is the identity source of truth so SQL and OpenFGA never desync on fake `invite_*` ids.
 
-5. **Upgrade cleanup (legacy DBs only):** if this environment previously used invite placeholders, run the operator cleanup **after deploying** the build that stopped creating them:
+6. **Upgrade cleanup (legacy DBs only):** if this environment previously used invite placeholders, run the operator cleanup **after deploying** the build that stopped creating them:
 
    ```bash
    cargo run --bin cleanup-invite-placeholders -- --dry-run

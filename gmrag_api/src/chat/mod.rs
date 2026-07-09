@@ -143,11 +143,12 @@ pub async fn build_chat_context(
     user_id: &str,
     user_message: &str,
 ) -> Result<ChatContext, ChatPipelineError> {
+    // ADR-21: cùng model với ingestion (`ollama_embed_model` / embed_text) — không hard-code model khác.
     tracing::info!(
         %workspace_id,
         %session_id,
         query_len = user_message.len(),
-        "RAG pipeline: embedding user query via Ollama"
+        "RAG pipeline: embedding user query via Ollama (shared ADR-21 model)"
     );
 
     let embedding = embed_text(client, user_message)

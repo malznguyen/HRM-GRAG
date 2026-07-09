@@ -418,6 +418,28 @@ pub async fn delete_workspace(
     match result {
         Ok(outcome) if outcome.rows_affected() == 0 => StatusCode::NOT_FOUND.into_response(),
         Ok(_) => {
+            // Best-effort sau SQL commit: cascade SQL đã xoá chunks nhưng Qdrant không cascade.
+            let qdrant_workspace_delete_succeeded = if let Err(err) = state
+                .retrieval
+                .delete_points_by_workspace(workspace_id)
+                .await
+            {
+                // TODO: cleanup worker/outbox cho orphan vectors nếu Qdrant delete fail lặp lại.
+                error!(
+                    error = %err,
+                    user_id = %authz.user_id,
+                    workspace_id = %workspace_id,
+                    "Failed to delete workspace points from Qdrant after database cleanup"
+                );
+                false
+            } else {
+                true
+            };
+
+            let mut audit_metadata = json!({
+                "qdrant_workspace_delete_succeeded": qdrant_workspace_delete_succeeded
+            });
+
             let mut audit_record = AuditEventRecord::new(AuditEventType::WorkspaceDeleted)
                 .with_actor_user_id(authz.user_id.clone())
                 .with_workspace_id(workspace_id)
@@ -448,10 +470,13 @@ pub async fn delete_workspace(
                     }
                 }
 
-                audit_record = audit_record
-                    .with_tenant_id(tid)
-                    .with_metadata(json!({ "tenant_id": tid }));
+                if let Some(obj) = audit_metadata.as_object_mut() {
+                    obj.insert("tenant_id".to_string(), json!(tid));
+                }
+                audit_record = audit_record.with_tenant_id(tid);
             }
+
+            audit_record = audit_record.with_metadata(audit_metadata);
 
             if let Err(err) = insert_audit_event(&state.pool, audit_record).await {
                 error!(

@@ -85,3 +85,27 @@ services:
       /usr/bin/mc mb --ignore-existing local/$$S3_BUCKET;
       /usr/bin/mc anonymous set private local/$$S3_BUCKET;
       "
+
+  # Qdrant — vector store cho Phase 2 retrieval (local demo)
+  qdrant:
+    image: qdrant/qdrant:v1.18.2
+    ports:
+      - "6333:6333" # REST
+      - "6334:6334" # gRPC
+    volumes:
+      - ./.docker_data/qdrant:/qdrant/storage
+
+  # Keycloak — Admin API lookup cho tenant-owner bootstrap (local demo, dev mode)
+  # JWT login/validation KHÔNG dùng service này; vẫn CLERK_ISSUER / test-bypass-jwt.
+  # Admin console (demo local): http://localhost:8080 — user/pass admin/admin
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.6.4
+    command: ["start-dev", "--import-realm"]
+    ports:
+      - "8080:8080"
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+    volumes:
+      # File phải tên <realm>-realm.json theo convention import-at-startup của Keycloak
+      - ./docker/keycloak/gmrag-realm.json:/opt/keycloak/data/import/gmrag-realm.json:ro

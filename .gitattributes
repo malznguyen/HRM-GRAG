@@ -1,0 +1,3 @@
+# sqlx migrate hashes exact migration file bytes; pin LF so Windows (autocrlf)
+# and CI/Linux produce the same checksum as the git object / first apply.
+gmrag_api/migrations/** text eol=lf

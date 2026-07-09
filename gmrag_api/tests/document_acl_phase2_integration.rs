@@ -1072,6 +1072,78 @@ async fn phase2_access_mode_and_share_endpoints_allow_and_deny() {
         .await
         .unwrap();
     assert_eq!(revoked_preview.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // Gap 2: re-share, then revert to workspace_default — must clean shares + FGA tuples.
+    let admin_reshare = client
+        .post(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/shares/{share_target}",
+            server.addr
+        ))
+        .bearer_auth(&workspace_admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_reshare.status(), reqwest::StatusCode::CREATED);
+
+    let admin_unrestrict = client
+        .patch(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/access-mode",
+            server.addr
+        ))
+        .bearer_auth(&workspace_admin)
+        .json(&json!({ "access_mode": "workspace_default" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_unrestrict.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let access_mode_after: String = sqlx::query_scalar(
+        "SELECT access_mode FROM documents WHERE id = $1 AND workspace_id = $2",
+    )
+    .bind(document_id)
+    .bind(workspace_id)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(access_mode_after, "workspace_default");
+
+    let residual_shares: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM document_shares WHERE document_id = $1",
+    )
+    .bind(document_id)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(residual_shares, 0);
+
+    let explicit_still_allowed = server
+        .state
+        .authz_client
+        .check_fga(
+            &format!("user:{share_target}"),
+            Relation::ExplicitViewer,
+            &Object::Document(document_id),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !explicit_still_allowed,
+        "explicit_viewer tuple must be removed when reverting to workspace_default"
+    );
+
+    let member_preview_after_unrestrict = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/preview",
+            server.addr
+        ))
+        .bearer_auth(&member_user)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        member_preview_after_unrestrict.status(),
+        reqwest::StatusCode::OK
+    );
 }
 
 async fn insert_document(
