@@ -572,6 +572,42 @@ async fn invite_placeholder_cleanup_dry_run_does_not_delete() {
         .await;
 }
 
+/// Migration `20260709000000_graph_nodes_hnsw_index` phải tạo HNSW L2 (khớp `ORDER BY embedding <->`).
+#[tokio::test]
+async fn graph_nodes_embedding_hnsw_index_exists_with_l2_ops() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+
+    let indexdef: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT indexdef
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND tablename = 'graph_nodes'
+          AND indexname = 'graph_nodes_embedding_hnsw_idx'
+        "#,
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("query pg_indexes");
+
+    let indexdef = indexdef.expect("graph_nodes_embedding_hnsw_idx must exist after migrations");
+    let lower = indexdef.to_lowercase();
+    assert!(
+        lower.contains("hnsw"),
+        "index must be HNSW, got: {indexdef}"
+    );
+    assert!(
+        lower.contains("vector_l2_ops"),
+        "index must use vector_l2_ops (retrieval uses <->), got: {indexdef}"
+    );
+    assert!(
+        !lower.contains("vector_cosine_ops"),
+        "must not use cosine ops class on graph_nodes.embedding, got: {indexdef}"
+    );
+}
+
 fn init_test_env() {
     TEST_ENV_INIT.get_or_init(|| unsafe {
         std::env::set_var("APP_ENV", "test");

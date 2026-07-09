@@ -51,6 +51,9 @@ async fn main() {
     let retrieval =
         RetrievalClient::from_env().expect("Failed to load retrieval configuration from env");
 
+    // ADR-21: ingestion + chat query share one Ollama embed model (default AITeamVN/Vietnamese_Embedding).
+    gmrag_api::ingestion::embedding::log_embedding_config_on_startup();
+
     let state = AppState {
         pool,
         jwt,

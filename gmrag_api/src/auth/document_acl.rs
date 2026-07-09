@@ -273,8 +273,12 @@ pub async fn backfill_document_workspace_relations(
 }
 
 /// Đổi access_mode của document; trả về `None` nếu document không tồn tại trong workspace.
+///
+/// Khi target là `workspace_default`, dọn `document_shares` + tuple `explicit_viewer`
+/// (residue inert nếu để lại; dọn cả khi re-apply để retry an toàn).
 pub async fn set_document_access_mode(
     pool: &PgPool,
+    authz_client: &AuthzClient,
     document_id: Uuid,
     workspace_id: Uuid,
     access_mode: DocumentAccessMode,
@@ -303,6 +307,8 @@ pub async fn set_document_access_mode(
         },
     )?;
 
+    // UPDATE mode trước cleanup: nếu revoke share trước khi flip mode mà UPDATE fail,
+    // user mất explicit access trong lúc document vẫn restricted.
     sqlx::query(
         r#"
         UPDATE documents
@@ -316,6 +322,12 @@ pub async fn set_document_access_mode(
     .execute(pool)
     .await?;
 
+    let mut shares_cleaned = 0usize;
+    if !access_mode.is_restricted() {
+        shares_cleaned =
+            clear_document_explicit_shares(pool, authz_client, document_id).await?;
+    }
+
     insert_audit_event(
         pool,
         AuditEventRecord::new(AuditEventType::DocumentAccessModeChanged)
@@ -326,11 +338,36 @@ pub async fn set_document_access_mode(
             .with_metadata(json!({
                 "previous_access_mode": previous_mode.as_str(),
                 "access_mode": access_mode.as_str(),
+                "shares_cleaned": shares_cleaned,
             })),
     )
     .await?;
 
     Ok(Some(()))
+}
+
+/// Xoá toàn bộ share SQL + tuple OpenFGA của một document (reuse revoke helper).
+async fn clear_document_explicit_shares(
+    pool: &PgPool,
+    authz_client: &AuthzClient,
+    document_id: Uuid,
+) -> Result<usize, DocumentAclError> {
+    let user_ids: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT user_id
+        FROM document_shares
+        WHERE document_id = $1
+        "#,
+    )
+    .bind(document_id)
+    .fetch_all(pool)
+    .await?;
+
+    for user_id in &user_ids {
+        revoke_document_explicit_viewer(pool, authz_client, document_id, user_id).await?;
+    }
+
+    Ok(user_ids.len())
 }
 
 pub async fn grant_document_explicit_viewer(

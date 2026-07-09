@@ -168,6 +168,7 @@ async fn process_document(
 
     let client = Client::new();
     let embedding_started = Instant::now();
+    // ADR-21: cùng model với chat query (`embed_texts` / ollama_embed_model) — không hard-code model khác.
     tracing::info!(
         %workspace_id,
         %document_id,
@@ -176,7 +177,7 @@ async fn process_document(
         concurrency = embedding_concurrency(),
         timeout_secs = embedding_timeout_secs(),
         retries = embedding_retries(),
-        "Batched embedding stage started"
+        "Batched embedding stage started (shared ADR-21 model)"
     );
     let embeddings = embed_chunks_batched(&client, &chunks).await?;
     tracing::info!(
@@ -213,7 +214,7 @@ async fn process_document(
             stage_timeout_secs = graph_extraction_stage_timeout_secs(),
             "Graph extraction stage started"
         );
-        extract_graph_for_chunks(client, workspace_id, document_id, &chunk_rows).await
+        extract_graph_for_chunks(client.clone(), workspace_id, document_id, &chunk_rows).await
     } else {
         tracing::warn!(
             %workspace_id,
@@ -222,7 +223,7 @@ async fn process_document(
         );
         Vec::new()
     };
-    let graph_batch = GraphWriteBatch::from_extractions(&graph_results);
+    let mut graph_batch = GraphWriteBatch::from_extractions(&graph_results);
     tracing::info!(
         %workspace_id,
         %document_id,
@@ -232,6 +233,32 @@ async fn process_document(
         elapsed_ms = graph_started.elapsed().as_millis(),
         "Graph extraction stage completed"
     );
+
+    // Embed graph nodes trước SAVING để vector search trong chat không fallback ILIKE.
+    // Cùng model chunk/query (ADR-21); hard-fail nếu Ollama lỗi (consistent chunk embed).
+    if graph_batch.node_count() > 0 {
+        let node_embed_started = Instant::now();
+        let node_texts = graph_batch.node_texts_for_embedding();
+        tracing::info!(
+            %workspace_id,
+            %document_id,
+            graph_nodes = node_texts.len(),
+            batch_size = embedding_batch_size(),
+            concurrency = embedding_concurrency(),
+            "Graph node embedding stage started (shared ADR-21 model)"
+        );
+        let node_embeddings = embed_chunks_batched(&client, &node_texts).await?;
+        graph_batch
+            .attach_node_embeddings(node_embeddings)
+            .map_err(ProcessError::Graph)?;
+        tracing::info!(
+            %workspace_id,
+            %document_id,
+            graph_nodes = graph_batch.node_count(),
+            elapsed_ms = node_embed_started.elapsed().as_millis(),
+            "Graph node embedding stage completed"
+        );
+    }
 
     set_processing_stage(&pool, workspace_id, document_id, "SAVING").await?;
 

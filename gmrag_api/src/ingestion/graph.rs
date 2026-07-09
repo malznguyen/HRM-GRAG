@@ -5,6 +5,8 @@ use serde::Deserialize;
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
+use super::embedding::format_pgvector;
+
 pub const GRAPH_EXTRACTION_SYSTEM_PROMPT: &str = r#"You are an expert data extractor. Extract comprehensive Knowledge Graph nodes and edges from this text.
 Return ONLY a valid JSON array of objects.
 Extract ALL critical named entities, medical concepts, systems, people, organizations, statistics, and facts. Do not arbitrarily limit the count.
@@ -226,6 +228,49 @@ impl GraphWriteBatch {
     pub fn edge_count(&self) -> usize {
         self.edges.len()
     }
+
+    /// Text dùng để embed mỗi node — cùng thứ tự với `nodes` / `attach_node_embeddings`.
+    pub fn node_texts_for_embedding(&self) -> Vec<String> {
+        self.nodes
+            .iter()
+            .map(|node| {
+                node_text_for_embedding(&node.name, node.description.as_deref())
+            })
+            .collect()
+    }
+
+    /// Gắn vector embedding (768-d, ADR-21) vào từng node trước khi bulk upsert.
+    ///
+    /// `embeddings.len()` phải khớp `node_count()`; processor batch-embed rồi gọi hàm này.
+    pub fn attach_node_embeddings(
+        &mut self,
+        embeddings: Vec<Vec<f32>>,
+    ) -> Result<(), GraphError> {
+        if embeddings.len() != self.nodes.len() {
+            return Err(GraphError::EmbeddingCountMismatch {
+                expected: self.nodes.len(),
+                actual: embeddings.len(),
+            });
+        }
+
+        for (node, embedding) in self.nodes.iter_mut().zip(embeddings) {
+            node.embedding = Some(embedding);
+        }
+
+        Ok(())
+    }
+}
+
+/// Chuỗi đưa vào model embedding: chỉ `entity_name`, hoặc `name\\ndescription` nếu có mô tả.
+///
+/// Dùng chung model chunk/query (ADR-21) nên text phải ổn định giữa các lần ingest
+/// của cùng entity để vector so sánh được.
+pub fn node_text_for_embedding(name: &str, description: Option<&str>) -> String {
+    let name = name.trim();
+    match description.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(description) => format!("{name}\n{description}"),
+        None => name.to_string(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -233,6 +278,8 @@ struct NodeInput {
     name: String,
     entity_type: Option<String>,
     description: Option<String>,
+    /// Vector 768-d (ADR-21); None nếu chưa attach — SQL ghi NULL, không đè embedding cũ.
+    embedding: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -257,17 +304,42 @@ async fn bulk_upsert_graph_nodes(
         nodes.iter().map(|node| node.entity_type.clone()).collect();
     let descriptions: Vec<Option<String>> =
         nodes.iter().map(|node| node.description.clone()).collect();
+    // pgvector literal qua text[] (cùng pattern document_chunks); None → SQL NULL.
+    let embeddings: Vec<Option<String>> = nodes
+        .iter()
+        .map(|node| {
+            node.embedding
+                .as_ref()
+                .map(|values| format_pgvector(values))
+        })
+        .collect();
 
     let rows = sqlx::query_as::<_, (Uuid, String)>(
         r#"
-        INSERT INTO graph_nodes (workspace_id, entity_name, entity_type, description)
-        SELECT $1, node.entity_name, node.entity_type, node.description
-        FROM UNNEST($2::text[], $3::text[], $4::text[])
-            AS node(entity_name, entity_type, description)
+        INSERT INTO graph_nodes (workspace_id, entity_name, entity_type, description, embedding)
+        SELECT
+            $1,
+            node.entity_name,
+            node.entity_type,
+            node.description,
+            CASE
+                WHEN node.embedding IS NULL THEN NULL
+                ELSE node.embedding::vector
+            END
+        FROM UNNEST($2::text[], $3::text[], $4::text[], $5::text[])
+            AS node(entity_name, entity_type, description, embedding)
         ON CONFLICT (workspace_id, lower(entity_name))
         DO UPDATE SET
             entity_type = COALESCE(EXCLUDED.entity_type, graph_nodes.entity_type),
-            description = COALESCE(EXCLUDED.description, graph_nodes.description)
+            description = COALESCE(EXCLUDED.description, graph_nodes.description),
+            -- Edge-only node (không description) không được làm yếu embedding name+desc đã có.
+            -- NULL không ghi đè; node mới hoặc description mới thì cập nhật vector.
+            embedding = CASE
+                WHEN EXCLUDED.embedding IS NULL THEN graph_nodes.embedding
+                WHEN graph_nodes.embedding IS NULL THEN EXCLUDED.embedding
+                WHEN EXCLUDED.description IS NOT NULL THEN EXCLUDED.embedding
+                ELSE graph_nodes.embedding
+            END
         RETURNING id, lower(entity_name)
         "#,
     )
@@ -275,6 +347,7 @@ async fn bulk_upsert_graph_nodes(
     .bind(&names)
     .bind(&entity_types)
     .bind(&descriptions)
+    .bind(&embeddings)
     .fetch_all(&mut **tx)
     .await
     .map_err(GraphError::Database)?;
@@ -412,6 +485,7 @@ fn merge_node(
         name: name.trim().to_string(),
         entity_type: None,
         description: None,
+        embedding: None,
     });
 
     if input.entity_type.is_none() {
@@ -703,6 +777,8 @@ pub enum GraphError {
     EmptyResponse,
     InvalidJson(serde_json::Error),
     Database(sqlx::Error),
+    /// Số vector attach không khớp số node trong batch (lỗi orchestration).
+    EmbeddingCountMismatch { expected: usize, actual: usize },
 }
 
 impl std::fmt::Display for GraphError {
@@ -713,6 +789,10 @@ impl std::fmt::Display for GraphError {
             GraphError::EmptyResponse => write!(f, "deepseek returned no content"),
             GraphError::InvalidJson(err) => write!(f, "invalid graph JSON: {err}"),
             GraphError::Database(err) => write!(f, "graph database error: {err}"),
+            GraphError::EmbeddingCountMismatch { expected, actual } => write!(
+                f,
+                "graph node embedding count mismatch: got {actual}, expected {expected}"
+            ),
         }
     }
 }
@@ -793,5 +873,82 @@ mod tests {
                 ..
             } if source == "Ferritin" && target == "MAS" && relationship == "helps assess"
         ));
+    }
+
+    #[test]
+    fn node_text_for_embedding_name_only_when_description_missing() {
+        assert_eq!(node_text_for_embedding("ICU", None), "ICU");
+        assert_eq!(node_text_for_embedding("  ICU  ", Some("   ")), "ICU");
+        assert_eq!(node_text_for_embedding("ICU", Some("")), "ICU");
+    }
+
+    #[test]
+    fn node_text_for_embedding_joins_name_and_description() {
+        assert_eq!(
+            node_text_for_embedding("Ferritin", Some("Monitoring marker")),
+            "Ferritin\nMonitoring marker"
+        );
+        assert_eq!(
+            node_text_for_embedding("  Ferritin ", Some("  Monitoring marker  ")),
+            "Ferritin\nMonitoring marker"
+        );
+    }
+
+    #[test]
+    fn attach_node_embeddings_rejects_count_mismatch() {
+        let extractions = vec![(
+            0,
+            vec![GraphElement::Node {
+                name: "ICU".to_string(),
+                entity_type: Some("SYSTEM".to_string()),
+                description: Some("Intensive care unit".to_string()),
+            }],
+        )];
+        let mut batch = GraphWriteBatch::from_extractions(&extractions);
+        assert_eq!(batch.node_count(), 1);
+
+        let err = batch
+            .attach_node_embeddings(vec![vec![0.0; 2], vec![1.0; 2]])
+            .expect_err("count mismatch should fail");
+        assert!(matches!(
+            err,
+            GraphError::EmbeddingCountMismatch {
+                expected: 1,
+                actual: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn attach_node_embeddings_assigns_in_node_order() {
+        let extractions = vec![(
+            0,
+            vec![
+                GraphElement::Node {
+                    name: "Alpha".to_string(),
+                    entity_type: None,
+                    description: Some("first".to_string()),
+                },
+                GraphElement::Node {
+                    name: "Beta".to_string(),
+                    entity_type: None,
+                    description: None,
+                },
+            ],
+        )];
+        let mut batch = GraphWriteBatch::from_extractions(&extractions);
+        let texts = batch.node_texts_for_embedding();
+        assert_eq!(texts.len(), 2);
+        assert_eq!(texts[0], "Alpha\nfirst");
+        assert_eq!(texts[1], "Beta");
+
+        let emb_a = vec![0.1_f32; 3];
+        let emb_b = vec![0.2_f32; 3];
+        batch
+            .attach_node_embeddings(vec![emb_a.clone(), emb_b.clone()])
+            .expect("matching counts should succeed");
+
+        assert_eq!(batch.nodes[0].embedding.as_ref(), Some(&emb_a));
+        assert_eq!(batch.nodes[1].embedding.as_ref(), Some(&emb_b));
     }
 }
