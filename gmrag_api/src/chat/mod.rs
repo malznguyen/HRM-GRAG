@@ -369,12 +369,11 @@ fn log_retrieved_chunks(workspace_id: Uuid, chunks: &[RetrievedChunk]) {
         return;
     }
 
+    // Chỉ log metadata (id, độ dài) — không log nội dung chunk (xem ADR logging metadata-only)
     for chunk in chunks {
-        let preview: String = chunk.original_text.chars().take(120).collect();
         tracing::info!(
             %workspace_id,
             chunk_id = %chunk.id,
-            preview = %preview,
             text_len = chunk.original_text.len(),
             "RAG pipeline: retrieved document chunk"
         );
@@ -394,13 +393,12 @@ fn log_graph_context(workspace_id: Uuid, graph: &GraphContext) {
         return;
     }
 
+    // Chỉ log id/count/nullness — không log tên entity, mô tả, quan hệ
     for node in &graph.nodes {
         tracing::info!(
             %workspace_id,
             node_id = %node.id,
-            entity_name = %node.entity_name,
-            entity_type = ?node.entity_type,
-            description = ?node.description,
+            has_description = node.description.is_some(),
             "RAG pipeline: retrieved graph node"
         );
     }
@@ -409,9 +407,6 @@ fn log_graph_context(workspace_id: Uuid, graph: &GraphContext) {
         tracing::info!(
             %workspace_id,
             edge_id = %edge.id,
-            source = %edge.source_name,
-            target = %edge.target_name,
-            relationship = %edge.relationship,
             "RAG pipeline: retrieved graph edge"
         );
     }
