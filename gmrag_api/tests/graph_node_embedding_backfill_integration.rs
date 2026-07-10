@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use gmrag_api::audit::{AuditEventRecord, AuditEventType, insert_audit_event};
 use gmrag_api::ingestion::backfill_node_embeddings::{
-    backfill_graph_node_embeddings_with_embedder, BackfillGraphNodeEmbeddingsOptions,
+    BackfillGraphNodeEmbeddingsOptions, backfill_graph_node_embeddings_with_embedder,
 };
 use gmrag_api::ingestion::embedding::EXPECTED_EMBEDDING_DIM;
 use gmrag_api::ingestion::graph::node_text_for_embedding;
@@ -179,9 +179,11 @@ fn format_pgvector_literal(seed: f32) -> String {
 }
 
 /// Mock embedder: deterministic 768-d vectors; fails if text contains "FAIL_EMBED".
-fn success_embedder(
-) -> impl FnMut(Vec<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Result<Vec<f32>, String>>, String>> + Send>>
-{
+fn success_embedder() -> impl FnMut(
+    Vec<String>,
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Vec<Result<Vec<f32>, String>>, String>> + Send>,
+> {
     move |texts: Vec<String>| {
         Box::pin(async move {
             let mut results = Vec::with_capacity(texts.len());
@@ -200,13 +202,12 @@ fn success_embedder(
 }
 
 async fn node_embedding_is_null(pool: &sqlx::PgPool, node_id: Uuid) -> bool {
-    let is_null: bool = sqlx::query_scalar(
-        "SELECT embedding IS NULL FROM graph_nodes WHERE id = $1",
-    )
-    .bind(node_id)
-    .fetch_one(pool)
-    .await
-    .unwrap();
+    let is_null: bool =
+        sqlx::query_scalar("SELECT embedding IS NULL FROM graph_nodes WHERE id = $1")
+            .bind(node_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
     is_null
 }
 
@@ -253,7 +254,10 @@ async fn dry_run_reports_null_count_without_writing() {
     assert_eq!(report.nodes_updated, 0);
     assert_eq!(report.error_count, 0);
     assert_eq!(report.counts_by_workspace.len(), 1);
-    assert_eq!(report.counts_by_workspace[0].workspace_id, seed.workspace_id);
+    assert_eq!(
+        report.counts_by_workspace[0].workspace_id,
+        seed.workspace_id
+    );
     assert_eq!(report.counts_by_workspace[0].null_count, 2);
 
     for node_id in &seed.null_node_ids {
@@ -300,11 +304,12 @@ async fn apply_backfills_null_nodes_and_skips_existing() {
             !node_embedding_is_null(&pool, *node_id).await,
             "NULL node should be backfilled"
         );
-        let dims: i32 = sqlx::query_scalar("SELECT vector_dims(embedding) FROM graph_nodes WHERE id = $1")
-            .bind(node_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let dims: i32 =
+            sqlx::query_scalar("SELECT vector_dims(embedding) FROM graph_nodes WHERE id = $1")
+                .bind(node_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(dims as usize, EXPECTED_EMBEDDING_DIM);
     }
 
@@ -506,13 +511,11 @@ async fn apply_audit_metadata_is_counts_only() {
     .unwrap();
     assert_eq!(event_type, "graph_node_embedding_backfill_completed");
 
-    let _ = sqlx::query(
-        "DELETE FROM audit_events WHERE workspace_id = $1 AND event_type = $2",
-    )
-    .bind(seed.workspace_id)
-    .bind(AuditEventType::GraphNodeEmbeddingBackfillCompleted.as_str())
-    .execute(&pool)
-    .await;
+    let _ = sqlx::query("DELETE FROM audit_events WHERE workspace_id = $1 AND event_type = $2")
+        .bind(seed.workspace_id)
+        .bind(AuditEventType::GraphNodeEmbeddingBackfillCompleted.as_str())
+        .execute(&pool)
+        .await;
 
     cleanup_workspace(&pool, &seed).await;
 }

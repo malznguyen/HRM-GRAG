@@ -300,12 +300,11 @@ pub async fn set_document_access_mode(
         return Ok(None);
     };
 
-    let previous_mode = DocumentAccessMode::parse(&current_raw).ok_or(
-        DocumentAclError::InvalidAccessMode {
+    let previous_mode =
+        DocumentAccessMode::parse(&current_raw).ok_or(DocumentAclError::InvalidAccessMode {
             document_id,
             raw_mode: current_raw,
-        },
-    )?;
+        })?;
 
     // UPDATE mode trước cleanup: nếu revoke share trước khi flip mode mà UPDATE fail,
     // user mất explicit access trong lúc document vẫn restricted.
@@ -324,8 +323,7 @@ pub async fn set_document_access_mode(
 
     let mut shares_cleaned = 0usize;
     if !access_mode.is_restricted() {
-        shares_cleaned =
-            clear_document_explicit_shares(pool, authz_client, document_id).await?;
+        shares_cleaned = clear_document_explicit_shares(pool, authz_client, document_id).await?;
     }
 
     insert_audit_event(

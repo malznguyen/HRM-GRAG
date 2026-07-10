@@ -114,12 +114,11 @@ pub async fn collect_placeholder_snapshots(
     let mut snapshots = Vec::with_capacity(placeholders.len());
 
     for user in placeholders {
-        let workspace_member_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)::bigint FROM workspace_members WHERE user_id = $1",
-        )
-        .bind(&user.id)
-        .fetch_one(pool)
-        .await?;
+        let workspace_member_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM workspace_members WHERE user_id = $1")
+                .bind(&user.id)
+                .fetch_one(pool)
+                .await?;
 
         let tenant_member_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*)::bigint FROM tenant_members WHERE user_id = $1")
@@ -409,11 +408,7 @@ async fn collect_openfga_tuples_for_user(
         {
             Ok(objects) => {
                 for object in objects {
-                    push_tuple(
-                        fga_user.clone(),
-                        relation.as_str().to_string(),
-                        object,
-                    );
+                    push_tuple(fga_user.clone(), relation.as_str().to_string(), object);
                 }
             }
             // list-objects lỗi không chặn cleanup SQL — ghi nhận qua Err chỉ khi hard fail

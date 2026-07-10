@@ -1003,14 +1003,13 @@ async fn phase2_access_mode_and_share_endpoints_allow_and_deny() {
         .unwrap();
     assert_eq!(admin_patch.status(), reqwest::StatusCode::NO_CONTENT);
 
-    let access_mode: String = sqlx::query_scalar(
-        "SELECT access_mode FROM documents WHERE id = $1 AND workspace_id = $2",
-    )
-    .bind(document_id)
-    .bind(workspace_id)
-    .fetch_one(&server.pool)
-    .await
-    .unwrap();
+    let access_mode: String =
+        sqlx::query_scalar("SELECT access_mode FROM documents WHERE id = $1 AND workspace_id = $2")
+            .bind(document_id)
+            .bind(workspace_id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
     assert_eq!(access_mode, "restricted");
 
     let member_preview_before_share = client
@@ -1141,23 +1140,21 @@ async fn phase2_access_mode_and_share_endpoints_allow_and_deny() {
         .unwrap();
     assert_eq!(admin_unrestrict.status(), reqwest::StatusCode::NO_CONTENT);
 
-    let access_mode_after: String = sqlx::query_scalar(
-        "SELECT access_mode FROM documents WHERE id = $1 AND workspace_id = $2",
-    )
-    .bind(document_id)
-    .bind(workspace_id)
-    .fetch_one(&server.pool)
-    .await
-    .unwrap();
+    let access_mode_after: String =
+        sqlx::query_scalar("SELECT access_mode FROM documents WHERE id = $1 AND workspace_id = $2")
+            .bind(document_id)
+            .bind(workspace_id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
     assert_eq!(access_mode_after, "workspace_default");
 
-    let residual_shares: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM document_shares WHERE document_id = $1",
-    )
-    .bind(document_id)
-    .fetch_one(&server.pool)
-    .await
-    .unwrap();
+    let residual_shares: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM document_shares WHERE document_id = $1")
+            .bind(document_id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
     assert_eq!(residual_shares, 0);
 
     let explicit_still_allowed = server

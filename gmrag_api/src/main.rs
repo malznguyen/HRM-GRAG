@@ -18,6 +18,11 @@ async fn main() {
         )
         .init();
 
+    if let Err(error) = auth::validate_test_bypass_configuration() {
+        eprintln!("Invalid test bypass configuration: {error}");
+        std::process::exit(1);
+    }
+
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let max_connections = std::env::var("DATABASE_POOL_SIZE")
         .ok()

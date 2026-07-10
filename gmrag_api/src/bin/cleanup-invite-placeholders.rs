@@ -127,22 +127,13 @@ fn print_report(report: &InvitePlaceholderCleanupReport, delete_enabled: bool) {
 
     if delete_enabled {
         println!("--- deletion summary ---");
-        println!(
-            "openfga_tuples_deleted={}",
-            report.openfga_tuples_deleted
-        );
-        println!(
-            "document_shares_deleted={}",
-            report.document_shares_deleted
-        );
+        println!("openfga_tuples_deleted={}", report.openfga_tuples_deleted);
+        println!("document_shares_deleted={}", report.document_shares_deleted);
         println!(
             "workspace_members_deleted={}",
             report.workspace_members_deleted
         );
-        println!(
-            "tenant_members_deleted={}",
-            report.tenant_members_deleted
-        );
+        println!("tenant_members_deleted={}", report.tenant_members_deleted);
         println!("chat_sessions_deleted={}", report.chat_sessions_deleted);
         println!("users_deleted={}", report.users_deleted);
     } else {

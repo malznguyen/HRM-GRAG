@@ -298,10 +298,7 @@ async fn test_authz_enforcement_suite() {
         .unwrap();
     assert_eq!(missing_member_resp.status(), reqwest::StatusCode::NOT_FOUND);
     let missing_body: serde_json::Value = missing_member_resp.json().await.unwrap();
-    assert_eq!(
-        missing_body["error"]["code"],
-        "USER_NOT_FOUND_IN_IDENTITY"
-    );
+    assert_eq!(missing_body["error"]["code"], "USER_NOT_FOUND_IN_IDENTITY");
 
     // Verification 2c: Tenant Owner can patch member role
     let patch_role_resp = client

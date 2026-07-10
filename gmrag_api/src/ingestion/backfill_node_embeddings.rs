@@ -161,13 +161,9 @@ where
     let mut exclude_ids: Vec<Uuid> = Vec::new();
 
     loop {
-        let batch = fetch_null_embedding_batch(
-            pool,
-            options.workspace_id,
-            batch_size as i64,
-            &exclude_ids,
-        )
-        .await?;
+        let batch =
+            fetch_null_embedding_batch(pool, options.workspace_id, batch_size as i64, &exclude_ids)
+                .await?;
         if batch.is_empty() {
             break;
         }

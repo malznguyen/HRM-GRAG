@@ -32,15 +32,13 @@ async fn main() {
 
     let _ = insert_audit_event(
         &pool,
-        AuditEventRecord::new(AuditEventType::QdrantOutboxProcessingStarted).with_metadata(
-            json!({
-                "batch_size": config.batch_size,
-                "max_retries": config.max_retries,
-                "base_backoff_secs": config.backoff.base_backoff_secs,
-                "max_backoff_secs": config.backoff.max_backoff_secs,
-                "claim_lease_secs": config.backoff.claim_lease_secs
-            }),
-        ),
+        AuditEventRecord::new(AuditEventType::QdrantOutboxProcessingStarted).with_metadata(json!({
+            "batch_size": config.batch_size,
+            "max_retries": config.max_retries,
+            "base_backoff_secs": config.backoff.base_backoff_secs,
+            "max_backoff_secs": config.backoff.max_backoff_secs,
+            "claim_lease_secs": config.backoff.claim_lease_secs
+        })),
     )
     .await;
 
