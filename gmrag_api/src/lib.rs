@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod auth;
 pub mod chat;
+pub mod identity_report;
 pub mod ingestion;
 pub mod invite;
 pub mod invite_cleanup;
@@ -9,7 +10,6 @@ pub mod retrieval;
 pub mod routes;
 pub mod state;
 pub mod storage;
-pub mod webhooks;
 
 use axum::{
     Router,
@@ -39,7 +39,6 @@ use routes::workspaces::{
 use serde::Serialize;
 use state::AppState;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use webhooks::clerk::handle_clerk_webhook;
 
 #[derive(Serialize)]
 struct HealthResponse {
@@ -70,7 +69,6 @@ pub fn app_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health))
-        .route("/api/webhooks/clerk", post(handle_clerk_webhook))
         .route("/users/me", get(get_current_user))
         .route("/users/sync", post(sync_current_user))
         .route("/tenants", post(create_tenant))

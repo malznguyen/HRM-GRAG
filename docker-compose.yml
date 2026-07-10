@@ -95,8 +95,7 @@ services:
     volumes:
       - ./.docker_data/qdrant:/qdrant/storage
 
-  # Keycloak — Admin API lookup cho tenant-owner bootstrap (local demo, dev mode)
-  # JWT login/validation KHÔNG dùng service này; vẫn CLERK_ISSUER / test-bypass-jwt.
+  # Keycloak — IdP duy nhất cho frontend OIDC, bearer JWT và Admin API lookup.
   # Admin console (demo local): http://localhost:8080 — user/pass admin/admin
   keycloak:
     image: quay.io/keycloak/keycloak:26.6.4

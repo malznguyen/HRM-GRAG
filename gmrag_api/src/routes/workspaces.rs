@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event};
 use crate::auth::authz::{Authz, Object, Relation, TupleKey};
 use crate::auth::outbox::{enqueue_tuple_delete, enqueue_tuple_write};
+use crate::invite::{normalize_email, upsert_user};
 use crate::retrieval::outbox::enqueue_delete_by_workspace;
 use crate::state::AppState;
 
@@ -132,7 +133,7 @@ pub async fn add_tenant_owner(
     Path(tenant_id): Path<Uuid>,
     Json(body): Json<AddTenantOwnerRequest>,
 ) -> impl IntoResponse {
-    let email = body.email.trim();
+    let email = normalize_email(&body.email);
     if email.is_empty() || !email.contains('@') {
         return (StatusCode::BAD_REQUEST, "Valid email is required").into_response();
     }
@@ -148,7 +149,7 @@ pub async fn add_tenant_owner(
     // Tìm kiếm user từ Keycloak Admin API
     let keycloak_user = match state
         .keycloak_client
-        .get_verified_user_by_email(email)
+        .get_verified_user_by_email(&email)
         .await
     {
         Ok(Some(user)) => user,
@@ -165,24 +166,12 @@ pub async fn add_tenant_owner(
         }
     };
 
-    // Sync user vào SQL nếu chưa tồn tại
-    let user_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)")
-        .bind(&keycloak_user.id)
-        .fetch_one(&state.pool)
-        .await
-        .unwrap_or(false);
-
-    if !user_exists {
-        if let Err(err) =
-            sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
-                .bind(&keycloak_user.id)
-                .bind(email)
-                .execute(&state.pool)
-                .await
-        {
-            error!(error = %err, user_id = %keycloak_user.id, "Failed to insert synced user");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
+    let Some(keycloak_email) = keycloak_user.email.as_deref().map(normalize_email) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if let Err(err) = upsert_user(&state.pool, &keycloak_user.id, &keycloak_email).await {
+        error!(error = %err, user_id = %keycloak_user.id, "Failed to sync Keycloak owner into SQL");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     let mut tx = match state.pool.begin().await {
@@ -363,9 +352,12 @@ pub async fn create_workspace(
 }
 
 /// GET /workspaces
-/// Liệt kê các Workspace mà user thuộc về (hoặc sở hữu Tenant chứa Workspace đó)
+/// SQL candidates (membership / tenant owner read model) ∩ OpenFGA `member`.
+///
+/// SQL chỉ là candidate list — không phải authorization source of truth.
+/// Lỗi OpenFGA fail-closed (không trả SQL-only).
 pub async fn list_workspaces(State(state): State<AppState>, authz: Authz) -> impl IntoResponse {
-    let rows: Result<Vec<WorkspaceResponse>, _> = sqlx::query_as(
+    let candidates: Result<Vec<WorkspaceResponse>, _> = sqlx::query_as(
         r#"
         SELECT w.id, w.name, w.created_at
         FROM workspaces w
@@ -380,13 +372,55 @@ pub async fn list_workspaces(State(state): State<AppState>, authz: Authz) -> imp
     .fetch_all(&state.pool)
     .await;
 
-    match rows {
-        Ok(workspaces) => Json(workspaces).into_response(),
+    let candidates = match candidates {
+        Ok(rows) => rows,
         Err(err) => {
-            error!(error = %err, user_id = %authz.user_id, "Failed to list workspaces");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            error!(error = %err, user_id = %authz.user_id, "Failed to list workspace candidates");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    if candidates.is_empty() {
+        return Json(Vec::<WorkspaceResponse>::new()).into_response();
+    }
+
+    // Deduplicate theo id (GROUP BY đã đảm bảo, vẫn giữ deterministic order)
+    let mut seen = std::collections::HashSet::new();
+    let mut unique: Vec<WorkspaceResponse> = Vec::with_capacity(candidates.len());
+    for row in candidates {
+        if seen.insert(row.id) {
+            unique.push(row);
         }
     }
+
+    let workspace_ids: Vec<Uuid> = unique.iter().map(|w| w.id).collect();
+    let allowed_ids = match state
+        .authz_client
+        .filter_workspaces_by_member(&authz.user_id, &workspace_ids)
+        .await
+    {
+        Ok(ids) => ids.into_iter().collect::<std::collections::HashSet<_>>(),
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                "OpenFGA workspace list filter failed; refusing SQL-only fallback"
+            );
+            return crate::auth::authz::ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "AUTHZ_ERROR",
+                message: format!("Authorization check failed: {err}"),
+            }
+            .into_response();
+        }
+    };
+
+    let filtered: Vec<WorkspaceResponse> = unique
+        .into_iter()
+        .filter(|w| allowed_ids.contains(&w.id))
+        .collect();
+
+    Json(filtered).into_response()
 }
 
 /// DELETE /workspaces/{id}

@@ -1,13 +1,3 @@
-# Documentation
-docs/
-**/docs/
-*.md
-*.mdx
-!README.md
-*.pdf
-*.doc
-*.docx
-
 # Secrets and local configuration
 .env
 .env.*
@@ -41,7 +31,18 @@ out/
 coverage/
 *.tsbuildinfo
 
-# Tooling caches
+# Tooling caches / local browser automation artifacts
 .turbo/
 .vercel/
 .DS_Store
+.playwright/
+.playwright-cli/
+**/playwright-report/
+**/test-results/
+**/tmp/
+**/tmp-e2e/
+*.log
+
+# Generated docs only (source-of-truth Markdown under docs/ and plans/ is tracked)
+docs/generated/
+**/generated-docs/

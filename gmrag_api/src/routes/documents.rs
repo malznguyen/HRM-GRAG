@@ -489,6 +489,8 @@ pub async fn share_document(
         }
     }
 
+    // Share target phải pass SQL membership VÀ OpenFGA member relation.
+    // SQL-only stale membership (FGA đã revoke) không được grant.
     match is_workspace_member(&state.pool, workspace_id, &user_id).await {
         Ok(true) => {}
         Ok(false) => {
@@ -508,6 +510,37 @@ pub async fn share_document(
                 "Failed to verify workspace membership before document share"
             );
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
+    match state
+        .authz_client
+        .check_workspace_member(&user_id, workspace_id)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return ApiError {
+                status: StatusCode::BAD_REQUEST,
+                code: "USER_NOT_WORKSPACE_MEMBER",
+                message: "Target user is not a member of this workspace".to_string(),
+            }
+            .into_response();
+        }
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                target_user_id = %user_id,
+                "OpenFGA membership check failed before document share"
+            );
+            return ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "AUTHZ_ERROR",
+                message: format!("Authorization check failed: {err}"),
+            }
+            .into_response();
         }
     }
 

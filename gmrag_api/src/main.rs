@@ -41,8 +41,8 @@ async fn main() {
         .await
         .expect("Failed to run migrations");
 
-    let jwt =
-        auth::jwt::JwtValidator::from_env().expect("CLERK_ISSUER must be set for JWT validation");
+    let jwt = auth::jwt::JwtValidator::from_env()
+        .expect("JWT_ISSUER, JWT_AUDIENCE, and JWT_JWKS_URL must be configured for JWT validation");
 
     let authz_client =
         auth::authz::AuthzClient::from_env().expect("Failed to initialize AuthzClient from env");
@@ -71,7 +71,10 @@ async fn main() {
 
     let app = gmrag_api::app_router(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+    let addr = std::env::var("API_BIND_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:8083".to_string())
+        .parse::<SocketAddr>()
+        .expect("API_BIND_ADDR must be a valid socket address");
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("Failed to bind TCP listener");

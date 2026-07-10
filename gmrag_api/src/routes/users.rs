@@ -1,9 +1,10 @@
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
+use serde_json::json;
 use tracing::error;
 
 use crate::auth::authz::{Authz, Object, Relation};
-use crate::invite::{normalize_email, upsert_user};
+use crate::invite::upsert_user;
 use crate::state::AppState;
 
 #[derive(Serialize)]
@@ -11,11 +12,6 @@ pub struct UserResponse {
     pub id: String,
     pub email: String,
     pub is_super_admin: bool,
-}
-
-#[derive(Deserialize)]
-pub struct SyncUserRequest {
-    pub email: String,
 }
 
 pub async fn get_current_user(State(state): State<AppState>, authz: Authz) -> impl IntoResponse {
@@ -48,31 +44,62 @@ pub async fn get_current_user(State(state): State<AppState>, authz: Authz) -> im
     Json(user_resp).into_response()
 }
 
-/// Upsert profile SQL theo JWT `sub`. Không còn reconcile placeholder invite.
-pub async fn sync_current_user(
-    State(state): State<AppState>,
-    authz: Authz,
-    Json(body): Json<SyncUserRequest>,
-) -> impl IntoResponse {
-    let email = normalize_email(&body.email);
-    if email.is_empty() || !email.contains('@') {
-        return (StatusCode::BAD_REQUEST, "Valid email is required").into_response();
+/// Đồng bộ profile từ claims OIDC đã xác thực, không nhận email từ client.
+pub async fn sync_current_user(State(state): State<AppState>, authz: Authz) -> impl IntoResponse {
+    let Some(email) = authz
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+    else {
+        return identity_sync_error(
+            StatusCode::BAD_REQUEST,
+            "IDENTITY_EMAIL_REQUIRED",
+            "Verified email claim is required",
+        );
+    };
+    if !authz.email_verified {
+        return identity_sync_error(
+            StatusCode::BAD_REQUEST,
+            "IDENTITY_EMAIL_UNVERIFIED",
+            "Verified email claim is required",
+        );
     }
 
-    // user_id lấy từ JWT đã verify; email body vẫn là debt legacy (xem CURRENT_API_CONTRACT)
     if let Err(err) = upsert_user(&state.pool, &authz.user_id, &email).await {
+        if is_identity_email_conflict(&err) {
+            return identity_sync_error(
+                StatusCode::CONFLICT,
+                "IDENTITY_EMAIL_CONFLICT",
+                "Email is already associated with another identity",
+            );
+        }
         error!(
             error = %err,
             user_id = %authz.user_id,
-            email = %email,
             "Failed to upsert user during sync"
         );
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to sync user: {err}"),
-        )
-            .into_response();
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     StatusCode::OK.into_response()
+}
+
+fn identity_sync_error(
+    status: StatusCode,
+    code: &'static str,
+    message: &'static str,
+) -> axum::response::Response {
+    (
+        status,
+        Json(json!({ "error": { "code": code, "message": message } })),
+    )
+        .into_response()
+}
+
+fn is_identity_email_conflict(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|database_error| database_error.code())
+        .is_some_and(|code| code == "23505")
 }

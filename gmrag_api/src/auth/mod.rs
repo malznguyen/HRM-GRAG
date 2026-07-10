@@ -4,6 +4,7 @@ pub mod extractor;
 pub mod jwt;
 pub mod keycloak;
 pub mod outbox;
+pub mod workspace_role;
 
 const TEST_BYPASS_FLAGS: [&str; 2] = ["TEST_BYPASS_JWT", "TEST_BYPASS_KEYCLOAK"];
 

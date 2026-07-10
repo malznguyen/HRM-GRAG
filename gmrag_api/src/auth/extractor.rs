@@ -7,6 +7,8 @@ use axum::{
 
 pub struct AuthUser {
     pub user_id: String,
+    pub email: Option<String>,
+    pub email_verified: bool,
 }
 
 impl FromRequestParts<AppState> for AuthUser {
@@ -21,9 +23,13 @@ impl FromRequestParts<AppState> for AuthUser {
             "Missing or invalid Authorization header",
         ))?;
 
-        let user_id = state.jwt.validate(token).await.map_err(jwt_rejection)?;
+        let claims = state.jwt.validate(token).await.map_err(jwt_rejection)?;
 
-        Ok(AuthUser { user_id })
+        Ok(AuthUser {
+            user_id: claims.sub,
+            email: claims.email,
+            email_verified: claims.email_verified,
+        })
     }
 }
 
@@ -35,7 +41,9 @@ fn bearer_token(parts: &Parts) -> Option<&str> {
 
 fn jwt_rejection(err: JwtError) -> (StatusCode, &'static str) {
     match err {
-        JwtError::MissingConfig => (StatusCode::INTERNAL_SERVER_ERROR, "JWT not configured"),
+        JwtError::MissingConfig(_) | JwtError::InvalidConfig(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "JWT not configured")
+        }
         JwtError::FetchJwks | JwtError::InvalidJwks | JwtError::UnknownKeyId => {
             (StatusCode::UNAUTHORIZED, "Invalid token")
         }

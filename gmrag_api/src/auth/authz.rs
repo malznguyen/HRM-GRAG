@@ -129,7 +129,7 @@ pub struct AuthzClient {
     model_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct TupleKey {
     pub user: String,
     pub relation: String,
@@ -161,6 +161,18 @@ struct ListObjectsRequest {
 #[derive(Debug, Deserialize)]
 struct ListObjectsResponse {
     objects: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadTuplesResponse {
+    #[serde(default)]
+    tuples: Vec<ReadTuple>,
+    continuation_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReadTuple {
+    key: TupleKey,
 }
 
 #[derive(Debug, Serialize)]
@@ -313,6 +325,39 @@ impl AuthzClient {
         Ok(list_resp.objects)
     }
 
+    /// Đọc tuple để operator đối chiếu; không dùng cho authorization ở request path.
+    /// OpenFGA Read API là POST; body rỗng nghĩa là quét mọi tuple trong store (phân trang).
+    pub async fn list_all_tuples(&self) -> Result<Vec<TupleKey>, AuthzError> {
+        let url = format!("{}/stores/{}/read", self.api_url, self.store_id);
+        let mut tuples = Vec::new();
+        let mut continuation_token: Option<String> = None;
+
+        loop {
+            let mut body = serde_json::Map::new();
+            body.insert("page_size".to_string(), serde_json::json!(100));
+            if let Some(token) = &continuation_token {
+                body.insert(
+                    "continuation_token".to_string(),
+                    serde_json::Value::String(token.clone()),
+                );
+            }
+
+            let response = self.client.post(&url).json(&body).send().await?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                return Err(AuthzError::OpenFga { status, body });
+            }
+
+            let page: ReadTuplesResponse = response.json().await?;
+            tuples.extend(page.tuples.into_iter().map(|entry| entry.key));
+            let Some(token) = page.continuation_token.filter(|value| !value.is_empty()) else {
+                return Ok(tuples);
+            };
+            continuation_token = Some(token);
+        }
+    }
+
     pub async fn write_tuple(
         &self,
         user: &str,
@@ -343,6 +388,65 @@ impl AuthzClient {
                 relation: relation.as_str().to_string(),
                 object: object.to_string(),
             }],
+        )
+        .await
+    }
+
+    /// Kiểm tra relation `member` trên workspace (admin/tenant_owner inherit qua model).
+    /// Fail-closed: lỗi dependency trả `Err`, không suy luận true.
+    pub async fn check_workspace_member(
+        &self,
+        user_id: &str,
+        workspace_id: Uuid,
+    ) -> Result<bool, AuthzError> {
+        self.check_fga(
+            &format!("user:{user_id}"),
+            Relation::Member,
+            &Object::Workspace(workspace_id),
+        )
+        .await
+    }
+
+    /// Lọc candidate workspace theo relation `member` của caller.
+    /// Fail-closed nếu bất kỳ check OpenFGA nào lỗi — không fallback SQL-only.
+    pub async fn filter_workspaces_by_member(
+        &self,
+        user_id: &str,
+        workspace_ids: &[Uuid],
+    ) -> Result<Vec<Uuid>, AuthzError> {
+        let mut allowed = Vec::with_capacity(workspace_ids.len());
+        for workspace_id in workspace_ids {
+            if self.check_workspace_member(user_id, *workspace_id).await? {
+                allowed.push(*workspace_id);
+            }
+        }
+        Ok(allowed)
+    }
+
+    /// Kiểm tra relation `admin` explicit/inherited trên workspace.
+    pub async fn check_workspace_admin(
+        &self,
+        user_id: &str,
+        workspace_id: Uuid,
+    ) -> Result<bool, AuthzError> {
+        self.check_fga(
+            &format!("user:{user_id}"),
+            Relation::Admin,
+            &Object::Workspace(workspace_id),
+        )
+        .await
+    }
+
+    /// Kiểm tra relation `owner` trên tenant.
+    pub async fn check_tenant_owner(
+        &self,
+        user_id: &str,
+        tenant_id: Uuid,
+    ) -> Result<bool, AuthzError> {
+        self.check_fga(
+            &format!("user:{user_id}"),
+            Relation::Owner,
+            &Object::Tenant(tenant_id),
         )
         .await
     }
@@ -383,6 +487,8 @@ impl IntoResponse for ApiError {
 pub struct Authz {
     pub client: AuthzClient,
     pub user_id: String,
+    pub email: Option<String>,
+    pub email_verified: bool,
     pub cache: RequestAuthzCache,
 }
 
@@ -457,6 +563,8 @@ impl FromRequestParts<AppState> for Authz {
         Ok(Self {
             client: state.authz_client.clone(),
             user_id: auth_user.user_id,
+            email: auth_user.email,
+            email_verified: auth_user.email_verified,
             cache,
         })
     }
