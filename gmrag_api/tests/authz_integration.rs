@@ -484,6 +484,57 @@ async fn test_authz_enforcement_suite() {
         .unwrap();
     assert_eq!(member_patch_resp.status(), reqwest::StatusCode::FORBIDDEN);
 
+    // Verification 3c: successful remove returns 204, clears SQL, revokes OpenFGA access
+    let member_access_before = client
+        .get(&format!(
+            "{}/workspaces/{}/documents",
+            test_server.addr, workspace_id
+        ))
+        .bearer_auth(new_member_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(member_access_before.status(), reqwest::StatusCode::OK);
+
+    let admin_remove_resp = client
+        .delete(&format!(
+            "{}/workspaces/{}/members/{}",
+            test_server.addr, workspace_id, new_member_id
+        ))
+        .bearer_auth(workspace_admin_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_remove_resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let removed_still_member: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)",
+    )
+    .bind(workspace_uuid)
+    .bind(new_member_id)
+    .fetch_one(&test_server.pool)
+    .await
+    .unwrap();
+    assert!(
+        !removed_still_member,
+        "SQL membership row must be deleted after successful remove"
+    );
+
+    let member_access_after = client
+        .get(&format!(
+            "{}/workspaces/{}/documents",
+            test_server.addr, workspace_id
+        ))
+        .bearer_auth(new_member_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        member_access_after.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "removed member must be denied workspace-protected routes"
+    );
+
     // -------------------------------------------------------------
     // 5. NON-MEMBER CHECKS
     // -------------------------------------------------------------

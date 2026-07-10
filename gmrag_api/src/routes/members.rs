@@ -12,8 +12,8 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event};
-use crate::auth::authz::{ApiError, Authz, Object, Relation, TupleKey};
-use crate::auth::outbox::{enqueue_tuple_delete, enqueue_tuple_write};
+use crate::auth::authz::{ApiError, Authz, AuthzError, Object, Relation, TupleKey};
+use crate::auth::outbox::enqueue_tuple_write;
 use crate::invite::normalize_email;
 use crate::state::AppState;
 
@@ -323,7 +323,10 @@ pub async fn update_workspace_member_role(
 }
 
 /// DELETE /workspaces/{workspace_id}/members/{member_id}
-/// Xoá thành viên khỏi workspace
+/// Xoá thành viên khỏi workspace.
+///
+/// OpenFGA revoke trước SQL (fail-closed): thà từ chối tạm thời còn hơn
+/// báo xoá thành công trong khi user vẫn còn quyền truy cập.
 pub async fn remove_workspace_member(
     State(state): State<AppState>,
     authz: Authz,
@@ -357,6 +360,43 @@ pub async fn remove_workspace_member(
         return StatusCode::NOT_FOUND.into_response();
     };
 
+    let fga_relation = if role_str == "ADMIN" {
+        Relation::Admin
+    } else {
+        Relation::Member
+    };
+
+    let tuple = TupleKey {
+        user: format!("user:{member_id}"),
+        relation: fga_relation.as_str().to_string(),
+        object: Object::Workspace(workspace_id).to_string(),
+    };
+
+    // OpenFGA trước SQL — outbox không được coi là bằng chứng đã revoke
+    match state
+        .authz_client
+        .write_tuples(Vec::new(), vec![tuple.clone()])
+        .await
+    {
+        Ok(()) => {}
+        // Tuple đã không còn = revoke idempotent (cùng semantics outbox)
+        Err(err) if is_missing_tuple_delete_error(&err) => {}
+        Err(err) => {
+            error!(
+                error = %err,
+                workspace_id = %workspace_id,
+                user_id = %member_id,
+                "Failed to delete workspace member from OpenFGA"
+            );
+            return ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "AUTHZ_REVOKE_FAILED",
+                message: "Failed to revoke workspace membership in authorization store".to_string(),
+            }
+            .into_response();
+        }
+    }
+
     let result = sqlx::query(
         r#"
         DELETE FROM workspace_members
@@ -371,35 +411,6 @@ pub async fn remove_workspace_member(
     match result {
         Ok(outcome) if outcome.rows_affected() == 0 => StatusCode::NOT_FOUND.into_response(),
         Ok(_) => {
-            let fga_relation = if role_str == "ADMIN" {
-                Relation::Admin
-            } else {
-                Relation::Member
-            };
-
-            let tuple = TupleKey {
-                user: format!("user:{member_id}"),
-                relation: fga_relation.as_str().to_string(),
-                object: Object::Workspace(workspace_id).to_string(),
-            };
-
-            if let Err(err) = state
-                .authz_client
-                .write_tuples(Vec::new(), vec![tuple.clone()])
-                .await
-            {
-                error!(error = %err, workspace_id = %workspace_id, user_id = %member_id, "Failed to delete workspace member from OpenFGA");
-
-                if let Err(outbox_err) = enqueue_tuple_delete(&state.pool, &tuple).await {
-                    error!(
-                        error = %outbox_err,
-                        workspace_id = %workspace_id,
-                        user_id = %member_id,
-                        "Failed to enqueue authz outbox recovery event for member remove"
-                    );
-                }
-            }
-
             if let Err(err) = insert_audit_event(
                 &state.pool,
                 AuditEventRecord::new(AuditEventType::MemberRemoved)
@@ -424,15 +435,44 @@ pub async fn remove_workspace_member(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(err) => {
+            // FGA đã revoke nhưng SQL vẫn còn membership — ghi tuple_write để khôi phục
+            // đồng bộ với read model; admin nhận lỗi và có thể retry remove.
             error!(
                 error = %err,
                 user_id = %authz.user_id,
                 workspace_id = %workspace_id,
                 member_id = %member_id,
-                "Failed to remove workspace member"
+                "Failed to remove workspace member from SQL after OpenFGA revoke"
             );
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+
+            if let Err(outbox_err) = enqueue_tuple_write(&state.pool, &tuple).await {
+                error!(
+                    error = %outbox_err,
+                    workspace_id = %workspace_id,
+                    user_id = %member_id,
+                    "Failed to enqueue authz outbox recovery write after member remove SQL failure"
+                );
+            }
+
+            ApiError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "MEMBER_REMOVE_FAILED",
+                message: "Membership authorization was revoked but membership record could not be removed"
+                    .to_string(),
+            }
+            .into_response()
         }
+    }
+}
+
+/// OpenFGA trả lỗi khi xoá tuple không tồn tại — coi là success cho revoke idempotent.
+fn is_missing_tuple_delete_error(err: &AuthzError) -> bool {
+    match err {
+        AuthzError::OpenFga { body, .. } => {
+            let body_lower = body.to_ascii_lowercase();
+            body_lower.contains("does not exist") || body_lower.contains("not found")
+        }
+        AuthzError::Http(_) => false,
     }
 }
 
