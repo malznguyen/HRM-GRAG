@@ -1265,6 +1265,496 @@ async fn qdrant_cleanup_force_allows_delete_attempt_on_live_workspace() {
         .ok();
 }
 
+/// OpenFGA revoke lỗi → SQL membership giữ nguyên, không trả 204.
+#[tokio::test]
+async fn remove_member_openfga_failure_leaves_sql_and_returns_error() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+
+    let mock_fga_url = spawn_authz_mock(AuthzMockMode::CheckAllowWriteFail).await;
+    let store_id = std::env::var("OPENFGA_STORE_ID").unwrap_or_else(|_| "test-store".into());
+    let authz_client = AuthzClient::new(mock_fga_url, store_id, None);
+
+    let (addr, tenant_id, workspace_id, owner_user_id, member_user_id) =
+        bootstrap_member_remove_fixture(&pool, authz_client, false).await;
+
+    let response = Client::new()
+        .delete(format!(
+            "{addr}/workspaces/{workspace_id}/members/{member_user_id}"
+        ))
+        .bearer_auth(&owner_user_id)
+        .send()
+        .await
+        .unwrap();
+
+    assert_ne!(
+        response.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "must not report success when OpenFGA revoke fails"
+    );
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "AUTHZ_REVOKE_FAILED");
+
+    let still_member: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)",
+    )
+    .bind(workspace_id)
+    .bind(&member_user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        still_member,
+        "SQL row must remain when OpenFGA revoke fails"
+    );
+
+    cleanup_member_remove_fixture(
+        &pool,
+        tenant_id,
+        workspace_id,
+        &owner_user_id,
+        &member_user_id,
+    )
+    .await;
+}
+
+/// SQL DELETE lỗi sau khi OpenFGA revoke thành công → fail-closed + outbox tuple_write.
+#[tokio::test]
+async fn remove_member_sql_failure_after_fga_enqueues_tuple_write() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    let authz_client = AuthzClient::from_env().unwrap();
+
+    let (addr, tenant_id, workspace_id, owner_user_id, member_user_id) =
+        bootstrap_member_remove_fixture(&pool, authz_client.clone(), true).await;
+
+    install_reject_member_delete_trigger(&pool).await;
+
+    let response = Client::new()
+        .delete(format!(
+            "{addr}/workspaces/{workspace_id}/members/{member_user_id}"
+        ))
+        .bearer_auth(&owner_user_id)
+        .send()
+        .await
+        .unwrap();
+
+    assert_ne!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "MEMBER_REMOVE_FAILED");
+
+    let still_member: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2)",
+    )
+    .bind(workspace_id)
+    .bind(&member_user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(still_member);
+
+    let outbox: Option<(String, serde_json::Value)> = sqlx::query_as(
+        r#"
+        SELECT event_type, payload
+        FROM authz_outbox
+        WHERE status = 'PENDING'
+          AND event_type = 'tuple_write'
+          AND payload->>'user' = $1
+          AND payload->>'object' = $2
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(format!("user:{member_user_id}"))
+    .bind(format!("workspace:{workspace_id}"))
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+
+    drop_reject_member_delete_trigger(&pool).await;
+
+    let Some((event_type, payload)) = outbox else {
+        panic!("expected tuple_write recovery outbox event after SQL failure");
+    };
+    assert_eq!(event_type, "tuple_write");
+    assert_eq!(payload["relation"], json!("member"));
+
+    // FGA đã revoke; member không còn quyền dù SQL vẫn còn row
+    let still_allowed = authz_client
+        .check_fga(
+            &format!("user:{member_user_id}"),
+            Relation::Member,
+            &Object::Workspace(workspace_id),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !still_allowed,
+        "OpenFGA access must stay revoked (fail-closed) until recovery write runs"
+    );
+    let _ = sqlx::query(
+        "DELETE FROM authz_outbox WHERE payload->>'user' = $1 AND payload->>'object' = $2",
+    )
+    .bind(format!("user:{member_user_id}"))
+    .bind(format!("workspace:{workspace_id}"))
+    .execute(&pool)
+    .await;
+
+    // Khôi phục FGA admin/owner tuples cleanup
+    let _ = authz_client
+        .delete_tuple(
+            &format!("user:{owner_user_id}"),
+            Relation::Owner,
+            &Object::Tenant(tenant_id),
+        )
+        .await;
+    let _ = authz_client
+        .delete_tuple(
+            &format!("tenant:{tenant_id}"),
+            Relation::Tenant,
+            &Object::Workspace(workspace_id),
+        )
+        .await;
+    cleanup_member_remove_fixture(
+        &pool,
+        tenant_id,
+        workspace_id,
+        &owner_user_id,
+        &member_user_id,
+    )
+    .await;
+}
+
+/// SQL + outbox enqueue đều lỗi → vẫn trả failure, không bao giờ 204.
+#[tokio::test]
+async fn remove_member_sql_and_outbox_failure_still_returns_error() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    let authz_client = AuthzClient::from_env().unwrap();
+
+    let (addr, tenant_id, workspace_id, owner_user_id, member_user_id) =
+        bootstrap_member_remove_fixture(&pool, authz_client.clone(), true).await;
+
+    install_reject_member_delete_trigger(&pool).await;
+    install_reject_outbox_insert_trigger(&pool).await;
+
+    let response = Client::new()
+        .delete(format!(
+            "{addr}/workspaces/{workspace_id}/members/{member_user_id}"
+        ))
+        .bearer_auth(&owner_user_id)
+        .send()
+        .await
+        .unwrap();
+
+    assert_ne!(
+        response.status(),
+        reqwest::StatusCode::NO_CONTENT,
+        "must never claim removal succeeded when recovery enqueue fails"
+    );
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "MEMBER_REMOVE_FAILED");
+
+    drop_reject_member_delete_trigger(&pool).await;
+    drop_reject_outbox_insert_trigger(&pool).await;
+
+    let _ = authz_client
+        .delete_tuple(
+            &format!("user:{owner_user_id}"),
+            Relation::Owner,
+            &Object::Tenant(tenant_id),
+        )
+        .await;
+    let _ = authz_client
+        .delete_tuple(
+            &format!("tenant:{tenant_id}"),
+            Relation::Tenant,
+            &Object::Workspace(workspace_id),
+        )
+        .await;
+    // Member FGA may already be revoked
+    let _ = authz_client
+        .delete_tuple(
+            &format!("user:{member_user_id}"),
+            Relation::Member,
+            &Object::Workspace(workspace_id),
+        )
+        .await;
+    cleanup_member_remove_fixture(
+        &pool,
+        tenant_id,
+        workspace_id,
+        &owner_user_id,
+        &member_user_id,
+    )
+    .await;
+}
+
+#[derive(Clone, Copy)]
+enum AuthzMockMode {
+    /// Check luôn allow; Write luôn fail (mô phỏng outage lúc revoke).
+    CheckAllowWriteFail,
+}
+
+async fn spawn_authz_mock(mode: AuthzMockMode) -> String {
+    use axum::http::StatusCode as AxumStatus;
+    use axum::response::IntoResponse;
+    use axum::{Router, routing::post};
+
+    let router = Router::new()
+        .route(
+            "/stores/{store_id}/check",
+            post(move || async move {
+                match mode {
+                    AuthzMockMode::CheckAllowWriteFail => {
+                        axum::Json(json!({ "allowed": true })).into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/stores/{store_id}/write",
+            post(move || async move {
+                match mode {
+                    AuthzMockMode::CheckAllowWriteFail => {
+                        (AxumStatus::SERVICE_UNAVAILABLE, "openfga unavailable").into_response()
+                    }
+                }
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+async fn bootstrap_member_remove_fixture(
+    pool: &sqlx::PgPool,
+    authz_client: AuthzClient,
+    seed_real_fga: bool,
+) -> (String, Uuid, Uuid, String, String) {
+    let jwt = gmrag_api::auth::jwt::JwtValidator::from_env().unwrap();
+    let keycloak_client = gmrag_api::auth::keycloak::KeycloakClient::from_env().unwrap();
+    let storage = setup_storage().await;
+    let retrieval = gmrag_api::retrieval::RetrievalClient::from_env().unwrap();
+
+    let state = AppState {
+        pool: pool.clone(),
+        jwt,
+        storage,
+        retrieval,
+        ingestion_limiter: Arc::new(Semaphore::new(0)),
+        authz_client: authz_client.clone(),
+        keycloak_client,
+    };
+
+    let app = gmrag_api::app_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let tenant_id = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
+    let owner_user_id = format!("phase3a-rm-owner-{}", Uuid::new_v4());
+    let member_user_id = format!("phase3a-rm-member-{}", Uuid::new_v4());
+
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(tenant_id)
+        .bind(format!("Phase3A RM Tenant {tenant_id}"))
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO workspaces (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(workspace_id)
+        .bind(tenant_id)
+        .bind(format!("Phase3A RM Workspace {workspace_id}"))
+        .execute(pool)
+        .await
+        .unwrap();
+
+    for user_id in [&owner_user_id, &member_user_id] {
+        sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(format!("{user_id}@test.local"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'ADMIN')",
+    )
+    .bind(workspace_id)
+    .bind(&owner_user_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'MEMBER')",
+    )
+    .bind(workspace_id)
+    .bind(&member_user_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    if seed_real_fga {
+        authz_client
+            .write_tuple(
+                &format!("user:{owner_user_id}"),
+                Relation::Owner,
+                &Object::Tenant(tenant_id),
+            )
+            .await
+            .unwrap();
+        authz_client
+            .write_tuple(
+                &format!("tenant:{tenant_id}"),
+                Relation::Tenant,
+                &Object::Workspace(workspace_id),
+            )
+            .await
+            .unwrap();
+        authz_client
+            .write_tuple(
+                &format!("user:{member_user_id}"),
+                Relation::Member,
+                &Object::Workspace(workspace_id),
+            )
+            .await
+            .unwrap();
+    }
+
+    (addr, tenant_id, workspace_id, owner_user_id, member_user_id)
+}
+
+async fn cleanup_member_remove_fixture(
+    pool: &sqlx::PgPool,
+    tenant_id: Uuid,
+    workspace_id: Uuid,
+    owner_user_id: &str,
+    member_user_id: &str,
+) {
+    let _ = sqlx::query("DELETE FROM workspace_members WHERE workspace_id = $1")
+        .bind(workspace_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM workspaces WHERE id = $1")
+        .bind(workspace_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(tenant_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM users WHERE id = $1 OR id = $2")
+        .bind(owner_user_id)
+        .bind(member_user_id)
+        .execute(pool)
+        .await;
+}
+
+/// Trigger tĩnh (sqlx 0.9 cấm dynamic SQL) — phase3a_test_lock đảm bảo không chạy song song.
+async fn install_reject_member_delete_trigger(pool: &sqlx::PgPool) {
+    sqlx::query(
+        r#"
+        CREATE OR REPLACE FUNCTION test_reject_member_delete() RETURNS trigger AS $$
+        BEGIN
+          RAISE EXCEPTION 'injected member delete failure for tests';
+        END;
+        $$ LANGUAGE plpgsql;
+        "#,
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query("DROP TRIGGER IF EXISTS test_reject_member_delete ON workspace_members")
+        .execute(pool)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        r#"
+        CREATE TRIGGER test_reject_member_delete
+        BEFORE DELETE ON workspace_members
+        FOR EACH ROW EXECUTE FUNCTION test_reject_member_delete();
+        "#,
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn drop_reject_member_delete_trigger(pool: &sqlx::PgPool) {
+    let _ = sqlx::query("DROP TRIGGER IF EXISTS test_reject_member_delete ON workspace_members")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DROP FUNCTION IF EXISTS test_reject_member_delete()")
+        .execute(pool)
+        .await;
+}
+
+async fn install_reject_outbox_insert_trigger(pool: &sqlx::PgPool) {
+    sqlx::query(
+        r#"
+        CREATE OR REPLACE FUNCTION test_reject_outbox_insert() RETURNS trigger AS $$
+        BEGIN
+          RAISE EXCEPTION 'injected authz_outbox insert failure for tests';
+        END;
+        $$ LANGUAGE plpgsql;
+        "#,
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::query("DROP TRIGGER IF EXISTS test_reject_outbox_insert ON authz_outbox")
+        .execute(pool)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        r#"
+        CREATE TRIGGER test_reject_outbox_insert
+        BEFORE INSERT ON authz_outbox
+        FOR EACH ROW EXECUTE FUNCTION test_reject_outbox_insert();
+        "#,
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn drop_reject_outbox_insert_trigger(pool: &sqlx::PgPool) {
+    let _ = sqlx::query("DROP TRIGGER IF EXISTS test_reject_outbox_insert ON authz_outbox")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DROP FUNCTION IF EXISTS test_reject_outbox_insert()")
+        .execute(pool)
+        .await;
+}
+
 fn init_test_env() {
     TEST_ENV_INIT.get_or_init(|| unsafe {
         std::env::set_var("APP_ENV", "test");
