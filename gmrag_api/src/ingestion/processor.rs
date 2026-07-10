@@ -289,6 +289,17 @@ async fn process_document(
         .await
         .map_err(ProcessError::Retrieval)?;
 
+    // Race: user có thể DELETE document sau SQL commit chunks nhưng trước upsert Qdrant.
+    // Upsert lúc đó tạo orphan points (SQL đã không còn document). Skip nếu row đã mất.
+    if !document_still_exists(&pool, workspace_id, document_id).await? {
+        tracing::warn!(
+            %workspace_id,
+            %document_id,
+            "Document deleted during ingestion; skip Qdrant upsert to avoid orphan points"
+        );
+        return Ok(());
+    }
+
     retrieval
         .upsert_chunk_points(&points)
         .await
@@ -615,6 +626,129 @@ async fn build_chunk_points_for_retrieval(
 #[derive(sqlx::FromRow)]
 struct DocumentStorageMetadata {
     object_key: String,
+}
+
+async fn document_still_exists(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    document_id: Uuid,
+) -> Result<bool, ProcessError> {
+    let exists: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1
+            FROM documents
+            WHERE id = $1 AND workspace_id = $2
+        )
+        "#,
+    )
+    .bind(document_id)
+    .bind(workspace_id)
+    .fetch_one(pool)
+    .await
+    .map_err(ProcessError::Database)?;
+    Ok(exists)
+}
+
+#[cfg(test)]
+mod race_guard_tests {
+    use super::document_still_exists;
+    use sqlx::postgres::PgPoolOptions;
+    use uuid::Uuid;
+
+    /// Fix High #4: sau khi document bị xoá, race guard phải thấy `exists=false`.
+    #[tokio::test]
+    async fn document_still_exists_false_after_delete() {
+        dotenvy::dotenv().ok();
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skip: DATABASE_URL not set");
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .expect("connect");
+        let _ = sqlx::migrate!("./migrations").run(&pool).await;
+
+        let tenant_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let document_id = Uuid::new_v4();
+        let user_id = format!("race-guard-{}", Uuid::new_v4());
+
+        sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
+            .bind(&user_id)
+            .bind(format!("{user_id}@test.local"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+            .bind(tenant_id)
+            .bind(format!("race-tenant-{tenant_id}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces (id, tenant_id, name) VALUES ($1, $2, $3)")
+            .bind(workspace_id)
+            .bind(tenant_id)
+            .bind(format!("race-ws-{workspace_id}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO documents (
+                id, workspace_id, owner_id, filename, status, processing_stage,
+                object_key, bucket, uploaded_by
+            )
+            VALUES (
+                $1, $2, $3, 'race.pdf', 'PROCESSING', 'EMBEDDING',
+                'tmp/race.pdf', 'gmrag-documents', $3
+            )
+            "#,
+        )
+        .bind(document_id)
+        .bind(workspace_id)
+        .bind(&user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            document_still_exists(&pool, workspace_id, document_id)
+                .await
+                .unwrap()
+        );
+
+        sqlx::query("DELETE FROM documents WHERE id = $1")
+            .bind(document_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(
+            !document_still_exists(&pool, workspace_id, document_id)
+                .await
+                .unwrap(),
+            "after SQL delete, upsert race guard must report missing document"
+        );
+
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind(workspace_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM tenants WHERE id = $1")
+            .bind(tenant_id)
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .ok();
+    }
 }
 
 async fn fetch_document_storage_metadata(

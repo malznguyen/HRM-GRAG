@@ -23,6 +23,12 @@ pub enum AuditEventType {
     AuthzOutboxProcessingStarted,
     AuthzOutboxProcessingCompleted,
     AuthzOutboxProcessingFailed,
+    QdrantOutboxProcessingStarted,
+    QdrantOutboxProcessingCompleted,
+    QdrantOutboxProcessingFailed,
+    QdrantCleanupDryRun,
+    QdrantCleanupCompleted,
+    QdrantCleanupFailed,
     StorageCleanupDryRun,
     StorageCleanupCompleted,
     StorageCleanupFailed,
@@ -61,6 +67,14 @@ impl AuditEventType {
             AuditEventType::AuthzOutboxProcessingStarted => "authz_outbox_processing_started",
             AuditEventType::AuthzOutboxProcessingCompleted => "authz_outbox_processing_completed",
             AuditEventType::AuthzOutboxProcessingFailed => "authz_outbox_processing_failed",
+            AuditEventType::QdrantOutboxProcessingStarted => "qdrant_outbox_processing_started",
+            AuditEventType::QdrantOutboxProcessingCompleted => {
+                "qdrant_outbox_processing_completed"
+            }
+            AuditEventType::QdrantOutboxProcessingFailed => "qdrant_outbox_processing_failed",
+            AuditEventType::QdrantCleanupDryRun => "qdrant_cleanup_dry_run",
+            AuditEventType::QdrantCleanupCompleted => "qdrant_cleanup_completed",
+            AuditEventType::QdrantCleanupFailed => "qdrant_cleanup_failed",
             AuditEventType::StorageCleanupDryRun => "storage_cleanup_dry_run",
             AuditEventType::StorageCleanupCompleted => "storage_cleanup_completed",
             AuditEventType::StorageCleanupFailed => "storage_cleanup_failed",

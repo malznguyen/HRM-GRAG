@@ -21,6 +21,7 @@ use crate::auth::document_acl::{
 };
 use crate::auth::outbox::enqueue_tuple_delete;
 use crate::ingestion::processor::spawn_document_processing;
+use crate::retrieval::outbox::enqueue_delete_by_document;
 use crate::state::AppState;
 use crate::storage::build_original_document_object_key;
 
@@ -835,20 +836,33 @@ pub async fn delete_document(
                     true
                 };
 
-            // Best-effort giống storage: SQL đã commit thì không fail cả request nếu Qdrant down.
+            // SQL đã commit: không fail HTTP nếu Qdrant down/timeout; enqueue recovery.
+            // Dùng timeout ngắn (request path) — không block DELETE tới worker timeout;
+            // chậm/timeout → outbox, worker retry với timeout dài hơn.
             let qdrant_delete_succeeded = if let Err(err) = state
                 .retrieval
-                .delete_points_by_document(workspace_id, document_id)
+                .delete_points_by_document_for_request(workspace_id, document_id)
                 .await
             {
-                // TODO: cleanup worker/outbox cho orphan vectors nếu Qdrant delete fail lặp lại.
                 error!(
                     error = %err,
                     user_id = %authz.user_id,
                     workspace_id = %workspace_id,
                     document_id = %document_id,
+                    request_timeout_secs = state.retrieval.delete_request_timeout_secs(),
                     "Failed to delete document points from Qdrant after database cleanup"
                 );
+
+                if let Err(outbox_err) =
+                    enqueue_delete_by_document(&state.pool, workspace_id, document_id).await
+                {
+                    error!(
+                        error = %outbox_err,
+                        workspace_id = %workspace_id,
+                        document_id = %document_id,
+                        "Failed to enqueue qdrant_outbox recovery for document delete"
+                    );
+                }
                 false
             } else {
                 true
