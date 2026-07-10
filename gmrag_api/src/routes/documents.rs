@@ -1146,7 +1146,8 @@ pub async fn upload_document(
                     Ok(bytes) => bytes.to_vec(),
                     Err(_) => continue,
                 };
-                if pdf_bytes.is_empty() || !is_pdf_upload(&filename, &pdf_bytes) {
+                // Filename/MIME chỉ là metadata — chấp nhận theo chữ ký + parse cấu trúc PDF
+                if pdf_bytes.is_empty() || !is_parseable_pdf(&pdf_bytes) {
                     continue;
                 }
                 pending_files.push(PendingUploadFile {
@@ -1373,15 +1374,82 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
-fn is_pdf_upload(filename: &str, data: &[u8]) -> bool {
-    let magic_ok = data.starts_with(b"%PDF");
-    let ext_ok = filename.to_ascii_lowercase().ends_with(".pdf");
-    magic_ok || ext_ok
+/// Chấp nhận upload khi bytes có chữ ký `%PDF-` và `lopdf` parse cấu trúc được.
+/// Tên file / Content-Type client gửi không quyết định acceptance (chỉ lưu metadata).
+fn is_parseable_pdf(data: &[u8]) -> bool {
+    if !data.starts_with(b"%PDF-") {
+        return false;
+    }
+    lopdf::Document::load_mem(data).is_ok()
 }
 
 fn checksum_sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("{:x}", digest)
+}
+
+#[cfg(test)]
+mod pdf_upload_validation_tests {
+    use super::is_parseable_pdf;
+    use lopdf::{Document, Object, dictionary};
+
+    fn minimal_valid_pdf_bytes() -> Vec<u8> {
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes)
+            .expect("synthetic PDF fixture must serialize");
+        bytes
+    }
+
+    #[test]
+    fn pdf_upload_validation_accepts_minimal_valid_pdf() {
+        let bytes = minimal_valid_pdf_bytes();
+        assert!(
+            is_parseable_pdf(&bytes),
+            "minimal in-memory PDF fixture must be accepted"
+        );
+    }
+
+    #[test]
+    fn pdf_upload_validation_rejects_arbitrary_bytes_named_pdf() {
+        // Tên file .pdf không đủ — arbitrary bytes phải bị từ chối
+        let bytes = b"this is not a pdf at all";
+        assert!(!is_parseable_pdf(bytes));
+    }
+
+    #[test]
+    fn pdf_upload_validation_rejects_malformed_pdf_prefix() {
+        // Có chữ ký %PDF- nhưng không parse được cấu trúc
+        let bytes = b"%PDF-1.4\nthis is truncated garbage without xref or trailer\n%%EOF";
+        assert!(!is_parseable_pdf(bytes));
+    }
+
+    #[test]
+    fn pdf_upload_validation_accepts_valid_bytes_without_pdf_extension() {
+        // Bytes là authoritative — không cần suffix .pdf trên filename
+        let bytes = minimal_valid_pdf_bytes();
+        assert!(is_parseable_pdf(&bytes));
+    }
 }
 
 async fn fetch_workspace_tenant_id(

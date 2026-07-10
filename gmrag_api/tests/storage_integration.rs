@@ -360,6 +360,57 @@ async fn upload_rejects_invalid_access_mode() {
 }
 
 #[tokio::test]
+async fn upload_rejects_non_pdf_bytes_with_pdf_filename_without_creating_storage() {
+    let server = TestServer::bootstrap().await;
+    let seed = server.seed_workspace_admin().await;
+
+    let docs_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM documents WHERE workspace_id = $1")
+            .bind(seed.workspace_id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+
+    let form = reqwest::multipart::Form::new().part(
+        "file",
+        reqwest::multipart::Part::bytes(b"not a real pdf payload".to_vec())
+            .file_name("report.pdf")
+            .mime_str("application/pdf")
+            .unwrap(),
+    );
+
+    let response = Client::new()
+        .post(format!(
+            "{}/workspaces/{}/documents/upload",
+            server.addr, seed.workspace_id
+        ))
+        .bearer_auth(&seed.admin_user_id)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+
+    // Contract: empty 400 when no acceptable PDF was accepted
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = response.bytes().await.unwrap();
+    assert!(
+        body.is_empty(),
+        "rejected non-PDF upload must keep empty 400 body"
+    );
+
+    let docs_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM documents WHERE workspace_id = $1")
+            .bind(seed.workspace_id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        docs_after, docs_before,
+        "rejected upload must not insert a documents row (validation runs before S3 put)"
+    );
+}
+
+#[tokio::test]
 async fn retry_document_reads_from_object_storage_without_local_file() {
     let server = TestServer::bootstrap().await;
     let seed = server.seed_workspace_admin().await;
@@ -926,7 +977,25 @@ fn init_test_env() {
 }
 
 fn sample_pdf_bytes() -> Vec<u8> {
-    b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF".to_vec()
+    // PDF tối thiểu do lopdf sinh ra — phải parse được bằng Document::load_mem
+    vec![
+        37, 80, 68, 70, 45, 49, 46, 52, 10, 37, 187, 173, 192, 222, 10, 49, 32, 48, 32, 111, 98,
+        106, 10, 60, 60, 47, 84, 121, 112, 101, 47, 80, 97, 103, 101, 115, 47, 75, 105, 100, 115,
+        91, 50, 32, 48, 32, 82, 93, 47, 67, 111, 117, 110, 116, 32, 49, 62, 62, 10, 101, 110, 100,
+        111, 98, 106, 10, 50, 32, 48, 32, 111, 98, 106, 10, 60, 60, 47, 84, 121, 112, 101, 47, 80,
+        97, 103, 101, 47, 80, 97, 114, 101, 110, 116, 32, 49, 32, 48, 32, 82, 47, 77, 101, 100,
+        105, 97, 66, 111, 120, 91, 48, 32, 48, 32, 54, 49, 50, 32, 55, 57, 50, 93, 62, 62, 10, 101,
+        110, 100, 111, 98, 106, 10, 51, 32, 48, 32, 111, 98, 106, 10, 60, 60, 47, 84, 121, 112,
+        101, 47, 67, 97, 116, 97, 108, 111, 103, 47, 80, 97, 103, 101, 115, 32, 49, 32, 48, 32, 82,
+        62, 62, 10, 101, 110, 100, 111, 98, 106, 10, 52, 32, 48, 32, 111, 98, 106, 10, 60, 60, 47,
+        82, 111, 111, 116, 32, 51, 32, 48, 32, 82, 47, 84, 121, 112, 101, 47, 88, 82, 101, 102, 47,
+        83, 105, 122, 101, 32, 53, 47, 87, 91, 49, 32, 52, 32, 50, 93, 47, 73, 110, 100, 101, 120,
+        91, 49, 32, 52, 93, 47, 76, 101, 110, 103, 116, 104, 32, 50, 56, 62, 62, 115, 116, 114,
+        101, 97, 109, 10, 1, 0, 0, 0, 15, 0, 0, 1, 0, 0, 0, 66, 0, 0, 1, 0, 0, 0, 131, 0, 0, 1, 0,
+        0, 0, 176, 0, 0, 10, 101, 110, 100, 115, 116, 114, 101, 97, 109, 32, 10, 101, 110, 100,
+        111, 98, 106, 10, 10, 115, 116, 97, 114, 116, 120, 114, 101, 102, 10, 49, 55, 54, 10, 37,
+        37, 69, 79, 70,
+    ]
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
