@@ -103,10 +103,17 @@ pub async fn bulk_upsert_graph(
     delete_untracked_graph_items(tx, workspace_id).await?;
 
     let node_ids = bulk_upsert_graph_nodes(tx, workspace_id, &batch.nodes).await?;
-    insert_graph_node_sources(tx, workspace_id, document_id, node_ids.values()).await?;
+    insert_graph_node_sources(tx, workspace_id, document_id, &node_ids, &batch.nodes).await?;
 
-    let edge_ids = bulk_upsert_graph_edges(tx, workspace_id, &node_ids, &batch.edges).await?;
-    insert_graph_edge_sources(tx, workspace_id, document_id, edge_ids.iter()).await?;
+    bulk_upsert_graph_edges(tx, workspace_id, &node_ids, &batch.edges).await?;
+    insert_graph_edge_sources(
+        tx,
+        workspace_id,
+        document_id,
+        &node_ids,
+        &batch.edges,
+    )
+    .await?;
 
     Ok(())
 }
@@ -360,9 +367,9 @@ async fn bulk_upsert_graph_edges(
     workspace_id: Uuid,
     node_ids: &HashMap<String, Uuid>,
     edges: &[EdgeInput],
-) -> Result<Vec<Uuid>, GraphError> {
+) -> Result<(), GraphError> {
     if edges.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
     let mut source_ids = Vec::with_capacity(edges.len());
@@ -385,10 +392,10 @@ async fn bulk_upsert_graph_edges(
     }
 
     if source_ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
 
-    let rows = sqlx::query_as::<_, (Uuid,)>(
+    sqlx::query(
         r#"
         INSERT INTO graph_edges (workspace_id, source_node_id, target_node_id, relationship, description)
         SELECT $1, edge.source_id, edge.target_id, edge.relationship, edge.description
@@ -397,7 +404,6 @@ async fn bulk_upsert_graph_edges(
         ON CONFLICT (workspace_id, source_node_id, target_node_id, lower(relationship))
         DO UPDATE SET
             description = COALESCE(EXCLUDED.description, graph_edges.description)
-        RETURNING id
         "#,
     )
     .bind(workspace_id)
@@ -405,35 +411,6 @@ async fn bulk_upsert_graph_edges(
     .bind(&target_ids)
     .bind(&relationships)
     .bind(&descriptions)
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(GraphError::Database)?;
-
-    Ok(rows.into_iter().map(|(id,)| id).collect())
-}
-
-async fn insert_graph_node_sources<'a>(
-    tx: &mut Transaction<'_, Postgres>,
-    workspace_id: Uuid,
-    document_id: Uuid,
-    node_ids: impl Iterator<Item = &'a Uuid>,
-) -> Result<(), GraphError> {
-    let ids: Vec<Uuid> = node_ids.copied().collect();
-    if ids.is_empty() {
-        return Ok(());
-    }
-
-    sqlx::query(
-        r#"
-        INSERT INTO graph_node_sources (graph_node_id, document_id, workspace_id)
-        SELECT node_id, $1, $2
-        FROM UNNEST($3::uuid[]) AS source(node_id)
-        ON CONFLICT (graph_node_id, document_id) DO NOTHING
-        "#,
-    )
-    .bind(document_id)
-    .bind(workspace_id)
-    .bind(&ids)
     .execute(&mut **tx)
     .await
     .map_err(GraphError::Database)?;
@@ -441,28 +418,140 @@ async fn insert_graph_node_sources<'a>(
     Ok(())
 }
 
-async fn insert_graph_edge_sources<'a>(
+async fn insert_graph_node_sources(
     tx: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
     document_id: Uuid,
-    edge_ids: impl Iterator<Item = &'a Uuid>,
+    node_ids: &HashMap<String, Uuid>,
+    nodes: &[NodeInput],
 ) -> Result<(), GraphError> {
-    let ids: Vec<Uuid> = edge_ids.copied().collect();
+    let mut ids = Vec::with_capacity(nodes.len());
+    let mut entity_types = Vec::with_capacity(nodes.len());
+    let mut descriptions = Vec::with_capacity(nodes.len());
+    let mut embeddings = Vec::with_capacity(nodes.len());
+
+    for node in nodes {
+        let Some(node_id) = node_ids.get(&normalize_key(&node.name)) else {
+            continue;
+        };
+
+        ids.push(*node_id);
+        entity_types.push(node.entity_type.clone());
+        descriptions.push(node.description.clone());
+        embeddings.push(
+            node.embedding
+                .as_ref()
+                .map(|values| format_pgvector(values)),
+        );
+    }
+
     if ids.is_empty() {
         return Ok(());
     }
 
     sqlx::query(
         r#"
-        INSERT INTO graph_edge_sources (graph_edge_id, document_id, workspace_id)
-        SELECT edge_id, $1, $2
-        FROM UNNEST($3::uuid[]) AS source(edge_id)
-        ON CONFLICT (graph_edge_id, document_id) DO NOTHING
+        INSERT INTO graph_node_sources (
+            graph_node_id,
+            document_id,
+            workspace_id,
+            entity_type,
+            description,
+            embedding
+        )
+        SELECT
+            source.node_id,
+            $1,
+            $2,
+            source.entity_type,
+            source.description,
+            CASE
+                WHEN source.embedding IS NULL THEN NULL
+                ELSE source.embedding::vector
+            END
+        FROM UNNEST($3::uuid[], $4::text[], $5::text[], $6::text[])
+            AS source(node_id, entity_type, description, embedding)
+        ON CONFLICT (graph_node_id, document_id)
+        DO UPDATE SET
+            workspace_id = EXCLUDED.workspace_id,
+            entity_type = EXCLUDED.entity_type,
+            description = EXCLUDED.description,
+            embedding = EXCLUDED.embedding
         "#,
     )
     .bind(document_id)
     .bind(workspace_id)
     .bind(&ids)
+    .bind(&entity_types)
+    .bind(&descriptions)
+    .bind(&embeddings)
+    .execute(&mut **tx)
+    .await
+    .map_err(GraphError::Database)?;
+
+    Ok(())
+}
+
+async fn insert_graph_edge_sources(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    document_id: Uuid,
+    node_ids: &HashMap<String, Uuid>,
+    edges: &[EdgeInput],
+) -> Result<(), GraphError> {
+    let mut source_ids = Vec::with_capacity(edges.len());
+    let mut target_ids = Vec::with_capacity(edges.len());
+    let mut relationships = Vec::with_capacity(edges.len());
+    let mut descriptions = Vec::with_capacity(edges.len());
+
+    for edge in edges {
+        let Some(source_id) = node_ids.get(&normalize_key(&edge.source)) else {
+            continue;
+        };
+        let Some(target_id) = node_ids.get(&normalize_key(&edge.target)) else {
+            continue;
+        };
+
+        source_ids.push(*source_id);
+        target_ids.push(*target_id);
+        relationships.push(edge.relationship.clone());
+        descriptions.push(edge.description.clone());
+    }
+
+    if source_ids.is_empty() {
+        return Ok(());
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO graph_edge_sources (
+            graph_edge_id,
+            document_id,
+            workspace_id,
+            relationship,
+            description
+        )
+        SELECT edge.id, $1, $2, source.relationship, source.description
+        FROM UNNEST($3::uuid[], $4::uuid[], $5::text[], $6::text[])
+            AS source(source_node_id, target_node_id, relationship, description)
+        INNER JOIN graph_edges edge
+            ON edge.workspace_id = $2
+           AND edge.source_node_id = source.source_node_id
+           AND edge.target_node_id = source.target_node_id
+           AND lower(edge.relationship) = lower(source.relationship)
+        ON CONFLICT (graph_edge_id, document_id)
+        DO UPDATE SET
+            workspace_id = EXCLUDED.workspace_id,
+            relationship = EXCLUDED.relationship,
+            description = EXCLUDED.description
+        "#,
+    )
+    .bind(document_id)
+    .bind(workspace_id)
+    .bind(&source_ids)
+    .bind(&target_ids)
+    .bind(&relationships)
+    .bind(&descriptions)
     .execute(&mut **tx)
     .await
     .map_err(GraphError::Database)?;

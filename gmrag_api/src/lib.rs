@@ -4,6 +4,7 @@ pub mod chat;
 pub mod ingestion;
 pub mod invite;
 pub mod invite_cleanup;
+pub mod outbox;
 pub mod retrieval;
 pub mod routes;
 pub mod state;

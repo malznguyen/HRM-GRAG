@@ -542,6 +542,8 @@ async fn delete_document_succeeds_when_qdrant_unavailable() {
         vector_size: 768,
         top_k: 5,
         api_key: None,
+        delete_request_timeout_secs: 5,
+        delete_worker_timeout_secs: 5,
     });
     let server = TestServer::bootstrap_with_retrieval(Some(broken_retrieval)).await;
     let seed = server.seed_workspace_admin().await;
@@ -596,6 +598,92 @@ async fn delete_document_succeeds_when_qdrant_unavailable() {
         assert_eq!(metadata["qdrant_delete_succeeded"], false);
         assert_eq!(metadata["storage_delete_succeeded"], true);
     }
+
+    // Fail path phải enqueue recovery — không để orphan vĩnh viễn.
+    let outbox_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM qdrant_outbox
+        WHERE event_type = 'delete_by_document'
+          AND status = 'PENDING'
+          AND payload->>'document_id' = $1
+        "#,
+    )
+    .bind(seeded_document.document_id.to_string())
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(outbox_count, 1, "document delete failure must enqueue qdrant_outbox");
+}
+
+#[tokio::test]
+async fn delete_document_short_circuits_when_qdrant_hangs_and_enqueues_outbox() {
+    // Fix High #1 (integration): request timeout ngắn → HTTP 204 nhanh, enqueue recovery.
+    use std::time::Instant;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hang_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                drop(stream);
+            });
+        }
+    });
+
+    let hanging_retrieval = RetrievalClient::from_config(RetrievalConfig {
+        qdrant_url: format!("http://{hang_addr}"),
+        collection_name: "gmrag_document_chunks".to_string(),
+        vector_size: 768,
+        top_k: 5,
+        api_key: None,
+        delete_request_timeout_secs: 1,
+        delete_worker_timeout_secs: 30,
+    });
+    let server = TestServer::bootstrap_with_retrieval(Some(hanging_retrieval)).await;
+    let seed = server.seed_workspace_admin().await;
+    let seeded_document = server.insert_failed_document(&seed, true).await;
+
+    let started = Instant::now();
+    let response = Client::new()
+        .delete(format!(
+            "{}/workspaces/{}/documents/{}",
+            server.addr, seed.workspace_id, seeded_document.document_id
+        ))
+        .bearer_auth(&seed.admin_user_id)
+        .send()
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(
+        elapsed.as_secs_f64() < 8.0,
+        "HTTP delete must not wait worker timeout when Qdrant hangs; elapsed={elapsed:?}"
+    );
+
+    let outbox_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM qdrant_outbox
+        WHERE event_type = 'delete_by_document'
+          AND status = 'PENDING'
+          AND payload->>'document_id' = $1
+        "#,
+    )
+    .bind(seeded_document.document_id.to_string())
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        outbox_count, 1,
+        "timeout on request path must enqueue qdrant_outbox"
+    );
 }
 
 #[tokio::test]
@@ -714,6 +802,8 @@ async fn delete_workspace_succeeds_when_qdrant_unavailable() {
         vector_size: 768,
         top_k: 5,
         api_key: None,
+        delete_request_timeout_secs: 5,
+        delete_worker_timeout_secs: 5,
     });
     let server = TestServer::bootstrap_with_retrieval(Some(broken_retrieval)).await;
     let seed = server.seed_tenant_owner_workspace().await;
@@ -753,6 +843,21 @@ async fn delete_workspace_succeeds_when_qdrant_unavailable() {
     if let Some(metadata) = audit_metadata {
         assert_eq!(metadata["qdrant_workspace_delete_succeeded"], false);
     }
+
+    let outbox_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM qdrant_outbox
+        WHERE event_type = 'delete_by_workspace'
+          AND status = 'PENDING'
+          AND payload->>'workspace_id' = $1
+        "#,
+    )
+    .bind(seed.workspace_id.to_string())
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(outbox_count, 1, "workspace delete failure must enqueue qdrant_outbox");
 }
 
 #[tokio::test]

@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use gmrag_api::auth::authz::{Object, Relation};
 use gmrag_api::auth::document_acl::backfill_document_workspace_relations;
+use gmrag_api::ingestion::graph::{GraphElement, GraphWriteBatch, bulk_upsert_graph};
 use gmrag_api::state::AppState;
 
 const EMBEDDING_DIM: usize = 768;
@@ -214,9 +215,14 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
     .await
     .unwrap();
 
-    let public_doc_id = Uuid::new_v4();
+    let first_provenance_doc_id = Uuid::new_v4();
+    let second_provenance_doc_id = Uuid::new_v4();
+    let (restricted_doc_id, public_doc_id) = if first_provenance_doc_id < second_provenance_doc_id {
+        (first_provenance_doc_id, second_provenance_doc_id)
+    } else {
+        (second_provenance_doc_id, first_provenance_doc_id)
+    };
     let legacy_public_doc_id = Uuid::new_v4();
-    let restricted_doc_id = Uuid::new_v4();
 
     insert_document(
         &server.pool,
@@ -494,7 +500,6 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         .unwrap();
     assert_eq!(owner_chunk.status(), reqwest::StatusCode::OK);
 
-    // Graph filtering should hide restricted sources for non-viewer member.
     let member_graph = client
         .get(format!("{}/workspaces/{workspace_id}/graph", server.addr))
         .bearer_auth(&member_user)
@@ -503,18 +508,33 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         .unwrap();
     assert_eq!(member_graph.status(), reqwest::StatusCode::OK);
     let member_graph_json: Value = member_graph.json().await.unwrap();
-    let member_node_names: Vec<String> = member_graph_json["nodes"]
+    let member_shared_node = member_graph_json["nodes"]
         .as_array()
-        .unwrap_or(&Vec::new())
+        .unwrap()
         .iter()
-        .filter_map(|node| {
-            node.get("entity_name")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect();
-    assert!(member_node_names.contains(&"PublicEntity".to_string()));
-    assert!(!member_node_names.contains(&"SecretEntity".to_string()));
+        .find(|node| node["entity_name"] == "SharedEntity")
+        .unwrap();
+    assert_eq!(member_shared_node["entity_type"], "public_type");
+    assert_eq!(
+        member_shared_node["description"],
+        "public graph node description"
+    );
+    let member_shared_link = member_graph_json["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|link| link["relationship"] == "shared_relation")
+        .unwrap();
+    assert_eq!(
+        member_shared_link["description"],
+        "public graph edge description"
+    );
+    assert!(!member_graph_json.to_string().contains("restricted graph"));
+    assert!(
+        !member_graph_json
+            .to_string()
+            .contains("restricted_only_relation")
+    );
 
     let viewer_graph = client
         .get(format!("{}/workspaces/{workspace_id}/graph", server.addr))
@@ -524,17 +544,36 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         .unwrap();
     assert_eq!(viewer_graph.status(), reqwest::StatusCode::OK);
     let viewer_graph_json: Value = viewer_graph.json().await.unwrap();
-    let viewer_node_names: Vec<String> = viewer_graph_json["nodes"]
+    let viewer_shared_node = viewer_graph_json["nodes"]
         .as_array()
-        .unwrap_or(&Vec::new())
+        .unwrap()
         .iter()
-        .filter_map(|node| {
-            node.get("entity_name")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .collect();
-    assert!(viewer_node_names.contains(&"SecretEntity".to_string()));
+        .find(|node| node["entity_name"] == "SharedEntity")
+        .unwrap();
+    assert_eq!(viewer_shared_node["entity_type"], "restricted_type");
+    assert_eq!(
+        viewer_shared_node["description"],
+        "restricted graph node description"
+    );
+    let viewer_graph_text = viewer_graph_json.to_string();
+    assert!(viewer_graph_text.contains("restricted graph edge description"));
+    assert!(viewer_graph_text.contains("restricted_only_relation"));
+
+    let platform_graph = client
+        .get(format!("{}/workspaces/{workspace_id}/graph", server.addr))
+        .bearer_auth(&platform_admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(platform_graph.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let outsider_graph = client
+        .get(format!("{}/workspaces/{workspace_id}/graph", server.addr))
+        .bearer_auth(format!("phase2-outsider-{}", Uuid::new_v4()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(outsider_graph.status(), reqwest::StatusCode::FORBIDDEN);
 
     // Citation-facing endpoint re-check for historical messages.
     let history_session_member = Uuid::new_v4();
@@ -608,6 +647,11 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         .unwrap_or_default();
     assert!(system_prompt.contains("public alpha content"));
     assert!(!system_prompt.contains("secret beta content"));
+    assert!(system_prompt.contains("public graph node description"));
+    assert!(system_prompt.contains("public graph edge description"));
+    assert!(!system_prompt.contains("restricted graph node description"));
+    assert!(!system_prompt.contains("restricted graph edge description"));
+    assert!(!system_prompt.contains("restricted_only_relation"));
 
     let qdrant_payload = server.qdrant_mock.latest_search_payload().await.unwrap();
     let must_conditions = qdrant_payload["filter"]["must"]
@@ -1249,70 +1293,68 @@ async fn seed_graph(
     public_doc_id: Uuid,
     restricted_doc_id: Uuid,
 ) {
-    let public_node = Uuid::new_v4();
-    let secret_node = Uuid::new_v4();
-    let secret_edge = Uuid::new_v4();
+    let mut public_batch = GraphWriteBatch::from_extractions(&[(
+        0,
+        vec![
+            GraphElement::Node {
+                name: "SharedEntity".to_string(),
+                entity_type: Some("public_type".to_string()),
+                description: Some("public graph node description".to_string()),
+            },
+            GraphElement::Edge {
+                relationship: "shared_relation".to_string(),
+                source: "SharedEntity".to_string(),
+                target: "SharedEntity".to_string(),
+                description: Some("public graph edge description".to_string()),
+            },
+        ],
+    )]);
+    public_batch
+        .attach_node_embeddings(vec![embedding_vec(1.0)])
+        .unwrap();
 
-    sqlx::query(
-        "INSERT INTO graph_nodes (id, workspace_id, entity_name, entity_type, description) VALUES ($1, $2, $3, 'type', 'public')",
+    let mut public_tx = pool.begin().await.unwrap();
+    bulk_upsert_graph(&mut public_tx, workspace_id, public_doc_id, &public_batch)
+        .await
+        .unwrap();
+    public_tx.commit().await.unwrap();
+
+    let mut restricted_batch = GraphWriteBatch::from_extractions(&[(
+        0,
+        vec![
+            GraphElement::Node {
+                name: "SharedEntity".to_string(),
+                entity_type: Some("restricted_type".to_string()),
+                description: Some("restricted graph node description".to_string()),
+            },
+            GraphElement::Edge {
+                relationship: "shared_relation".to_string(),
+                source: "SharedEntity".to_string(),
+                target: "SharedEntity".to_string(),
+                description: Some("restricted graph edge description".to_string()),
+            },
+            GraphElement::Edge {
+                relationship: "restricted_only_relation".to_string(),
+                source: "SharedEntity".to_string(),
+                target: "SharedEntity".to_string(),
+                description: Some("restricted-only graph edge description".to_string()),
+            },
+        ],
+    )]);
+    restricted_batch
+        .attach_node_embeddings(vec![embedding_vec(0.5)])
+        .unwrap();
+
+    let mut restricted_tx = pool.begin().await.unwrap();
+    bulk_upsert_graph(
+        &mut restricted_tx,
+        workspace_id,
+        restricted_doc_id,
+        &restricted_batch,
     )
-    .bind(public_node)
-    .bind(workspace_id)
-    .bind("PublicEntity")
-    .execute(pool)
     .await
     .unwrap();
-
-    sqlx::query(
-        "INSERT INTO graph_nodes (id, workspace_id, entity_name, entity_type, description) VALUES ($1, $2, $3, 'type', 'secret')",
-    )
-    .bind(secret_node)
-    .bind(workspace_id)
-    .bind("SecretEntity")
-    .execute(pool)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        "INSERT INTO graph_node_sources (graph_node_id, document_id, workspace_id) VALUES ($1, $2, $3)",
-    )
-    .bind(public_node)
-    .bind(public_doc_id)
-    .bind(workspace_id)
-    .execute(pool)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        "INSERT INTO graph_node_sources (graph_node_id, document_id, workspace_id) VALUES ($1, $2, $3)",
-    )
-    .bind(secret_node)
-    .bind(restricted_doc_id)
-    .bind(workspace_id)
-    .execute(pool)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        "INSERT INTO graph_edges (id, workspace_id, source_node_id, target_node_id, relationship, description) VALUES ($1, $2, $3, $4, 'linked_to', 'secret link')",
-    )
-    .bind(secret_edge)
-    .bind(workspace_id)
-    .bind(secret_node)
-    .bind(public_node)
-    .execute(pool)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        "INSERT INTO graph_edge_sources (graph_edge_id, document_id, workspace_id) VALUES ($1, $2, $3)",
-    )
-    .bind(secret_edge)
-    .bind(restricted_doc_id)
-    .bind(workspace_id)
-    .execute(pool)
-    .await
-    .unwrap();
+    restricted_tx.commit().await.unwrap();
 }
 
 #[allow(clippy::too_many_arguments)]

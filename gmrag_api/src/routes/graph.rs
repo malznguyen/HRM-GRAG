@@ -109,17 +109,22 @@ async fn fetch_workspace_graph(
 
     let nodes = sqlx::query_as::<_, GraphNodeResponse>(
         r#"
-        SELECT DISTINCT
+        SELECT
             node.id,
             node.entity_name,
-            node.entity_type,
-            node.description
+            provenance.entity_type,
+            provenance.description
         FROM graph_nodes node
-        INNER JOIN graph_node_sources source
-            ON source.graph_node_id = node.id
+        INNER JOIN LATERAL (
+            SELECT source.entity_type, source.description
+            FROM graph_node_sources source
+            WHERE source.graph_node_id = node.id
+              AND source.workspace_id = $1
+              AND source.document_id = ANY($2)
+            ORDER BY source.document_id ASC
+            LIMIT 1
+        ) provenance ON TRUE
         WHERE node.workspace_id = $1
-          AND source.workspace_id = $1
-          AND source.document_id = ANY($2)
         ORDER BY node.entity_name ASC
         "#,
     )
@@ -130,18 +135,25 @@ async fn fetch_workspace_graph(
 
     let links = sqlx::query_as::<_, GraphLinkResponse>(
         r#"
-        SELECT DISTINCT
+        SELECT
             edge.id,
             edge.source_node_id AS source,
             edge.target_node_id AS target,
-            edge.relationship,
-            edge.description
+            provenance.relationship,
+            provenance.description
         FROM graph_edges edge
-        INNER JOIN graph_edge_sources source
-            ON source.graph_edge_id = edge.id
+        INNER JOIN LATERAL (
+            SELECT source.relationship, source.description
+            FROM graph_edge_sources source
+            WHERE source.graph_edge_id = edge.id
+              AND source.workspace_id = $1
+              AND source.document_id = ANY($2)
+              AND source.relationship IS NOT NULL
+            ORDER BY source.document_id ASC
+            LIMIT 1
+        ) provenance ON TRUE
         WHERE edge.workspace_id = $1
-          AND source.workspace_id = $1
-          AND source.document_id = ANY($2)
+        ORDER BY edge.id ASC
         "#,
     )
     .bind(workspace_id)

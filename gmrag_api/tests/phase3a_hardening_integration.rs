@@ -13,6 +13,12 @@ use gmrag_api::auth::outbox::{
 use gmrag_api::invite_cleanup::{
     InvitePlaceholderCleanupOptions, cleanup_invite_placeholders, find_invite_placeholders,
 };
+use gmrag_api::retrieval::RetrievalClient;
+use gmrag_api::retrieval::cleanup::{QdrantCleanupOptions, cleanup_qdrant_orphans};
+use gmrag_api::retrieval::outbox::{
+    QdrantOutboxProcessorConfig, enqueue_delete_by_document, enqueue_delete_by_workspace,
+    process_qdrant_outbox,
+};
 use gmrag_api::state::AppState;
 use gmrag_api::storage::cleanup::{
     StorageCleanupOptions, build_tenant_prefix, build_workspace_prefix, cleanup_prefix,
@@ -606,6 +612,658 @@ async fn graph_nodes_embedding_hnsw_index_exists_with_l2_ops() {
         !lower.contains("vector_cosine_ops"),
         "must not use cosine ops class on graph_nodes.embedding, got: {indexdef}"
     );
+}
+
+/// Xoá row outbox còn claimable — tránh test chậm / assert lẫn state leftover.
+async fn clear_claimable_qdrant_outbox(pool: &sqlx::PgPool) {
+    sqlx::query(
+        r#"
+        DELETE FROM qdrant_outbox
+        WHERE status IN ('PENDING', 'FAILED')
+        "#,
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn qdrant_outbox_processor_processes_pending_document_delete() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    clear_claimable_qdrant_outbox(&pool).await;
+
+    // Qdrant local — delete filter không match point vẫn Ok (idempotent).
+    let retrieval = match RetrievalClient::from_env() {
+        Ok(client) => client,
+        Err(_) => {
+            eprintln!("skip: Qdrant retrieval config unavailable");
+            return;
+        }
+    };
+
+    let workspace_id = Uuid::new_v4();
+    let document_id = Uuid::new_v4();
+    let event_id = enqueue_delete_by_document(&pool, workspace_id, document_id)
+        .await
+        .unwrap();
+
+    let result = process_qdrant_outbox(&pool, &retrieval, QdrantOutboxProcessorConfig::default())
+        .await
+        .unwrap();
+    assert!(result.processed_rows >= 1 || result.failed_rows >= 1);
+
+    let status: String = sqlx::query_scalar("SELECT status FROM qdrant_outbox WHERE id = $1")
+        .bind(event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // Local Qdrant reachable → PROCESSED; unreachable → FAILED (retryable).
+    assert!(
+        status == "PROCESSED" || status == "FAILED",
+        "unexpected status={status}"
+    );
+}
+
+#[tokio::test]
+async fn qdrant_outbox_processor_marks_unreachable_as_failed() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    clear_claimable_qdrant_outbox(&pool).await;
+
+    use gmrag_api::retrieval::RetrievalConfig;
+    let broken = RetrievalClient::from_config(RetrievalConfig {
+        qdrant_url: "http://127.0.0.1:1".to_string(),
+        collection_name: "gmrag_document_chunks".to_string(),
+        vector_size: 768,
+        top_k: 5,
+        api_key: None,
+        delete_request_timeout_secs: 2,
+        delete_worker_timeout_secs: 2,
+    });
+
+    let workspace_id = Uuid::new_v4();
+    let event_id = enqueue_delete_by_workspace(&pool, workspace_id)
+        .await
+        .unwrap();
+
+    let result = process_qdrant_outbox(&pool, &broken, QdrantOutboxProcessorConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(result.failed_rows, 1);
+
+    let row: (String, i32) =
+        sqlx::query_as("SELECT status, retry_count FROM qdrant_outbox WHERE id = $1")
+            .bind(event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row.0, "FAILED");
+    assert_eq!(row.1, 1);
+
+    // Backoff: next_attempt_at phải ở tương lai → lần process ngay sau không claim lại event này.
+    let due_now: bool = sqlx::query_scalar(
+        r#"
+        SELECT next_attempt_at <= CURRENT_TIMESTAMP
+        FROM qdrant_outbox
+        WHERE id = $1
+        "#,
+    )
+    .bind(event_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !due_now,
+        "FAILED row must schedule next_attempt_at in the future (backoff)"
+    );
+
+    let second = process_qdrant_outbox(&pool, &broken, QdrantOutboxProcessorConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        second.fetched_rows, 0,
+        "backoff must prevent immediate re-claim of the same failed row"
+    );
+    let retry_after_second: i32 =
+        sqlx::query_scalar("SELECT retry_count FROM qdrant_outbox WHERE id = $1")
+            .bind(event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(retry_after_second, 1);
+}
+
+#[tokio::test]
+async fn qdrant_outbox_poison_invalid_payload_marked_dead() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    clear_claimable_qdrant_outbox(&pool).await;
+
+    use gmrag_api::retrieval::RetrievalConfig;
+    let broken = RetrievalClient::from_config(RetrievalConfig {
+        qdrant_url: "http://127.0.0.1:1".to_string(),
+        collection_name: "gmrag_document_chunks".to_string(),
+        vector_size: 768,
+        top_k: 5,
+        api_key: None,
+        delete_request_timeout_secs: 2,
+        delete_worker_timeout_secs: 2,
+    });
+
+    let event_id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO qdrant_outbox (event_type, payload, status, retry_count, next_attempt_at)
+        VALUES ('delete_by_document', '{"bad":true}'::jsonb, 'PENDING', 0, CURRENT_TIMESTAMP)
+        RETURNING id
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let result = process_qdrant_outbox(&pool, &broken, QdrantOutboxProcessorConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(result.dead_rows, 1);
+    assert_eq!(result.failed_rows, 0);
+
+    let row: (String, i32, Option<String>) = sqlx::query_as(
+        "SELECT status, retry_count, error_message FROM qdrant_outbox WHERE id = $1",
+    )
+    .bind(event_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "DEAD");
+    assert_eq!(row.1, 1);
+    assert_eq!(row.2.as_deref(), Some("invalid_payload"));
+
+    // DEAD không được claim lại.
+    let again = process_qdrant_outbox(&pool, &broken, QdrantOutboxProcessorConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(again.fetched_rows, 0);
+}
+
+#[tokio::test]
+async fn qdrant_outbox_exhausted_retries_marked_dead() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    clear_claimable_qdrant_outbox(&pool).await;
+
+    use gmrag_api::outbox::OutboxBackoffConfig;
+    use gmrag_api::retrieval::RetrievalConfig;
+    let broken = RetrievalClient::from_config(RetrievalConfig {
+        qdrant_url: "http://127.0.0.1:1".to_string(),
+        collection_name: "gmrag_document_chunks".to_string(),
+        vector_size: 768,
+        top_k: 5,
+        api_key: None,
+        delete_request_timeout_secs: 2,
+        delete_worker_timeout_secs: 2,
+    });
+
+    let workspace_id = Uuid::new_v4();
+    // retry_count = max-1: lần fail tiếp theo → DEAD
+    let event_id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO qdrant_outbox (event_type, payload, status, retry_count, next_attempt_at)
+        VALUES (
+            'delete_by_workspace',
+            jsonb_build_object('workspace_id', $1::text),
+            'FAILED',
+            4,
+            CURRENT_TIMESTAMP
+        )
+        RETURNING id
+        "#,
+    )
+    .bind(workspace_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let config = QdrantOutboxProcessorConfig {
+        batch_size: 50,
+        max_retries: 5,
+        backoff: OutboxBackoffConfig {
+            base_backoff_secs: 0,
+            max_backoff_secs: 0,
+            claim_lease_secs: 30,
+        },
+    };
+
+    let result = process_qdrant_outbox(&pool, &broken, config).await.unwrap();
+    assert_eq!(result.dead_rows, 1);
+
+    let status: String = sqlx::query_scalar("SELECT status FROM qdrant_outbox WHERE id = $1")
+        .bind(event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "DEAD");
+}
+
+#[tokio::test]
+async fn qdrant_outbox_claim_skip_locked_is_exclusive() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    clear_claimable_qdrant_outbox(&pool).await;
+
+    let workspace_id = Uuid::new_v4();
+    let event_id = enqueue_delete_by_workspace(&pool, workspace_id)
+        .await
+        .unwrap();
+
+    // Mô phỏng 2 worker: transaction A claim + giữ lock; transaction B không thấy row.
+    let mut tx_a = pool.begin().await.unwrap();
+    let claimed_a: Vec<(Uuid,)> = sqlx::query_as(
+        r#"
+        SELECT id
+        FROM qdrant_outbox
+        WHERE id = $1
+          AND status IN ('PENDING', 'FAILED')
+          AND next_attempt_at <= CURRENT_TIMESTAMP
+        FOR UPDATE SKIP LOCKED
+        "#,
+    )
+    .bind(event_id)
+    .fetch_all(&mut *tx_a)
+    .await
+    .unwrap();
+    assert_eq!(claimed_a.len(), 1);
+
+    let mut tx_b = pool.begin().await.unwrap();
+    let claimed_b: Vec<(Uuid,)> = sqlx::query_as(
+        r#"
+        SELECT id
+        FROM qdrant_outbox
+        WHERE id = $1
+          AND status IN ('PENDING', 'FAILED')
+          AND next_attempt_at <= CURRENT_TIMESTAMP
+        FOR UPDATE SKIP LOCKED
+        "#,
+    )
+    .bind(event_id)
+    .fetch_all(&mut *tx_b)
+    .await
+    .unwrap();
+    assert!(
+        claimed_b.is_empty(),
+        "second worker must skip locked row (no double claim)"
+    );
+
+    tx_b.rollback().await.unwrap();
+    tx_a.rollback().await.unwrap();
+}
+
+#[tokio::test]
+async fn qdrant_outbox_backoff_zero_allows_immediate_retry() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    clear_claimable_qdrant_outbox(&pool).await;
+
+    use gmrag_api::outbox::OutboxBackoffConfig;
+    use gmrag_api::retrieval::RetrievalConfig;
+    let broken = RetrievalClient::from_config(RetrievalConfig {
+        qdrant_url: "http://127.0.0.1:1".to_string(),
+        collection_name: "gmrag_document_chunks".to_string(),
+        vector_size: 768,
+        top_k: 5,
+        api_key: None,
+        delete_request_timeout_secs: 2,
+        delete_worker_timeout_secs: 2,
+    });
+
+    let workspace_id = Uuid::new_v4();
+    let event_id = enqueue_delete_by_workspace(&pool, workspace_id)
+        .await
+        .unwrap();
+
+    // base/max = 0 → delay 0; claim_lease = 0 để test claim lại ngay ở run sau.
+    let config = QdrantOutboxProcessorConfig {
+        batch_size: 50,
+        max_retries: 5,
+        backoff: OutboxBackoffConfig {
+            base_backoff_secs: 0,
+            max_backoff_secs: 0,
+            claim_lease_secs: 0,
+        },
+    };
+
+    let first = process_qdrant_outbox(&pool, &broken, config).await.unwrap();
+    assert_eq!(first.failed_rows, 1);
+
+    let retry_after_first: i32 =
+        sqlx::query_scalar("SELECT retry_count FROM qdrant_outbox WHERE id = $1")
+            .bind(event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(retry_after_first, 1);
+
+    // claim_lease_secs = 0 + backoff 0: next_attempt_at ≈ now → claim lại được ở run sau.
+    let second = process_qdrant_outbox(&pool, &broken, config).await.unwrap();
+    assert_eq!(second.failed_rows, 1);
+
+    let retry_count: i32 =
+        sqlx::query_scalar("SELECT retry_count FROM qdrant_outbox WHERE id = $1")
+            .bind(event_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(retry_count, 2);
+}
+
+#[tokio::test]
+async fn qdrant_cleanup_dry_run_reports_outbox_candidates_without_delete() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+
+    use gmrag_api::retrieval::RetrievalConfig;
+    let broken = RetrievalClient::from_config(RetrievalConfig {
+        qdrant_url: "http://127.0.0.1:1".to_string(),
+        collection_name: "gmrag_document_chunks".to_string(),
+        vector_size: 768,
+        top_k: 5,
+        api_key: None,
+        delete_request_timeout_secs: 2,
+        delete_worker_timeout_secs: 2,
+    });
+
+    let workspace_id = Uuid::new_v4();
+    let document_id = Uuid::new_v4();
+    enqueue_delete_by_document(&pool, workspace_id, document_id)
+        .await
+        .unwrap();
+
+    let report = cleanup_qdrant_orphans(
+        &pool,
+        &broken,
+        &QdrantCleanupOptions {
+            dry_run: true,
+            delete: false,
+            workspace_id: None,
+            tenant_id: None,
+            full_scan: false,
+            scroll_page_size: 64,
+            force: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(report.dry_run);
+    assert!(report.candidates_from_outbox >= 1);
+    assert_eq!(report.deletes_attempted, 0);
+}
+
+fn broken_retrieval_client() -> RetrievalClient {
+    use gmrag_api::retrieval::RetrievalConfig;
+    RetrievalClient::from_config(RetrievalConfig {
+        qdrant_url: "http://127.0.0.1:1".to_string(),
+        collection_name: "gmrag_document_chunks".to_string(),
+        vector_size: 768,
+        top_k: 5,
+        api_key: None,
+        delete_request_timeout_secs: 2,
+        delete_worker_timeout_secs: 2,
+    })
+}
+
+#[tokio::test]
+async fn qdrant_cleanup_refuses_delete_on_live_workspace_without_force() {
+    // Fix High #2: scoped --delete trên workspace còn SQL phải refuse (tránh wipe live vectors).
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    let retrieval = broken_retrieval_client();
+
+    let tenant_id = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(tenant_id)
+        .bind(format!("cleanup-live-tenant-{tenant_id}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO workspaces (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(workspace_id)
+        .bind(tenant_id)
+        .bind(format!("cleanup-live-ws-{workspace_id}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let err = cleanup_qdrant_orphans(
+        &pool,
+        &retrieval,
+        &QdrantCleanupOptions {
+            dry_run: false,
+            delete: true,
+            workspace_id: Some(workspace_id),
+            tenant_id: None,
+            full_scan: false,
+            scroll_page_size: 64,
+            force: false,
+        },
+    )
+    .await
+    .expect_err("live workspace --delete without --force must refuse");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("still exists") || msg.contains("refusing"),
+        "unexpected error: {msg}"
+    );
+
+    // Dry-run trên live workspace vẫn OK (chỉ report).
+    let dry = cleanup_qdrant_orphans(
+        &pool,
+        &retrieval,
+        &QdrantCleanupOptions {
+            dry_run: true,
+            delete: false,
+            workspace_id: Some(workspace_id),
+            tenant_id: None,
+            full_scan: false,
+            scroll_page_size: 64,
+            force: false,
+        },
+    )
+    .await
+    .expect("dry-run on live workspace must be allowed");
+    assert!(dry.dry_run);
+    assert_eq!(dry.deletes_attempted, 0);
+
+    sqlx::query("DELETE FROM workspaces WHERE id = $1")
+        .bind(workspace_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(tenant_id)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn qdrant_cleanup_refuses_delete_on_live_tenant_without_force() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    let retrieval = broken_retrieval_client();
+
+    let tenant_id = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(tenant_id)
+        .bind(format!("cleanup-live-tenant2-{tenant_id}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO workspaces (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(workspace_id)
+        .bind(tenant_id)
+        .bind(format!("cleanup-live-ws2-{workspace_id}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let err = cleanup_qdrant_orphans(
+        &pool,
+        &retrieval,
+        &QdrantCleanupOptions {
+            dry_run: false,
+            delete: true,
+            workspace_id: None,
+            tenant_id: Some(tenant_id),
+            full_scan: false,
+            scroll_page_size: 64,
+            force: false,
+        },
+    )
+    .await
+    .expect_err("live tenant --delete without --force must refuse");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("still has") || msg.contains("refusing"),
+        "unexpected error: {msg}"
+    );
+
+    sqlx::query("DELETE FROM workspaces WHERE id = $1")
+        .bind(workspace_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(tenant_id)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn qdrant_cleanup_empty_tenant_is_hard_error() {
+    // Fix High #3: tenant cascade / unknown id → không silent no-op success.
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    let retrieval = broken_retrieval_client();
+
+    let missing_tenant = Uuid::new_v4();
+    let err = cleanup_qdrant_orphans(
+        &pool,
+        &retrieval,
+        &QdrantCleanupOptions {
+            dry_run: true,
+            delete: false,
+            workspace_id: None,
+            tenant_id: Some(missing_tenant),
+            full_scan: false,
+            scroll_page_size: 64,
+            force: false,
+        },
+    )
+    .await
+    .expect_err("empty tenant workspace list must hard-fail");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no workspaces found") || msg.contains("already cascaded"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn delete_points_by_tenant_empty_list_hard_fails() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    let retrieval = broken_retrieval_client();
+
+    let missing_tenant = Uuid::new_v4();
+    let err = retrieval
+        .delete_points_by_tenant(&pool, missing_tenant)
+        .await
+        .expect_err("delete_points_by_tenant must not no-op on empty list");
+
+    assert!(
+        matches!(
+            err,
+            gmrag_api::retrieval::RetrievalError::EmptyTenantWorkspaceList { tenant_id }
+            if tenant_id == missing_tenant
+        ),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn qdrant_cleanup_force_allows_delete_attempt_on_live_workspace() {
+    // --force bỏ qua live guard; delete có thể fail Qdrant (broken client) nhưng không bị refuse.
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    let retrieval = broken_retrieval_client();
+
+    let tenant_id = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(tenant_id)
+        .bind(format!("cleanup-force-tenant-{tenant_id}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO workspaces (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(workspace_id)
+        .bind(tenant_id)
+        .bind(format!("cleanup-force-ws-{workspace_id}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let report = cleanup_qdrant_orphans(
+        &pool,
+        &retrieval,
+        &QdrantCleanupOptions {
+            dry_run: false,
+            delete: true,
+            workspace_id: Some(workspace_id),
+            tenant_id: None,
+            full_scan: false,
+            scroll_page_size: 64,
+            force: true,
+        },
+    )
+    .await
+    .expect("--force must bypass live workspace refuse");
+
+    assert_eq!(report.deletes_attempted, 1);
+    // Broken Qdrant → fail delete + requeue outbox.
+    assert_eq!(report.deletes_failed, 1);
+    assert_eq!(report.outbox_requeued, 1);
+
+    sqlx::query("DELETE FROM workspaces WHERE id = $1")
+        .bind(workspace_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(tenant_id)
+        .execute(&pool)
+        .await
+        .ok();
 }
 
 fn init_test_env() {

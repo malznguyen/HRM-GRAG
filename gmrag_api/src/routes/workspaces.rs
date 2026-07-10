@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event};
 use crate::auth::authz::{Authz, Object, Relation, TupleKey};
 use crate::auth::outbox::{enqueue_tuple_delete, enqueue_tuple_write};
+use crate::retrieval::outbox::enqueue_delete_by_workspace;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -418,19 +419,30 @@ pub async fn delete_workspace(
     match result {
         Ok(outcome) if outcome.rows_affected() == 0 => StatusCode::NOT_FOUND.into_response(),
         Ok(_) => {
-            // Best-effort sau SQL commit: cascade SQL đã xoá chunks nhưng Qdrant không cascade.
+            // wait=true + timeout ngắn (request path): không confirm → enqueue (SQL đã cascade).
+            // Không dùng worker timeout trên HTTP — tránh treo DELETE khi Qdrant chậm.
             let qdrant_workspace_delete_succeeded = if let Err(err) = state
                 .retrieval
-                .delete_points_by_workspace(workspace_id)
+                .delete_points_by_workspace_for_request(workspace_id)
                 .await
             {
-                // TODO: cleanup worker/outbox cho orphan vectors nếu Qdrant delete fail lặp lại.
                 error!(
                     error = %err,
                     user_id = %authz.user_id,
                     workspace_id = %workspace_id,
+                    request_timeout_secs = state.retrieval.delete_request_timeout_secs(),
                     "Failed to delete workspace points from Qdrant after database cleanup"
                 );
+
+                if let Err(outbox_err) =
+                    enqueue_delete_by_workspace(&state.pool, workspace_id).await
+                {
+                    error!(
+                        error = %outbox_err,
+                        workspace_id = %workspace_id,
+                        "Failed to enqueue qdrant_outbox recovery for workspace delete"
+                    );
+                }
                 false
             } else {
                 true

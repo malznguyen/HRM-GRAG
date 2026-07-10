@@ -2,14 +2,15 @@
 
 GMRAG is a multi-tenant GraphRAG platform under active refactor.
 
-Current live architecture after Phase 1.5:
+Current live architecture after Phase 2 + Phase 3A hardening:
 
 - tenant and workspace hierarchy in PostgreSQL,
 - OpenFGA as the authorization source of truth,
 - Keycloak-backed tenant-owner bootstrap and workspace member addition (verified users only),
 - original PDF storage in MinIO/S3 through `aws-sdk-s3` v1,
-- Qdrant vector retrieval for ACL-aware search,
-- document-level ACL and Qdrant retrieval are now live in Phase 2.
+- Qdrant vector retrieval for ACL-aware chunk search,
+- PostgreSQL graph store with `graph_nodes.embedding` on the ingestion forward-path (HNSW `vector_l2_ops`; legacy NULL nodes need operator `backfill-graph-node-embeddings`),
+- document-level ACL fully live; Phase 3A operator workers (outbox, storage cleanup, invite-placeholder cleanup) available.
 
 ## Current Docs
 
@@ -30,8 +31,9 @@ Historical v1 audit snapshots are archived under `docs/archive/v1/`.
 | Identity and admin lookup | Keycloak-backed owner bootstrap + member addition (verified users only); bearer JWT validation is live in the backend |
 | Authorization | OpenFGA via `AuthzClient` and route-level relation checks |
 | Original document storage | S3-compatible object storage; MinIO in local development |
-| Current retrieval path | Qdrant vector search (ACL-aware filtering) and PostgreSQL graph tables |
-| Planned Phase 3 hardening | Outbox processing and cleanup workers |
+| Current retrieval path | Qdrant vector search (ACL-aware chunk filtering) and PostgreSQL graph tables (`graph_nodes.embedding` L2 + ILIKE fallback) |
+| Phase 3A hardening | ✅ complete — authz outbox processor, storage cleanup, invite-placeholder cleanup, audit trail (see `docs/RUNBOOK.md`) |
+| Phase 3B/3C | 🟡 partial — Qdrant lifecycle/outbox (claim, backoff, `DEAD`) + orphan cleanup shipped; daemon orchestration and other follow-up remain (see `docs/authz-refactor-taskboard.md`) |
 
 ## Local Services
 
@@ -52,7 +54,7 @@ Historical v1 audit snapshots are archived under `docs/archive/v1/`.
 ollama pull AITeamVN/Vietnamese_Embedding
 ```
 
-This model is the default for both chunk embedding (ingestion) and query embedding (chat). It outputs **768** dimensions (matches Postgres `vector(768)` and Qdrant). Override with `OLLAMA_EMBED_MODEL` only if you accept retrieval-quality risk and a full re-embed. See `docs/RUNBOOK.md` §6.
+This model is the default for chunk embedding (ingestion), graph node embedding (ingestion forward-path), and query embedding (chat). Runtime output is **768** dimensions (matches Postgres `vector(768)` and Qdrant). The HuggingFace model card lists 1024-d; the Ollama registry copy used here is verified at **768-d** — do not change schema solely because of the card (see `docs/RUNBOOK.md` §6). Override with `OLLAMA_EMBED_MODEL` only if you accept retrieval-quality risk and a full re-embed.
 
 **Keycloak scope in local compose:** the container is for **Admin API lookup** used by tenant-owner bootstrap and workspace member addition (`KeycloakClient.get_verified_user_by_email`). JWT validation still uses `CLERK_ISSUER` / the existing `test-bypass-jwt` path — Keycloak is **not** used for login or bearer-token validation in the current backend.
 
@@ -65,7 +67,10 @@ Copy `gmrag_api/.env.example` to `gmrag_api/.env` and fill in the values for:
 - database connection
 - bearer-token issuer and JWKS configuration used by the current backend
 - OpenFGA: `OPENFGA_API_URL`, `OPENFGA_STORE_ID`, `OPENFGA_MODEL_ID`
-- Outbox worker: `AUTHZ_OUTBOX_BATCH_SIZE`, `AUTHZ_OUTBOX_MAX_RETRIES`
+- Authz outbox worker: `AUTHZ_OUTBOX_BATCH_SIZE`, `AUTHZ_OUTBOX_MAX_RETRIES`
+- Qdrant: `QDRANT_URL`, `QDRANT_COLLECTION`, `QDRANT_VECTOR_SIZE`, optional `QDRANT_API_KEY`
+- Qdrant delete timeouts: `QDRANT_DELETE_REQUEST_TIMEOUT_SECS` (HTTP path), `QDRANT_DELETE_WORKER_TIMEOUT_SECS` (outbox/cleanup)
+- Qdrant outbox worker: `QDRANT_OUTBOX_BATCH_SIZE`, `QDRANT_OUTBOX_MAX_RETRIES`, `QDRANT_OUTBOX_BASE_BACKOFF_SECS`, `QDRANT_OUTBOX_MAX_BACKOFF_SECS`, `QDRANT_OUTBOX_CLAIM_LEASE_SECS`
 - Keycloak admin lookup: `KEYCLOAK_ADMIN_URL`, `KEYCLOAK_REALM`, `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET`
 - S3/MinIO: `S3_ENDPOINT_URL`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_FORCE_PATH_STYLE`, `S3_PRESIGN_EXPIRY_SECS`
 - DeepSeek and Ollama settings for chat, graph extraction, and embeddings (`OLLAMA_EMBED_MODEL=AITeamVN/Vietnamese_Embedding` recommended)
@@ -108,11 +113,12 @@ Copy `gmrag_api/.env.example` to `gmrag_api/.env` and fill in the values for:
 
    Default is dry-run; nothing is deleted without `--delete`. Safe to re-run. See `docs/RUNBOOK.md` §5.
 
-## Phase 3A Hardening Commands
+## Phase 3A / 3B Operator Commands
 
 Run these from `gmrag_api/`:
 
 ```bash
+# Phase 3A — authz + storage + invite cleanup
 cargo run --bin process-authz-outbox
 cargo run --bin cleanup-storage-objects -- --dry-run
 cargo run --bin cleanup-storage-objects -- --delete-orphans --delete
@@ -121,7 +127,21 @@ cargo run --bin cleanup-storage-objects -- --tenant-id <tenant_uuid> --delete
 cargo run --bin cleanup-invite-placeholders -- --dry-run
 cargo run --bin cleanup-invite-placeholders -- --delete
 cargo run --bin backfill-document-workspace-tuples
+
+# Phase 3B — Qdrant lifecycle / recovery
+cargo run --bin process-qdrant-outbox
+cargo run --bin cleanup-qdrant-orphans -- --dry-run
+cargo run --bin cleanup-qdrant-orphans -- --delete
+cargo run --bin cleanup-qdrant-orphans -- --full-scan --dry-run
+
+# Graph node embeddings (legacy NULL backfill)
+cargo run --bin backfill-graph-node-embeddings -- --dry-run
+cargo run --bin backfill-graph-node-embeddings -- --apply
 ```
+
+- **Qdrant outbox:** claim with `FOR UPDATE SKIP LOCKED` + lease, exponential backoff on `FAILED`, status `DEAD` for poison/exhausted retries. See `docs/RUNBOOK.md` §7 (env vars, DEAD inspection, dual-write caveat).
+- **Orphan cleanup:** prioritizes outbox (`PENDING`/`FAILED`/`DEAD`) + failed audit deletes; optional expensive `--full-scan`. Default dry-run; mutations need `--delete`.
+- Graph node embedding backfill fills legacy `graph_nodes.embedding IS NULL` only (manual; default dry-run). See `docs/RUNBOOK.md` §10. HNSW apply notes: §9.
 
 ## Test Commands
 
@@ -133,6 +153,7 @@ cargo test
 cargo test --test authz_integration
 cargo test --test storage_integration
 cargo test --test phase3a_hardening_integration
+cargo test --test graph_node_embedding_backfill_integration
 ```
 
 ## Current Implementation Notes
@@ -141,4 +162,5 @@ cargo test --test phase3a_hardening_integration
 - Document delete performs SQL cleanup first and storage cleanup second on a best-effort basis.
 - Retry reads the original object from storage and returns `DOCUMENT_OBJECT_MISSING` when the object is gone.
 - Document-level ACL enforcement, restricted-document behavior, and Qdrant retrieval are fully implemented and verified.
-- A pre-deploy runbook section for the backfill command is available in `docs/CURRENT_ARCHITECTURE.md`.
+- Document/workspace delete is SQL-first then **best-effort** Qdrant filter-delete + outbox enqueue (not a distributed transaction). Recovery: `process-qdrant-outbox` / `cleanup-qdrant-orphans` — see `docs/RUNBOOK.md` §7.
+- Operator runbook for Phase 2/3A/3B (including Ollama, HNSW, graph node embedding backfill, and Qdrant outbox) is in `docs/RUNBOOK.md`.
