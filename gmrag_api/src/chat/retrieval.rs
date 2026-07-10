@@ -102,18 +102,28 @@ pub async fn fetch_graph_context(
 
     let mut nodes: Vec<GraphNodeRow> = sqlx::query_as(
         r#"
-        SELECT id, entity_name, entity_type, description
-        FROM graph_nodes
-        WHERE workspace_id = $1
-          AND embedding IS NOT NULL
-          AND EXISTS (
-            SELECT 1
+        WITH visible_provenance AS (
+            SELECT DISTINCT ON (source.graph_node_id)
+                source.graph_node_id,
+                source.entity_type,
+                source.description,
+                source.embedding
             FROM graph_node_sources source
-            WHERE source.graph_node_id = graph_nodes.id
-              AND source.workspace_id = $1
+            WHERE source.workspace_id = $1
               AND source.document_id = ANY($3)
-          )
-        ORDER BY embedding <-> $2::vector
+            ORDER BY source.graph_node_id, source.document_id ASC
+        )
+        SELECT
+            node.id,
+            node.entity_name,
+            provenance.entity_type,
+            provenance.description
+        FROM visible_provenance provenance
+        INNER JOIN graph_nodes node
+            ON node.id = provenance.graph_node_id
+           AND node.workspace_id = $1
+        WHERE provenance.embedding IS NOT NULL
+        ORDER BY provenance.embedding <-> $2::vector
         LIMIT 5
         "#,
     )
@@ -131,20 +141,30 @@ pub async fn fetch_graph_context(
         let pattern = format!("%{}%", user_message.trim());
         nodes = sqlx::query_as(
             r#"
-            SELECT id, entity_name, entity_type, description
-            FROM graph_nodes
-            WHERE workspace_id = $1
-              AND EXISTS (
-                SELECT 1
+            WITH visible_provenance AS (
+                SELECT DISTINCT ON (source.graph_node_id)
+                    source.graph_node_id,
+                    source.entity_type,
+                    source.description
                 FROM graph_node_sources source
-                WHERE source.graph_node_id = graph_nodes.id
-                  AND source.workspace_id = $1
+                WHERE source.workspace_id = $1
                   AND source.document_id = ANY($3)
-              )
-              AND (
-                entity_name ILIKE $2
-                OR COALESCE(description, '') ILIKE $2
-              )
+                ORDER BY source.graph_node_id, source.document_id ASC
+            )
+            SELECT
+                node.id,
+                node.entity_name,
+                provenance.entity_type,
+                provenance.description
+            FROM visible_provenance provenance
+            INNER JOIN graph_nodes node
+                ON node.id = provenance.graph_node_id
+               AND node.workspace_id = $1
+            WHERE (
+                node.entity_name ILIKE $2
+                OR COALESCE(provenance.description, '') ILIKE $2
+            )
+            ORDER BY node.entity_name ASC
             LIMIT 5
             "#,
         )
@@ -173,22 +193,26 @@ pub async fn fetch_graph_context(
             e.id,
             sn.entity_name AS source_name,
             tn.entity_name AS target_name,
-            e.relationship,
-            e.description
+            provenance.relationship,
+            provenance.description
         FROM graph_edges e
         INNER JOIN graph_nodes sn
             ON sn.id = e.source_node_id AND sn.workspace_id = $1
         INNER JOIN graph_nodes tn
             ON tn.id = e.target_node_id AND tn.workspace_id = $1
-        WHERE e.workspace_id = $1
-          AND EXISTS (
-            SELECT 1
+        INNER JOIN LATERAL (
+            SELECT source.relationship, source.description
             FROM graph_edge_sources source
             WHERE source.graph_edge_id = e.id
               AND source.workspace_id = $1
               AND source.document_id = ANY($3)
-          )
+              AND source.relationship IS NOT NULL
+            ORDER BY source.document_id ASC
+            LIMIT 1
+        ) provenance ON TRUE
+        WHERE e.workspace_id = $1
           AND (e.source_node_id = ANY($2) OR e.target_node_id = ANY($2))
+        ORDER BY e.id ASC
         "#,
     )
     .bind(workspace_id)
