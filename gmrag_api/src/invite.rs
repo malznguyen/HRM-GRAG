@@ -165,9 +165,7 @@ async fn reconcile_invite_placeholder(
 ///
 /// **Cảnh báo:** hàm này không ghi OpenFGA. Sau khi chạy, operator phải
 /// kiểm tra/sửa tuple workspace membership cho user thật nếu còn desync.
-#[deprecated(
-    note = "One-time legacy migration only; not called from normal request flows"
-)]
+#[deprecated(note = "One-time legacy migration only; not called from normal request flows")]
 pub async fn reconcile_pending_invites(
     pool: &PgPool,
     real_user_id: &str,

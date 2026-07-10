@@ -68,9 +68,7 @@ impl AuditEventType {
             AuditEventType::AuthzOutboxProcessingCompleted => "authz_outbox_processing_completed",
             AuditEventType::AuthzOutboxProcessingFailed => "authz_outbox_processing_failed",
             AuditEventType::QdrantOutboxProcessingStarted => "qdrant_outbox_processing_started",
-            AuditEventType::QdrantOutboxProcessingCompleted => {
-                "qdrant_outbox_processing_completed"
-            }
+            AuditEventType::QdrantOutboxProcessingCompleted => "qdrant_outbox_processing_completed",
             AuditEventType::QdrantOutboxProcessingFailed => "qdrant_outbox_processing_failed",
             AuditEventType::QdrantCleanupDryRun => "qdrant_cleanup_dry_run",
             AuditEventType::QdrantCleanupCompleted => "qdrant_cleanup_completed",

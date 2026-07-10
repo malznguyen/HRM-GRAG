@@ -150,9 +150,7 @@ pub fn validate_embedding_dimensions(
     for embedding in embeddings {
         let actual = embedding.len();
         if actual != EXPECTED_EMBEDDING_DIM {
-            if !cfg!(test)
-                && !DIM_MISMATCH_LOGGED.swap(true, Ordering::Relaxed)
-            {
+            if !cfg!(test) && !DIM_MISMATCH_LOGGED.swap(true, Ordering::Relaxed) {
                 tracing::error!(
                     model = %model,
                     expected_dims = EXPECTED_EMBEDDING_DIM,
@@ -210,7 +208,10 @@ struct OllamaEmbedBatchResponse {
 pub enum EmbedError {
     Http(reqwest::Error),
     Empty,
-    CountMismatch { expected: usize, actual: usize },
+    CountMismatch {
+        expected: usize,
+        actual: usize,
+    },
     /// Vector length ≠ `EXPECTED_EMBEDDING_DIM` (768) — schema/Qdrant không tương thích.
     DimensionMismatch {
         expected: usize,
@@ -316,10 +317,7 @@ mod tests {
 
     #[test]
     fn validate_dimensions_accepts_exactly_768() {
-        let vecs = vec![
-            vec![0.0_f32; EXPECTED_EMBEDDING_DIM],
-            vec![1.0_f32; 768],
-        ];
+        let vecs = vec![vec![0.0_f32; EXPECTED_EMBEDDING_DIM], vec![1.0_f32; 768]];
         assert!(validate_embedding_dimensions(&vecs, PINNED_EMBED_MODEL).is_ok());
     }
 

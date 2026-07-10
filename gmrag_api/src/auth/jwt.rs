@@ -6,6 +6,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, warn};
 
+use crate::auth::test_bypass_enabled;
+
 #[derive(Debug)]
 pub enum JwtError {
     MissingConfig,
@@ -158,23 +160,4 @@ impl JwtValidator {
 fn rsa_decoding_key(n: &str, e: &str) -> Result<DecodingKey, jsonwebtoken::errors::Error> {
     // JWK `n`/`e` are base64url-encoded; jsonwebtoken expects the same encoding.
     DecodingKey::from_rsa_components(n, e)
-}
-
-fn test_bypass_enabled(flag_name: &str) -> bool {
-    if std::env::var_os(flag_name).is_none() {
-        return false;
-    }
-
-    if std::env::var("APP_ENV")
-        .ok()
-        .is_some_and(|value| value.eq_ignore_ascii_case("production"))
-    {
-        error!(
-            flag = flag_name,
-            "Test bypass flag is blocked in production APP_ENV"
-        );
-        return false;
-    }
-
-    true
 }

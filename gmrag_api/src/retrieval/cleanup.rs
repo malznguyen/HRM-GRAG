@@ -208,7 +208,8 @@ pub async fn cleanup_qdrant_orphans(
     }
 
     if options.full_scan {
-        let from_scan = collect_targets_from_full_scan(pool, retrieval, options.scroll_page_size).await?;
+        let from_scan =
+            collect_targets_from_full_scan(pool, retrieval, options.scroll_page_size).await?;
         report.candidates_from_full_scan = from_scan.len();
         for target in from_scan {
             targets.insert(target, ());
@@ -279,9 +280,7 @@ async fn apply_targets(
                 match enqueue_result {
                     Ok(_) => report.outbox_requeued += 1,
                     Err(enqueue_err) => {
-                        report
-                            .errors
-                            .push(format!("enqueue_failed: {enqueue_err}"));
+                        report.errors.push(format!("enqueue_failed: {enqueue_err}"));
                     }
                 }
             }
@@ -406,7 +405,9 @@ async fn collect_targets_from_full_scan(
 
     let mut offset: Option<Value> = None;
     loop {
-        let page = retrieval.scroll_points_page(page_size, offset.clone()).await?;
+        let page = retrieval
+            .scroll_points_page(page_size, offset.clone())
+            .await?;
         if page.points.is_empty() {
             break;
         }

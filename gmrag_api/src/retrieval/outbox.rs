@@ -345,7 +345,11 @@ async fn process_single_row(
         }
         QdrantOutboxEventType::DeleteByWorkspace => {
             match serde_json::from_value::<DeleteByWorkspacePayload>(row.payload.clone()) {
-                Ok(payload) => retrieval.delete_points_by_workspace(payload.workspace_id).await,
+                Ok(payload) => {
+                    retrieval
+                        .delete_points_by_workspace(payload.workspace_id)
+                        .await
+                }
                 Err(_) => {
                     return mark_outbox_row_failure(
                         pool,

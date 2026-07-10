@@ -502,12 +502,11 @@ async fn invite_placeholder_cleanup_dry_run_does_not_delete() {
     assert_eq!(report.users_deleted, 0);
     assert_eq!(report.openfga_tuples_deleted, 0);
 
-    let still_exists: Option<String> =
-        sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
-            .bind(&placeholder_id)
-            .fetch_optional(&pool)
-            .await
-            .unwrap();
+    let still_exists: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
+        .bind(&placeholder_id)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
     assert_eq!(still_exists.as_deref(), Some(placeholder_id.as_str()));
 
     let still_member: Option<String> = sqlx::query_scalar(
@@ -534,15 +533,17 @@ async fn invite_placeholder_cleanup_dry_run_does_not_delete() {
     let delete_report = cleanup_invite_placeholders(
         &pool,
         &authz_client,
-        InvitePlaceholderCleanupOptions {
-            allow_delete: true,
-        },
+        InvitePlaceholderCleanupOptions { allow_delete: true },
     )
     .await
     .unwrap();
     assert!(delete_report.deleted);
     assert!(delete_report.users_deleted >= 1);
-    assert!(delete_report.errors.is_empty(), "{:?}", delete_report.errors);
+    assert!(
+        delete_report.errors.is_empty(),
+        "{:?}",
+        delete_report.errors
+    );
 
     let after: Option<String> = sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
         .bind(&placeholder_id)
@@ -555,9 +556,7 @@ async fn invite_placeholder_cleanup_dry_run_does_not_delete() {
     let second = cleanup_invite_placeholders(
         &pool,
         &authz_client,
-        InvitePlaceholderCleanupOptions {
-            allow_delete: true,
-        },
+        InvitePlaceholderCleanupOptions { allow_delete: true },
     )
     .await
     .unwrap();

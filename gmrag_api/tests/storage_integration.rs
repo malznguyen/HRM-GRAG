@@ -318,14 +318,13 @@ async fn upload_accepts_access_mode_restricted() {
     let document_id =
         Uuid::parse_str(payload["documents"][0]["document_id"].as_str().unwrap()).unwrap();
 
-    let access_mode: String = sqlx::query_scalar(
-        "SELECT access_mode FROM documents WHERE id = $1 AND workspace_id = $2",
-    )
-    .bind(document_id)
-    .bind(seed.workspace_id)
-    .fetch_one(&server.pool)
-    .await
-    .unwrap();
+    let access_mode: String =
+        sqlx::query_scalar("SELECT access_mode FROM documents WHERE id = $1 AND workspace_id = $2")
+            .bind(document_id)
+            .bind(seed.workspace_id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
     assert_eq!(access_mode, "restricted");
 }
 
@@ -613,7 +612,10 @@ async fn delete_document_succeeds_when_qdrant_unavailable() {
     .fetch_one(&server.pool)
     .await
     .unwrap();
-    assert_eq!(outbox_count, 1, "document delete failure must enqueue qdrant_outbox");
+    assert_eq!(
+        outbox_count, 1,
+        "document delete failure must enqueue qdrant_outbox"
+    );
 }
 
 #[tokio::test]
@@ -857,7 +859,10 @@ async fn delete_workspace_succeeds_when_qdrant_unavailable() {
     .fetch_one(&server.pool)
     .await
     .unwrap();
-    assert_eq!(outbox_count, 1, "workspace delete failure must enqueue qdrant_outbox");
+    assert_eq!(
+        outbox_count, 1,
+        "workspace delete failure must enqueue qdrant_outbox"
+    );
 }
 
 #[tokio::test]

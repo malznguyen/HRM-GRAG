@@ -3,7 +3,8 @@ use serde::Deserialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::error;
+
+use crate::auth::test_bypass_enabled;
 
 /// Client tương tác với Keycloak Admin REST API
 #[derive(Clone)]
@@ -137,23 +138,4 @@ impl KeycloakClient {
             .find(|u| u.email_verified.unwrap_or(false));
         Ok(verified_user)
     }
-}
-
-fn test_bypass_enabled(flag_name: &str) -> bool {
-    if std::env::var_os(flag_name).is_none() {
-        return false;
-    }
-
-    if std::env::var("APP_ENV")
-        .ok()
-        .is_some_and(|value| value.eq_ignore_ascii_case("production"))
-    {
-        error!(
-            flag = flag_name,
-            "Test bypass flag is blocked in production APP_ENV"
-        );
-        return false;
-    }
-
-    true
 }

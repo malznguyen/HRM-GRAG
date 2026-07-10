@@ -37,7 +37,10 @@ impl Default for OutboxBackoffConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureDisposition {
     /// Còn retry được — status FAILED + schedule next_attempt_at.
-    Retryable { next_retry_count: i32, backoff_secs: i64 },
+    Retryable {
+        next_retry_count: i32,
+        backoff_secs: i64,
+    },
     /// Poison / hết retry — status DEAD, không claim lại.
     Dead { next_retry_count: i32 },
 }

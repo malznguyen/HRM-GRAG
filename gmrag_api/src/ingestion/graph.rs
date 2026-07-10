@@ -106,14 +106,7 @@ pub async fn bulk_upsert_graph(
     insert_graph_node_sources(tx, workspace_id, document_id, &node_ids, &batch.nodes).await?;
 
     bulk_upsert_graph_edges(tx, workspace_id, &node_ids, &batch.edges).await?;
-    insert_graph_edge_sources(
-        tx,
-        workspace_id,
-        document_id,
-        &node_ids,
-        &batch.edges,
-    )
-    .await?;
+    insert_graph_edge_sources(tx, workspace_id, document_id, &node_ids, &batch.edges).await?;
 
     Ok(())
 }
@@ -240,19 +233,14 @@ impl GraphWriteBatch {
     pub fn node_texts_for_embedding(&self) -> Vec<String> {
         self.nodes
             .iter()
-            .map(|node| {
-                node_text_for_embedding(&node.name, node.description.as_deref())
-            })
+            .map(|node| node_text_for_embedding(&node.name, node.description.as_deref()))
             .collect()
     }
 
     /// Gắn vector embedding (768-d, ADR-21) vào từng node trước khi bulk upsert.
     ///
     /// `embeddings.len()` phải khớp `node_count()`; processor batch-embed rồi gọi hàm này.
-    pub fn attach_node_embeddings(
-        &mut self,
-        embeddings: Vec<Vec<f32>>,
-    ) -> Result<(), GraphError> {
+    pub fn attach_node_embeddings(&mut self, embeddings: Vec<Vec<f32>>) -> Result<(), GraphError> {
         if embeddings.len() != self.nodes.len() {
             return Err(GraphError::EmbeddingCountMismatch {
                 expected: self.nodes.len(),
@@ -867,7 +855,10 @@ pub enum GraphError {
     InvalidJson(serde_json::Error),
     Database(sqlx::Error),
     /// Số vector attach không khớp số node trong batch (lỗi orchestration).
-    EmbeddingCountMismatch { expected: usize, actual: usize },
+    EmbeddingCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl std::fmt::Display for GraphError {

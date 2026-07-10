@@ -198,9 +198,7 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<BackfillArgs, String
         parsed.batch_size = value
             .parse::<usize>()
             .map_err(|_| {
-                format!(
-                    "Invalid GMRAG_GRAPH_NODE_EMBEDDING_BACKFILL_BATCH_SIZE: {value}"
-                )
+                format!("Invalid GMRAG_GRAPH_NODE_EMBEDDING_BACKFILL_BATCH_SIZE: {value}")
             })?
             .max(1);
     }
