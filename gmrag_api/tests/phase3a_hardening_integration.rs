@@ -166,6 +166,118 @@ async fn authz_outbox_failed_event_increments_retry_count_and_stores_sanitized_e
     assert_eq!(row.2.as_deref(), Some("invalid_payload"));
 }
 
+/// OPS-001: hai lần drain song song không để status ngoài enum CHECK;
+/// OpenFGA write idempotent → terminal PROCESSED; invalid payload → FAILED hợp lệ.
+#[tokio::test]
+async fn authz_outbox_concurrent_invocations_leave_valid_terminal_state() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    let authz_client = AuthzClient::from_env().unwrap();
+
+    let user_id = format!("phase3a-outbox-concurrent-{}", Uuid::new_v4());
+    let workspace_id = Uuid::new_v4();
+    let good_tuple = TupleKey {
+        user: format!("user:{user_id}"),
+        relation: Relation::Member.as_str().to_string(),
+        object: format!("workspace:{workspace_id}"),
+    };
+    let good_id = enqueue_tuple_write(&pool, &good_tuple).await.unwrap();
+
+    let bad_id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO authz_outbox (event_type, payload, status, retry_count)
+        VALUES ('tuple_write', '{}'::jsonb, 'PENDING', 0)
+        RETURNING id
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let pool_a = pool.clone();
+    let pool_b = pool.clone();
+    let client_a = authz_client.clone();
+    let client_b = authz_client.clone();
+    let config = AuthzOutboxProcessorConfig::default();
+
+    let (r1, r2) = tokio::join!(
+        process_authz_outbox(&pool_a, &client_a, config),
+        process_authz_outbox(&pool_b, &client_b, config),
+    );
+    r1.expect("first concurrent drain must not hard-fail");
+    r2.expect("second concurrent drain must not hard-fail");
+
+    let good_row: (String, i32) =
+        sqlx::query_as("SELECT status, retry_count FROM authz_outbox WHERE id = $1")
+            .bind(good_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(good_row.0, "PROCESSED");
+    assert_eq!(good_row.1, 0);
+
+    let bad_row: (String, i32, Option<String>) =
+        sqlx::query_as("SELECT status, retry_count, error_message FROM authz_outbox WHERE id = $1")
+            .bind(bad_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(bad_row.0, "FAILED");
+    assert!(
+        bad_row.1 >= 1 && bad_row.1 <= 2,
+        "retry_count must stay in a valid range under dual process: got {}",
+        bad_row.1
+    );
+    assert_eq!(bad_row.2.as_deref(), Some("invalid_payload"));
+
+    let allowed = authz_client
+        .check_fga(
+            &format!("user:{user_id}"),
+            Relation::Member,
+            &Object::Workspace(workspace_id),
+        )
+        .await
+        .unwrap();
+    assert!(allowed);
+
+    let _ = authz_client
+        .delete_tuple(
+            &format!("user:{user_id}"),
+            Relation::Member,
+            &Object::Workspace(workspace_id),
+        )
+        .await;
+    let _ = sqlx::query("DELETE FROM authz_outbox WHERE id = $1 OR id = $2")
+        .bind(good_id)
+        .bind(bad_id)
+        .execute(&pool)
+        .await;
+}
+
+/// OPS-001 failure drill: lỗi SQL cứng propagate (binary map → exit 1 / restart).
+#[tokio::test]
+async fn authz_outbox_hard_sql_failure_is_observable() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    let authz_client = AuthzClient::from_env().unwrap();
+
+    // Đóng pool → lần fetch tiếp theo fail cứng (không chỉ FAILED per-row).
+    pool.close().await;
+
+    let result =
+        process_authz_outbox(&pool, &authz_client, AuthzOutboxProcessorConfig::default()).await;
+    assert!(
+        result.is_err(),
+        "closed pool must surface Err for supervisor restart path"
+    );
+    assert_eq!(
+        gmrag_api::auth::outbox::authz_outbox_exit_code(&result),
+        gmrag_api::auth::outbox::AUTHZ_OUTBOX_EXIT_FAILURE
+    );
+}
+
 #[tokio::test]
 async fn storage_cleanup_dry_run_lists_orphan_without_deleting_it() {
     let _guard = phase3a_test_lock().lock().await;

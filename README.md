@@ -152,6 +152,8 @@ cargo run --bin recover-stale-ingestion-jobs -- --apply
 
 # Phase 3A — authz + storage + invite cleanup
 cargo run --bin process-authz-outbox
+# Unattended (OPS-001): deploy/authz-outbox/ — Compose/systemd/K8s artifacts;
+# see docs/RUNBOOK.md §2.2. Not production deployment proof by itself.
 cargo run --bin cleanup-storage-objects -- --dry-run
 cargo run --bin cleanup-storage-objects -- --delete-orphans --delete
 cargo run --bin cleanup-storage-objects -- --workspace-id <workspace_uuid> --delete

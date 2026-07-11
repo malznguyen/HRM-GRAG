@@ -9,6 +9,7 @@ use crate::auth::authz::{AuthzClient, AuthzError, TupleKey};
 
 const DEFAULT_AUTHZ_OUTBOX_BATCH_SIZE: i64 = 50;
 const DEFAULT_AUTHZ_OUTBOX_MAX_RETRIES: i32 = 5;
+const DEFAULT_AUTHZ_OUTBOX_POLL_INTERVAL_SECS: u64 = 30;
 const MAX_ERROR_MESSAGE_LEN: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +111,86 @@ impl AuthzOutboxProcessorConfig {
                 100,
             ),
         }
+    }
+}
+
+/// Chế độ chạy binary `process-authz-outbox` (one-shot cron vs loop daemon).
+///
+/// Không chứa logic xử lý row — chỉ cấu hình scheduler; processor vẫn là
+/// [`process_authz_outbox`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthzOutboxRunMode {
+    /// `true` = lặp drain + sleep; `false` = một lần rồi thoát (mặc định cron/timer).
+    pub loop_mode: bool,
+    /// Khoảng nghỉ giữa các lần drain khi `loop_mode` (giây).
+    pub interval_secs: u64,
+}
+
+impl Default for AuthzOutboxRunMode {
+    fn default() -> Self {
+        Self {
+            loop_mode: false,
+            interval_secs: DEFAULT_AUTHZ_OUTBOX_POLL_INTERVAL_SECS,
+        }
+    }
+}
+
+impl AuthzOutboxRunMode {
+    /// Parse CLI + env. CLI thắng env. Mặc định one-shot.
+    pub fn from_args_and_env(args: &[String]) -> Self {
+        let mut mode = Self {
+            loop_mode: false,
+            interval_secs: parse_env_u64(
+                "AUTHZ_OUTBOX_POLL_INTERVAL_SECS",
+                DEFAULT_AUTHZ_OUTBOX_POLL_INTERVAL_SECS,
+                1,
+                86_400,
+            ),
+        };
+
+        let mut index = 0;
+        while index < args.len() {
+            let arg = args[index].as_str();
+            match arg {
+                "--loop" => mode.loop_mode = true,
+                "--once" => mode.loop_mode = false,
+                "--interval-secs" => {
+                    index += 1;
+                    if let Some(raw) = args.get(index) {
+                        if let Ok(parsed) = raw.parse::<u64>() {
+                            mode.interval_secs = parsed.clamp(1, 86_400);
+                        }
+                    }
+                }
+                _ if arg.starts_with("--interval-secs=") => {
+                    if let Some(raw) = arg.strip_prefix("--interval-secs=") {
+                        if let Ok(parsed) = raw.parse::<u64>() {
+                            mode.interval_secs = parsed.clamp(1, 86_400);
+                        }
+                    }
+                }
+                "--help" | "-h" => {
+                    // Binary in ra usage rồi exit; giữ parse pure cho unit test.
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+
+        mode
+    }
+}
+
+/// Exit code binary: `0` khi drain xong (one-shot) hoặc shutdown sạch (loop);
+/// `1` khi lỗi cứng (DB/SQL) — supervisor restart / CronJob OnFailure.
+pub const AUTHZ_OUTBOX_EXIT_SUCCESS: i32 = 0;
+pub const AUTHZ_OUTBOX_EXIT_FAILURE: i32 = 1;
+
+/// Map kết quả processor → exit code quan sát được cho failure drill / orchestrator.
+pub fn authz_outbox_exit_code<T, E>(result: &Result<T, E>) -> i32 {
+    match result {
+        Ok(_) => AUTHZ_OUTBOX_EXIT_SUCCESS,
+        Err(_) => AUTHZ_OUTBOX_EXIT_FAILURE,
     }
 }
 
@@ -417,6 +498,14 @@ fn parse_env_i32(var_name: &str, default: i32, min: i32, max: i32) -> i32 {
         .clamp(min, max)
 }
 
+fn parse_env_u64(var_name: &str, default: u64, min: u64, max: u64) -> u64 {
+    std::env::var(var_name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +518,39 @@ mod tests {
 
         let decoded: AuthzOutboxEventType = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, AuthzOutboxEventType::TupleWrite);
+    }
+
+    #[test]
+    fn run_mode_defaults_to_once() {
+        let mode = AuthzOutboxRunMode::from_args_and_env(&[]);
+        assert!(!mode.loop_mode);
+        assert!(mode.interval_secs >= 1);
+    }
+
+    #[test]
+    fn run_mode_parses_loop_and_interval_cli() {
+        let args = vec![
+            "--loop".to_string(),
+            "--interval-secs".to_string(),
+            "15".to_string(),
+        ];
+        let mode = AuthzOutboxRunMode::from_args_and_env(&args);
+        assert!(mode.loop_mode);
+        assert_eq!(mode.interval_secs, 15);
+
+        let once = AuthzOutboxRunMode::from_args_and_env(&["--once".to_string()]);
+        assert!(!once.loop_mode);
+
+        let eq = AuthzOutboxRunMode::from_args_and_env(&["--interval-secs=45".to_string()]);
+        assert_eq!(eq.interval_secs, 45);
+    }
+
+    #[test]
+    fn exit_code_maps_ok_and_err_for_failure_drill() {
+        let ok: Result<(), &str> = Ok(());
+        let err: Result<(), &str> = Err("db_unavailable");
+        assert_eq!(authz_outbox_exit_code(&ok), AUTHZ_OUTBOX_EXIT_SUCCESS);
+        assert_eq!(authz_outbox_exit_code(&err), AUTHZ_OUTBOX_EXIT_FAILURE);
     }
 
     #[test]
