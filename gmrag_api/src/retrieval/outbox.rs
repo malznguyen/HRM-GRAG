@@ -204,13 +204,24 @@ pub async fn enqueue_delete_by_workspaces(
     pool: &PgPool,
     workspace_ids: &[Uuid],
 ) -> Result<Uuid, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let id = enqueue_delete_by_workspaces_tx(&mut tx, workspace_ids).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Insert `delete_by_workspaces` trong transaction lifecycle (tenant cascade: LIFE-005).
+///
+/// `workspace_ids` có thể rỗng — payload vẫn ghi `[]` tường minh (không silent omit).
+/// Caller phải capture ids **trước** SQL cascade; sau cascade không resolve lại được.
+pub async fn enqueue_delete_by_workspaces_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_ids: &[Uuid],
+) -> Result<Uuid, sqlx::Error> {
     let payload = json!({
         "workspace_ids": workspace_ids,
     });
-    let mut tx = pool.begin().await?;
-    let id = enqueue_event_tx(&mut tx, QdrantOutboxEventType::DeleteByWorkspaces, payload).await?;
-    tx.commit().await?;
-    Ok(id)
+    enqueue_event_tx(tx, QdrantOutboxEventType::DeleteByWorkspaces, payload).await
 }
 
 /// Ghi outbox row trong transaction đang mở — rollback theo transaction cha.

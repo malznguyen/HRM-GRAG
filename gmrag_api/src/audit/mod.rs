@@ -38,6 +38,10 @@ pub enum AuditEventType {
     InvitePlaceholderCleanupDryRun,
     InvitePlaceholderCleanupCompleted,
     InvitePlaceholderCleanupFailed,
+    /// Operator drill LIFE-005 — không phải public API tenant delete.
+    TenantDeleteDrillDryRun,
+    TenantDeleteDrillCompleted,
+    TenantDeleteDrillFailed,
     GraphNodeEmbeddingBackfillCompleted,
     GraphNodeEmbeddingBackfillFailed,
 }
@@ -89,6 +93,9 @@ impl AuditEventType {
                 "invite_placeholder_cleanup_completed"
             }
             AuditEventType::InvitePlaceholderCleanupFailed => "invite_placeholder_cleanup_failed",
+            AuditEventType::TenantDeleteDrillDryRun => "tenant_delete_drill_dry_run",
+            AuditEventType::TenantDeleteDrillCompleted => "tenant_delete_drill_completed",
+            AuditEventType::TenantDeleteDrillFailed => "tenant_delete_drill_failed",
             AuditEventType::GraphNodeEmbeddingBackfillCompleted => {
                 "graph_node_embedding_backfill_completed"
             }
