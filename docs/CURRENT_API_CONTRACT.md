@@ -72,7 +72,7 @@ The API is partially standardized today.
 | `POST` | `/tenants` | `admin` on `platform:system` |
 | `POST` | `/tenants/{tenant_id}/owners` | `admin` on `platform:system` |
 | `POST` | `/tenants/{tenant_id}/workspaces` | `owner` on `tenant:{tenant_id}` |
-| `GET` | `/workspaces` | authenticated user; result set filtered from SQL membership tables |
+| `GET` | `/workspaces` | authenticated user; SQL membership candidates intersected with OpenFGA `member` |
 | `DELETE` | `/workspaces/{workspace_id}` | `can_assign_role` on `workspace:{workspace_id}` |
 | `GET` | `/workspaces/{workspace_id}/documents` | `member` on `workspace:{workspace_id}` |
 | `POST` | `/workspaces/{workspace_id}/documents/upload` | `admin` on `workspace:{workspace_id}` |
@@ -270,7 +270,7 @@ Payload limitation: points do not carry `tenant_id` (workspace list only). See
 - Auth: bearer JWT.
 - Authorization: `member` on `workspace:{workspace_id}`.
 - Request body: none.
-- Success: `200` with document rows containing `id`, `filename`, `status`, `processing_stage`, and `created_at`.
+- Success: `200` with document rows containing `id`, `filename`, `status`, `processing_stage`, optional `failure_code`/`failure_message`, and `created_at`.
 - Errors: `403` JSON authz envelope; `500` empty body on SQL failure.
 - Side effects: none.
 - Security notes: visibility is ACL-scoped; users only see documents they have explicit or bypass viewer access to.
@@ -282,7 +282,7 @@ Payload limitation: points do not carry `tenant_id` (workspace list only). See
 - Request body: `multipart/form-data` with one or more `file` parts, and an optional text field `access_mode` (`workspace_default` | `restricted`). When omitted, `access_mode` defaults to `workspace_default`. The same `access_mode` applies to every accepted file in the request.
 - Success: `202` with `{ documents: [{ document_id, filename }] }` for the accepted files.
 - Errors: `400` empty body if no acceptable PDF was accepted; `400` JSON `{"error":{"code":"INVALID_ACCESS_MODE","message":"access_mode must be workspace_default or restricted"}}` if `access_mode` is present but not one of the two allowed values; `403` JSON authz envelope; `404` empty body if the workspace cannot be resolved to a tenant; `500` empty body on tenant lookup failure.
-- Side effects: uploads original bytes to MinIO/S3, inserts `documents` metadata (including `access_mode`), and spawns async ingestion.
+- Side effects: uploads original bytes to MinIO/S3, then atomically inserts `documents` metadata (including `access_mode`) and one durable `ingestion_jobs` row. Processing is performed by the separate ingestion worker after commit.
 - Security notes: filename and client MIME type are stored as metadata only. Acceptance requires a `%PDF-` signature and successful structural validation (`lopdf`) of the submitted bytes before object-key generation or S3/MinIO upload; a filename suffix alone is never enough. Responses do not expose raw object keys. Uploading as `restricted` does not auto-create `document_shares` or `explicit_viewer` tuples for the uploader; visibility follows the same restricted-document rules as after `PATCH .../access-mode`.
 
 ### `DELETE /workspaces/{workspace_id}/documents/{document_id}`
@@ -301,9 +301,16 @@ Payload limitation: points do not carry `tenant_id` (workspace list only). See
 - Authorization: `admin` on `workspace:{workspace_id}`.
 - Request body: none.
 - Success: `202` empty body.
-- Errors: `403` JSON authz envelope; `404` empty body if the document is missing; `409` plain text `Document is not in a failed state`; `410` JSON `{ "error": { "code": "DOCUMENT_OBJECT_MISSING", "message": "Original document object is missing" } }`; `500` empty body on SQL or storage lookup failure.
-- Side effects: checks object existence in MinIO/S3, resets the document row to `PROCESSING` / `QUEUED`, and spawns ingestion.
+- Errors: `403` JSON authz envelope; `404` empty body if the document is missing; `409` JSON `DOCUMENT_NOT_RETRYABLE` when it is not a failed document with no active job; `410` JSON `{ "error": { "code": "DOCUMENT_OBJECT_MISSING", "message": "Original document object is missing" } }`; `500` empty body on SQL or storage lookup failure.
+- Side effects: checks object existence in MinIO/S3, then atomically resets a `FAILED` document to `PROCESSING` / `QUEUED`, clears prior failure fields, and inserts exactly one durable job. Concurrent retries have one `202` winner.
+- Invariant: only `COMPLETED` / `DONE` documents can contribute Qdrant chunks to chat retrieval. `INDEXING` is the final non-terminal processing stage.
 - Security notes: retry is object-storage-based and does not depend on a local source file.
+
+Ingestion lifecycle closure: the API returns `202` after the durable document
+and job transaction commits; the independent worker owns parsing, persistence,
+Qdrant indexing, retry/backoff, lease recovery, and terminal failure updates.
+Retryable failures keep the document `PROCESSING` / `QUEUED`; non-retryable or
+exhausted failures set `FAILED` / `FAILED` with a structured `failure_code`.
 
 ### `PATCH /workspaces/{workspace_id}/documents/{document_id}/access-mode`
 

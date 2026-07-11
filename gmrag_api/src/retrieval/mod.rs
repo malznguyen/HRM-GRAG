@@ -251,6 +251,14 @@ impl RetrievalClient {
 
         self.ensure_collection().await?;
 
+        // Point id ổn định nên replay toàn bộ batch sau timeout/an unknown response vẫn idempotent.
+        for batch in points.chunks(256) {
+            self.upsert_chunk_point_batch(batch).await?;
+        }
+        Ok(())
+    }
+
+    async fn upsert_chunk_point_batch(&self, points: &[ChunkPoint]) -> Result<(), RetrievalError> {
         let qdrant_points: Vec<QdrantPointUpsert> = points
             .iter()
             .map(|point| QdrantPointUpsert {

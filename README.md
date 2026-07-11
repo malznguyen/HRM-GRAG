@@ -33,6 +33,7 @@ Historical v1 audit snapshots are archived under `docs/archive/v1/`.
 | Original document storage | S3-compatible object storage; MinIO in local development |
 | Current retrieval path | **Chunk:** Qdrant (ACL-aware). **Graph:** ACL-aware retrieval ranks document-scoped `graph_node_sources.embedding` after visible-provenance filtering and falls back to source-scoped text search. `graph_nodes.embedding` remains global compatibility/read-model data and is not used as ACL-filtered graph content fallback. |
 | Phase 3A hardening | ✅ complete — authz outbox processor, storage cleanup, invite-placeholder cleanup, audit trail (see `docs/RUNBOOK.md`) |
+| Phase 1 durable ingestion | ✅ complete — API enqueue only; independent worker claim/lease, retry/backoff, stable Qdrant replay, restart recovery, and terminal failure states (see `docs/RUNBOOK.md` §11) |
 | Phase 3B/3C | 🟡 partial — Qdrant lifecycle/outbox (claim, backoff, `DEAD`) + orphan cleanup shipped; daemon orchestration and other follow-up remain (see `docs/authz-refactor-taskboard.md`) |
 
 ## Local Services
@@ -108,6 +109,14 @@ Copy `gmrag_api/.env.example` to `gmrag_api/.env` and fill in the values for:
    The default API bind is `127.0.0.1:8083` (`API_BIND_ADDR`), leaving local
    Keycloak on `127.0.0.1:8080`.
 
+   Run durable ingestion separately (a successful upload only enqueues work):
+
+   ```bash
+   cargo run --bin ingestion-worker
+   # one polling pass for development/ops
+   cargo run --bin ingestion-worker -- --once
+   ```
+
 4. Bootstrap a platform admin tuple in OpenFGA for a real user id:
 
    ```bash
@@ -136,6 +145,11 @@ Copy `gmrag_api/.env.example` to `gmrag_api/.env` and fill in the values for:
 Run these from `gmrag_api/`:
 
 ```bash
+# Durable Phase 1 ingestion
+cargo run --bin ingestion-worker -- --worker-id local-worker
+cargo run --bin recover-stale-ingestion-jobs -- --dry-run
+cargo run --bin recover-stale-ingestion-jobs -- --apply
+
 # Phase 3A — authz + storage + invite cleanup
 cargo run --bin process-authz-outbox
 cargo run --bin cleanup-storage-objects -- --dry-run

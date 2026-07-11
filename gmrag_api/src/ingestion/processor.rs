@@ -1,10 +1,12 @@
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    pin::Pin,
+    time::{Duration, Instant},
+};
 
 use futures::{StreamExt, stream};
 use reqwest::Client;
 use sqlx::{PgPool, Postgres, Transaction};
-use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 
@@ -15,66 +17,70 @@ use super::graph::{
 };
 use super::ocr::vision_ocr_fallback;
 use super::pdf_parser::{PdfParseError, extract_pdf_from_bytes};
+use crate::ingestion::jobs::{
+    ClaimedJob, STAGE_EMBEDDING, STAGE_GRAPH_EXTRACTION, STAGE_INDEXING, STAGE_PARSING,
+    STAGE_SAVING, complete_job_and_document, set_stage_for_owner,
+};
 use crate::retrieval::{ChunkPoint, RetrievalClient, RetrievalError};
 use crate::storage::{StorageClient, StorageError};
 
-pub fn spawn_document_processing(
+/// Abstraction cho bước index Qdrant để worker production và test recovery dùng cùng orchestration.
+pub trait ChunkIndexer: Send + Sync {
+    fn delete_points_by_document<'a>(
+        &'a self,
+        workspace_id: Uuid,
+        document_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RetrievalError>> + Send + 'a>>;
+
+    fn upsert_chunk_points<'a>(
+        &'a self,
+        points: &'a [ChunkPoint],
+        attempt_count: i32,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RetrievalError>> + Send + 'a>>;
+}
+
+impl ChunkIndexer for RetrievalClient {
+    fn delete_points_by_document<'a>(
+        &'a self,
+        workspace_id: Uuid,
+        document_id: Uuid,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RetrievalError>> + Send + 'a>> {
+        Box::pin(async move {
+            RetrievalClient::delete_points_by_document(self, workspace_id, document_id).await
+        })
+    }
+
+    fn upsert_chunk_points<'a>(
+        &'a self,
+        points: &'a [ChunkPoint],
+        _attempt_count: i32,
+    ) -> Pin<Box<dyn Future<Output = Result<(), RetrievalError>> + Send + 'a>> {
+        Box::pin(async move { RetrievalClient::upsert_chunk_points(self, points).await })
+    }
+}
+
+/// Worker gọi hàm này sau khi claim durable job. API không được gọi trực tiếp.
+pub async fn process_claimed_job(
     pool: PgPool,
     storage: StorageClient,
     retrieval: RetrievalClient,
-    workspace_id: Uuid,
-    document_id: Uuid,
-    limiter: Arc<Semaphore>,
-) {
-    tokio::spawn(async move {
-        let _document_permit = match limiter.acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => {
-                tracing::error!(
-                    %workspace_id,
-                    %document_id,
-                    "Global ingestion limiter was closed before document processing started"
-                );
-                return;
-            }
-        };
-
-        if let Err(err) = process_document(
-            pool.clone(),
-            storage.clone(),
-            retrieval.clone(),
-            workspace_id,
-            document_id,
-        )
-        .await
-        {
-            tracing::error!(
-                %workspace_id,
-                %document_id,
-                error = %err,
-                "Document ingestion failed"
-            );
-            if let Err(db_err) = mark_document_failed(&pool, workspace_id, document_id).await {
-                tracing::error!(
-                    %workspace_id,
-                    %document_id,
-                    error = %db_err,
-                    "Failed to update document status to FAILED"
-                );
-            }
-        }
-    });
+    job: &ClaimedJob,
+    worker_id: &str,
+) -> Result<(), ProcessError> {
+    process_document(pool, storage, retrieval, job, worker_id).await
 }
 
 async fn process_document(
     pool: PgPool,
     storage: StorageClient,
     retrieval: RetrievalClient,
-    workspace_id: Uuid,
-    document_id: Uuid,
+    job: &ClaimedJob,
+    worker_id: &str,
 ) -> Result<(), ProcessError> {
+    let workspace_id = job.workspace_id;
+    let document_id = job.document_id;
     let document_started = Instant::now();
-    set_processing_stage(&pool, workspace_id, document_id, "PARSING").await?;
+    set_processing_stage(&pool, job, worker_id, STAGE_PARSING).await?;
 
     let storage_metadata = fetch_document_storage_metadata(&pool, workspace_id, document_id)
         .await?
@@ -157,14 +163,28 @@ async fn process_document(
             %document_id,
             "No text chunks produced from document; marking COMPLETED"
         );
-        set_processing_stage(&pool, workspace_id, document_id, "SAVING").await?;
         let mut tx = pool.begin().await.map_err(ProcessError::Database)?;
-        mark_document_completed_tx(&mut tx, workspace_id, document_id).await?;
+        clear_document_output(&mut tx, workspace_id, document_id).await?;
         tx.commit().await.map_err(ProcessError::Database)?;
+        set_processing_stage(&pool, job, worker_id, STAGE_INDEXING).await?;
+        retrieval
+            .delete_points_by_document(workspace_id, document_id)
+            .await
+            .map_err(ProcessError::Retrieval)?;
+        retrieval
+            .upsert_chunk_points(&[])
+            .await
+            .map_err(ProcessError::Retrieval)?;
+        if !complete_job_and_document(&pool, job, worker_id)
+            .await
+            .map_err(ProcessError::Database)?
+        {
+            return Err(ProcessError::LeaseLost);
+        }
         return Ok(());
     }
 
-    set_processing_stage(&pool, workspace_id, document_id, "EMBEDDING").await?;
+    set_processing_stage(&pool, job, worker_id, STAGE_EMBEDDING).await?;
 
     let client = Client::new();
     let embedding_started = Instant::now();
@@ -199,7 +219,7 @@ async fn process_document(
         })
         .collect();
 
-    set_processing_stage(&pool, workspace_id, document_id, "GRAPH_EXTRACTION").await?;
+    set_processing_stage(&pool, job, worker_id, STAGE_GRAPH_EXTRACTION).await?;
 
     let graph_started = Instant::now();
     let graph_results = if graph_extraction_enabled() {
@@ -260,7 +280,7 @@ async fn process_document(
         );
     }
 
-    set_processing_stage(&pool, workspace_id, document_id, "SAVING").await?;
+    set_processing_stage(&pool, job, worker_id, STAGE_SAVING).await?;
 
     let db_started = Instant::now();
     tracing::info!(
@@ -272,11 +292,12 @@ async fn process_document(
         "Bulk database transaction started"
     );
     let mut tx = pool.begin().await.map_err(ProcessError::Database)?;
+    clear_document_output(&mut tx, workspace_id, document_id).await?;
     bulk_upsert_document_chunks(&mut tx, workspace_id, document_id, &chunk_rows).await?;
+    delete_stale_document_chunks(&mut tx, workspace_id, document_id, &chunk_rows).await?;
     bulk_upsert_graph(&mut tx, workspace_id, document_id, &graph_batch)
         .await
         .map_err(ProcessError::Graph)?;
-    mark_document_completed_tx(&mut tx, workspace_id, document_id).await?;
     tx.commit().await.map_err(ProcessError::Database)?;
     tracing::info!(
         %workspace_id,
@@ -300,10 +321,8 @@ async fn process_document(
         return Ok(());
     }
 
-    retrieval
-        .upsert_chunk_points(&points)
-        .await
-        .map_err(ProcessError::Retrieval)?;
+    set_processing_stage(&pool, job, worker_id, STAGE_INDEXING).await?;
+    index_document_outputs(&pool, &retrieval, job, worker_id, &points).await?;
 
     tracing::info!(
         %workspace_id,
@@ -314,6 +333,38 @@ async fn process_document(
         elapsed_ms = document_started.elapsed().as_millis(),
         "Document ingestion completed"
     );
+
+    Ok(())
+}
+
+/// Index toàn bộ output bằng point id ổn định rồi chỉ hoàn tất document sau khi Qdrant xác nhận.
+pub async fn index_document_outputs<I: ChunkIndexer>(
+    pool: &PgPool,
+    indexer: &I,
+    job: &ClaimedJob,
+    worker_id: &str,
+    points: &[ChunkPoint],
+) -> Result<(), ProcessError> {
+    if !document_still_exists(pool, job.workspace_id, job.document_id).await? {
+        return Ok(());
+    }
+
+    set_processing_stage(pool, job, worker_id, STAGE_INDEXING).await?;
+    indexer
+        .delete_points_by_document(job.workspace_id, job.document_id)
+        .await
+        .map_err(ProcessError::Retrieval)?;
+    indexer
+        .upsert_chunk_points(points, job.attempt_count)
+        .await
+        .map_err(ProcessError::Retrieval)?;
+
+    if !complete_job_and_document(pool, job, worker_id)
+        .await
+        .map_err(ProcessError::Database)?
+    {
+        return Err(ProcessError::LeaseLost);
+    }
 
     Ok(())
 }
@@ -574,6 +625,60 @@ async fn bulk_upsert_document_chunks(
     Ok(())
 }
 
+/// Xóa output cũ trong cùng transaction để re-ingestion ít chunk/graph hơn không để lại stale data.
+async fn clear_document_output(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    document_id: Uuid,
+) -> Result<(), ProcessError> {
+    sqlx::query("DELETE FROM graph_edge_sources WHERE workspace_id = $1 AND document_id = $2")
+        .bind(workspace_id)
+        .bind(document_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(ProcessError::Database)?;
+    sqlx::query("DELETE FROM graph_node_sources WHERE workspace_id = $1 AND document_id = $2")
+        .bind(workspace_id)
+        .bind(document_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(ProcessError::Database)?;
+    sqlx::query(
+        "DELETE FROM graph_edges edge WHERE edge.workspace_id = $1 AND NOT EXISTS (SELECT 1 FROM graph_edge_sources source WHERE source.graph_edge_id = edge.id)",
+    )
+    .bind(workspace_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(ProcessError::Database)?;
+    sqlx::query(
+        "DELETE FROM graph_nodes node WHERE node.workspace_id = $1 AND NOT EXISTS (SELECT 1 FROM graph_node_sources source WHERE source.graph_node_id = node.id) AND NOT EXISTS (SELECT 1 FROM graph_edges edge WHERE edge.source_node_id = node.id OR edge.target_node_id = node.id)",
+    )
+    .bind(workspace_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(ProcessError::Database)?;
+    Ok(())
+}
+
+async fn delete_stale_document_chunks(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    document_id: Uuid,
+    rows: &[ChunkRow],
+) -> Result<(), ProcessError> {
+    let indexes: Vec<i32> = rows.iter().map(|row| row.index).collect();
+    sqlx::query(
+        "DELETE FROM document_chunks WHERE workspace_id = $1 AND document_id = $2 AND NOT (chunk_index = ANY($3::int[]))",
+    )
+    .bind(workspace_id)
+    .bind(document_id)
+    .bind(indexes)
+    .execute(&mut **tx)
+    .await
+    .map_err(ProcessError::Database)?;
+    Ok(())
+}
+
 #[derive(sqlx::FromRow)]
 struct PersistedChunkRow {
     id: Uuid,
@@ -751,6 +856,212 @@ mod race_guard_tests {
     }
 }
 
+#[cfg(test)]
+mod reingestion_idempotency_tests {
+    use super::{
+        ChunkRow, bulk_upsert_document_chunks, clear_document_output, delete_stale_document_chunks,
+    };
+    use crate::ingestion::graph::{GraphElement, GraphWriteBatch, bulk_upsert_graph};
+    use sqlx::{PgPool, postgres::PgPoolOptions};
+    use uuid::Uuid;
+
+    async fn persist_output(
+        pool: &PgPool,
+        workspace_id: Uuid,
+        document_id: Uuid,
+        rows: &[ChunkRow],
+        graph_batch: &GraphWriteBatch,
+    ) {
+        let mut tx = pool.begin().await.unwrap();
+        clear_document_output(&mut tx, workspace_id, document_id)
+            .await
+            .unwrap();
+        bulk_upsert_document_chunks(&mut tx, workspace_id, document_id, rows)
+            .await
+            .unwrap();
+        delete_stale_document_chunks(&mut tx, workspace_id, document_id, rows)
+            .await
+            .unwrap();
+        bulk_upsert_graph(&mut tx, workspace_id, document_id, graph_batch)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    fn graph_batch(include_node: bool) -> GraphWriteBatch {
+        let extractions = if include_node {
+            vec![(
+                0,
+                vec![GraphElement::Node {
+                    name: "Durable test node".to_string(),
+                    entity_type: Some("TEST".to_string()),
+                    description: Some("reingestion fixture".to_string()),
+                }],
+            )]
+        } else {
+            Vec::new()
+        };
+        let mut batch = GraphWriteBatch::from_extractions(&extractions);
+        if batch.node_count() > 0 {
+            batch
+                .attach_node_embeddings(vec![vec![0.01_f32; 768]])
+                .unwrap();
+        }
+        batch
+    }
+
+    fn rows(count: usize, suffix: &str) -> Vec<ChunkRow> {
+        (0..count)
+            .map(|index| ChunkRow {
+                index: index as i32,
+                text: format!("{suffix}-{index}"),
+                embedding: vec![0.02_f32; 768],
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn reprocessing_same_document_does_not_duplicate_outputs() {
+        dotenvy::dotenv().ok();
+        let Ok(database_url) = std::env::var("DATABASE_URL") else {
+            eprintln!("skip: DATABASE_URL not set");
+            return;
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let tenant_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let document_id = Uuid::new_v4();
+        let user_id = format!("reingestion-test-{}", Uuid::new_v4());
+        sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
+            .bind(&user_id)
+            .bind(format!("{user_id}@test.local"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+            .bind(tenant_id)
+            .bind(format!("reingestion-tenant-{tenant_id}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO workspaces (id, tenant_id, name) VALUES ($1, $2, $3)")
+            .bind(workspace_id)
+            .bind(tenant_id)
+            .bind(format!("reingestion-workspace-{workspace_id}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO documents (id, workspace_id, owner_id, filename, status, processing_stage, object_key, bucket, uploaded_by) VALUES ($1, $2, $3, 'reingestion.pdf', 'PROCESSING', 'SAVING', $4, 'test', $3)",
+        )
+        .bind(document_id)
+        .bind(workspace_id)
+        .bind(&user_id)
+        .bind(format!("test/{document_id}.pdf"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let initial_rows = rows(3, "initial");
+        persist_output(
+            &pool,
+            workspace_id,
+            document_id,
+            &initial_rows,
+            &graph_batch(true),
+        )
+        .await;
+        let initial_chunk_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM document_chunks WHERE document_id = $1 ORDER BY chunk_index",
+        )
+        .bind(document_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let initial_graph_sources: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM graph_node_sources WHERE document_id = $1",
+        )
+        .bind(document_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(initial_chunk_ids.len(), 3);
+        assert_eq!(initial_graph_sources, 1);
+
+        persist_output(
+            &pool,
+            workspace_id,
+            document_id,
+            &rows(3, "same-output"),
+            &graph_batch(true),
+        )
+        .await;
+        let same_output_chunk_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM document_chunks WHERE document_id = $1 ORDER BY chunk_index",
+        )
+        .bind(document_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let same_output_graph_sources: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM graph_node_sources WHERE document_id = $1",
+        )
+        .bind(document_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(same_output_chunk_ids, initial_chunk_ids);
+        assert_eq!(same_output_graph_sources, 1);
+
+        persist_output(
+            &pool,
+            workspace_id,
+            document_id,
+            &rows(1, "smaller-output"),
+            &graph_batch(false),
+        )
+        .await;
+        let smaller_chunk_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM document_chunks WHERE document_id = $1",
+        )
+        .bind(document_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let smaller_graph_sources: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM graph_node_sources WHERE document_id = $1",
+        )
+        .bind(document_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(smaller_chunk_count, 1);
+        assert_eq!(smaller_graph_sources, 0);
+
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind(workspace_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM tenants WHERE id = $1")
+            .bind(tenant_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}
+
 async fn fetch_document_storage_metadata(
     pool: &PgPool,
     workspace_id: Uuid,
@@ -772,63 +1083,18 @@ async fn fetch_document_storage_metadata(
 
 async fn set_processing_stage(
     pool: &PgPool,
-    workspace_id: Uuid,
-    document_id: Uuid,
-    stage: &str,
+    job: &ClaimedJob,
+    worker_id: &str,
+    stage: &'static str,
 ) -> Result<(), ProcessError> {
-    sqlx::query(
-        r#"
-        UPDATE documents
-        SET processing_stage = $3
-        WHERE id = $1 AND workspace_id = $2
-        "#,
-    )
-    .bind(document_id)
-    .bind(workspace_id)
-    .bind(stage)
-    .execute(pool)
-    .await
-    .map_err(ProcessError::Database)?;
-    Ok(())
-}
-
-async fn mark_document_completed_tx(
-    tx: &mut Transaction<'_, Postgres>,
-    workspace_id: Uuid,
-    document_id: Uuid,
-) -> Result<(), ProcessError> {
-    sqlx::query(
-        r#"
-        UPDATE documents
-        SET status = 'COMPLETED', processing_stage = 'DONE'
-        WHERE id = $1 AND workspace_id = $2
-        "#,
-    )
-    .bind(document_id)
-    .bind(workspace_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(ProcessError::Database)?;
-    Ok(())
-}
-
-async fn mark_document_failed(
-    pool: &PgPool,
-    workspace_id: Uuid,
-    document_id: Uuid,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
-        UPDATE documents
-        SET status = 'FAILED'
-        WHERE id = $1 AND workspace_id = $2
-        "#,
-    )
-    .bind(document_id)
-    .bind(workspace_id)
-    .execute(pool)
-    .await?;
-    Ok(())
+    if set_stage_for_owner(pool, job, worker_id, stage)
+        .await
+        .map_err(ProcessError::Database)?
+    {
+        Ok(())
+    } else {
+        Err(ProcessError::LeaseLost)
+    }
 }
 
 fn embedding_batch_size() -> usize {
@@ -917,7 +1183,8 @@ struct ChunkRow {
 }
 
 #[derive(Debug)]
-enum ProcessError {
+pub enum ProcessError {
+    LeaseLost,
     Join,
     DocumentNotFound { document_id: Uuid },
     DocumentObjectMissing { object_key: String },
@@ -937,6 +1204,7 @@ enum ProcessError {
 impl std::fmt::Display for ProcessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ProcessError::LeaseLost => write!(f, "ingestion job lease ownership was lost"),
             ProcessError::Join => write!(f, "background task panicked"),
             ProcessError::DocumentNotFound { document_id } => {
                 write!(f, "document not found in database: {document_id}")
@@ -971,3 +1239,52 @@ impl std::fmt::Display for ProcessError {
 }
 
 impl std::error::Error for ProcessError {}
+
+impl ProcessError {
+    pub fn is_lease_lost(&self) -> bool {
+        matches!(self, Self::LeaseLost)
+    }
+
+    pub fn failure_kind(&self) -> (&'static str, &'static str, bool) {
+        match self {
+            Self::DocumentObjectMissing { .. } => (
+                "DOCUMENT_OBJECT_MISSING",
+                "Original document object is missing",
+                false,
+            ),
+            Self::Parse(_) | Self::ParseTimeout { .. } | Self::Chunk(_) => {
+                ("PDF_PARSE_FAILED", "The PDF could not be parsed", false)
+            }
+            Self::Embed(_) | Self::EmbedTimeout { .. } | Self::MissingEmbedding { .. } => (
+                "EMBEDDING_PROVIDER_UNAVAILABLE",
+                "Embeddings could not be generated",
+                true,
+            ),
+            Self::Graph(_) | Self::GraphTimeout { .. } => (
+                "GRAPH_EXTRACTION_FAILED",
+                "Graph extraction could not be completed",
+                true,
+            ),
+            Self::Retrieval(_) => (
+                "QDRANT_INDEX_FAILED",
+                "Vector indexing could not be completed",
+                true,
+            ),
+            Self::Database(_) => (
+                "DATABASE_SAVE_FAILED",
+                "Ingestion data could not be saved",
+                true,
+            ),
+            Self::Join | Self::DocumentNotFound { .. } | Self::LeaseLost => (
+                "INTERNAL_INGESTION_ERROR",
+                "Ingestion could not be completed",
+                true,
+            ),
+            Self::Storage(_) => (
+                "INTERNAL_INGESTION_ERROR",
+                "Document storage could not be read",
+                true,
+            ),
+        }
+    }
+}

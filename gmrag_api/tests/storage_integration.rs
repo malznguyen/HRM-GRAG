@@ -283,6 +283,18 @@ async fn upload_pdf_persists_object_and_metadata() {
     assert_eq!(row.3.as_deref(), Some(expected_checksum.as_str()));
     assert_eq!(row.4, "workspace_default");
 
+    let jobs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM ingestion_jobs WHERE document_id = $1 AND status = 'QUEUED'",
+    )
+    .bind(document_id)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        jobs, 1,
+        "accepted upload must atomically enqueue one durable job"
+    );
+
     let exists = server.state.storage.object_exists(&row.0).await.unwrap();
     assert!(exists);
 }
@@ -444,6 +456,17 @@ async fn retry_document_reads_from_object_storage_without_local_file() {
 
     assert_eq!(row.0, "PROCESSING");
     assert_eq!(row.1, "QUEUED");
+    let jobs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM ingestion_jobs WHERE document_id = $1 AND status IN ('QUEUED', 'PROCESSING')",
+    )
+    .bind(seeded_document.document_id)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        jobs, 1,
+        "manual retry must create exactly one active durable job"
+    );
 }
 
 #[tokio::test]

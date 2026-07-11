@@ -78,6 +78,8 @@ pub async fn fetch_chunks_by_ids(
             AND d.workspace_id = dc.workspace_id
         WHERE dc.workspace_id = $1
           AND dc.id = ANY($2)
+          AND d.status = 'COMPLETED'
+          AND d.processing_stage = 'DONE'
         ORDER BY array_position($2::uuid[], dc.id)
         "#,
     )

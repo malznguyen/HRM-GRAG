@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::auth::authz::AuthzClient;
 use crate::auth::document_acl::{
     DocumentAccessMode, DocumentAclError, can_user_view_document, collect_viewable_document_ids,
-    fetch_workspace_document_acl_rows,
+    fetch_completed_workspace_document_acl_rows,
 };
 use crate::ingestion::embedding::{EmbedError, embed_text, format_pgvector};
 use crate::retrieval::{RetrievalClient, RetrievalError};
@@ -162,7 +162,7 @@ pub async fn build_chat_context(
         "RAG pipeline: query embedding complete"
     );
 
-    let acl_rows = fetch_workspace_document_acl_rows(pool, workspace_id).await?;
+    let acl_rows = fetch_completed_workspace_document_acl_rows(pool, workspace_id).await?;
     let visible_document_ids = collect_viewable_document_ids(authz_client, user_id, &acl_rows)
         .await?
         .into_iter()

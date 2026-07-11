@@ -138,6 +138,37 @@ pub async fn fetch_workspace_document_acl_rows(
     Ok(acl_rows)
 }
 
+/// Chỉ trả tài liệu đã hoàn tất cho retrieval; Qdrant có thể còn point partial của job retry.
+pub async fn fetch_completed_workspace_document_acl_rows(
+    pool: &PgPool,
+    workspace_id: Uuid,
+) -> Result<Vec<DocumentAclRow>, DocumentAclError> {
+    let rows: Vec<DocumentAclRawRow> = sqlx::query_as(
+        r#"
+        SELECT id, access_mode
+        FROM documents
+        WHERE workspace_id = $1 AND status = 'COMPLETED' AND processing_stage = 'DONE'
+        "#,
+    )
+    .bind(workspace_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let access_mode = DocumentAccessMode::parse(&row.access_mode).ok_or(
+                DocumentAclError::InvalidAccessMode {
+                    document_id: row.id,
+                    raw_mode: row.access_mode,
+                },
+            )?;
+            Ok(DocumentAclRow {
+                document_id: row.id,
+                access_mode,
+            })
+        })
+        .collect()
+}
+
 pub async fn collect_viewable_document_ids(
     authz_client: &AuthzClient,
     user_id: &str,

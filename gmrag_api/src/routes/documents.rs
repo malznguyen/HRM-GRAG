@@ -20,7 +20,7 @@ use crate::auth::document_acl::{
     remove_document_workspace_relation, revoke_document_explicit_viewer, set_document_access_mode,
 };
 use crate::auth::outbox::enqueue_tuple_delete;
-use crate::ingestion::processor::spawn_document_processing;
+use crate::ingestion::jobs::{IngestionWorkerConfig, enqueue_job_tx, retry_failed_document};
 use crate::retrieval::outbox::enqueue_delete_by_document;
 use crate::state::AppState;
 use crate::storage::build_original_document_object_key;
@@ -47,6 +47,8 @@ pub struct DocumentResponse {
     pub filename: String,
     pub status: String,
     pub processing_stage: String,
+    pub failure_code: Option<String>,
+    pub failure_message: Option<String>,
     pub created_at: NaiveDateTime,
 }
 
@@ -56,6 +58,8 @@ struct DocumentListRow {
     filename: String,
     status: String,
     processing_stage: String,
+    failure_code: Option<String>,
+    failure_message: Option<String>,
     created_at: NaiveDateTime,
     access_mode: String,
 }
@@ -99,7 +103,6 @@ struct DocumentDeleteTarget {
 
 #[derive(sqlx::FromRow)]
 struct RetryDocumentRow {
-    status: String,
     object_key: String,
 }
 
@@ -394,6 +397,8 @@ pub async fn list_documents(
                     filename: row.filename,
                     status: row.status,
                     processing_stage: row.processing_stage,
+                    failure_code: row.failure_code,
+                    failure_message: row.failure_message,
                     created_at: row.created_at,
                 })
                 .collect();
@@ -953,7 +958,7 @@ pub async fn retry_document_ingestion(
 
     let document_row: Result<Option<RetryDocumentRow>, sqlx::Error> = sqlx::query_as(
         r#"
-        SELECT status, object_key
+        SELECT object_key
         FROM documents
         WHERE id = $1 AND workspace_id = $2
         "#,
@@ -978,10 +983,6 @@ pub async fn retry_document_ingestion(
         }
     };
 
-    if document_row.status != "FAILED" {
-        return (StatusCode::CONFLICT, "Document is not in a failed state").into_response();
-    }
-
     match state.storage.object_exists(&document_row.object_key).await {
         Ok(true) => {}
         Ok(false) => {
@@ -1005,36 +1006,34 @@ pub async fn retry_document_ingestion(
         }
     }
 
-    if let Err(err) = sqlx::query(
-        r#"
-        UPDATE documents
-        SET status = 'PROCESSING', processing_stage = 'QUEUED'
-        WHERE id = $1 AND workspace_id = $2
-        "#,
-    )
-    .bind(document_id)
-    .bind(workspace_id)
-    .execute(&state.pool)
-    .await
-    {
-        error!(
-            error = %err,
-            user_id = %authz.user_id,
-            workspace_id = %workspace_id,
-            document_id = %document_id,
-            "Failed to reset document status before retry"
-        );
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-
-    spawn_document_processing(
-        state.pool.clone(),
-        state.storage.clone(),
-        state.retrieval.clone(),
-        workspace_id,
+    let requeued = retry_failed_document(
+        &state.pool,
         document_id,
-        state.ingestion_limiter.clone(),
-    );
+        workspace_id,
+        IngestionWorkerConfig::from_env().max_attempts,
+    )
+    .await;
+    let requeued = match requeued {
+        Ok(requeued) => requeued,
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to reset document status before retry"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    if !requeued {
+        return ApiError {
+            status: StatusCode::CONFLICT,
+            code: "DOCUMENT_NOT_RETRYABLE",
+            message: "Document is not in a retryable failed state".to_string(),
+        }
+        .into_response();
+    }
 
     if let Err(err) = insert_audit_event(
         &state.pool,
@@ -1064,7 +1063,7 @@ async fn fetch_workspace_documents(
 ) -> Result<Vec<DocumentListRow>, sqlx::Error> {
     sqlx::query_as(
         r#"
-        SELECT id, filename, status, processing_stage, created_at, access_mode
+        SELECT id, filename, status, processing_stage, failure_code, failure_message, created_at, access_mode
         FROM documents
         WHERE workspace_id = $1
         ORDER BY created_at DESC
@@ -1225,6 +1224,14 @@ pub async fn upload_document(
             }
         };
 
+        let mut transaction = match state.pool.begin().await {
+            Ok(transaction) => transaction,
+            Err(err) => {
+                error!(error = %err, %workspace_id, %document_id, "Failed to begin upload database transaction");
+                let _ = state.storage.delete_object(&object_key).await;
+                continue;
+            }
+        };
         let insert_result = sqlx::query(
             r#"
             INSERT INTO documents (
@@ -1258,7 +1265,7 @@ pub async fn upload_document(
         .bind(&checksum_sha256)
         .bind(storage_etag.as_deref())
         .bind(&authz.user_id)
-        .execute(&state.pool)
+        .execute(&mut *transaction)
         .await;
 
         if let Err(err) = insert_result {
@@ -1282,6 +1289,25 @@ pub async fn upload_document(
                     "Failed to cleanup object after database insert failure"
                 );
             }
+            continue;
+        }
+
+        if let Err(err) = enqueue_job_tx(
+            &mut transaction,
+            document_id,
+            workspace_id,
+            IngestionWorkerConfig::from_env().max_attempts,
+        )
+        .await
+        {
+            error!(error = %err, %workspace_id, %document_id, "Failed to enqueue durable ingestion job during upload");
+            let _ = transaction.rollback().await;
+            let _ = state.storage.delete_object(&object_key).await;
+            continue;
+        }
+        if let Err(err) = transaction.commit().await {
+            error!(error = %err, %workspace_id, %document_id, "Failed to commit upload document and durable job");
+            let _ = state.storage.delete_object(&object_key).await;
             continue;
         }
 
@@ -1328,15 +1354,6 @@ pub async fn upload_document(
             }
             continue;
         }
-
-        spawn_document_processing(
-            state.pool.clone(),
-            state.storage.clone(),
-            state.retrieval.clone(),
-            workspace_id,
-            document_id,
-            state.ingestion_limiter.clone(),
-        );
 
         if let Err(err) = insert_audit_event(
             &state.pool,
