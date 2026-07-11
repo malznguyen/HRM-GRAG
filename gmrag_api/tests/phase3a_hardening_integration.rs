@@ -626,6 +626,14 @@ async fn clear_claimable_qdrant_outbox(pool: &sqlx::PgPool) {
     .unwrap();
 }
 
+/// Probe filter-delete rỗng: Qdrant reachable + collection tồn tại (LIFE-002 hard PROCESSED).
+async fn qdrant_empty_filter_delete_ready(retrieval: &RetrievalClient) -> bool {
+    retrieval
+        .delete_points_by_document(Uuid::new_v4(), Uuid::new_v4())
+        .await
+        .is_ok()
+}
+
 #[tokio::test]
 async fn qdrant_outbox_processor_processes_pending_document_delete() {
     let _guard = phase3a_test_lock().lock().await;
@@ -663,6 +671,166 @@ async fn qdrant_outbox_processor_processes_pending_document_delete() {
     assert!(
         status == "PROCESSED" || status == "FAILED",
         "unexpected status={status}"
+    );
+}
+
+/// LIFE-002: delete filter không match point → cùng durable row PROCESSED và xoá stale error.
+#[tokio::test]
+async fn qdrant_outbox_empty_delete_marks_same_row_processed_and_clears_error() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    clear_claimable_qdrant_outbox(&pool).await;
+
+    let retrieval = match RetrievalClient::from_env() {
+        Ok(client) => client,
+        Err(_) => {
+            eprintln!("skip: Qdrant retrieval config unavailable");
+            return;
+        }
+    };
+    if !qdrant_empty_filter_delete_ready(&retrieval).await {
+        eprintln!("skip: Qdrant unreachable or collection missing (LIFE-002 PROCESSED path)");
+        return;
+    }
+
+    let workspace_id = Uuid::new_v4();
+    let document_id = Uuid::new_v4();
+    // Seed FAILED + error: worker success phải clear error, không tạo row mới.
+    let event_id: Uuid = sqlx::query_scalar(
+        r#"
+        INSERT INTO qdrant_outbox (
+            event_type, payload, status, retry_count, error_message, next_attempt_at
+        )
+        VALUES (
+            'delete_by_document',
+            jsonb_build_object(
+                'workspace_id', $1::text,
+                'document_id', $2::text
+            ),
+            'FAILED',
+            1,
+            'qdrant_http_error',
+            CURRENT_TIMESTAMP
+        )
+        RETURNING id
+        "#,
+    )
+    .bind(workspace_id.to_string())
+    .bind(document_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let result = process_qdrant_outbox(&pool, &retrieval, QdrantOutboxProcessorConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(result.processed_rows, 1);
+    assert_eq!(result.failed_rows, 0);
+    assert_eq!(result.dead_rows, 0);
+    assert_eq!(result.fetched_rows, 1);
+
+    let row: (String, i32, Option<String>) = sqlx::query_as(
+        r#"
+        SELECT status, retry_count, error_message
+        FROM qdrant_outbox
+        WHERE id = $1
+        "#,
+    )
+    .bind(event_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        row.0, "PROCESSED",
+        "empty filter-delete must mark PROCESSED"
+    );
+    assert_eq!(row.1, 1, "retry_count must stay on the same durable row");
+    assert_eq!(
+        row.2, None,
+        "success must clear stale error_message on the same row"
+    );
+}
+
+/// LIFE-002: replay worker sau PROCESSED không claim lại / không đổi state durable.
+#[tokio::test]
+async fn qdrant_outbox_replay_after_processed_does_not_reclaim_row() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    clear_claimable_qdrant_outbox(&pool).await;
+
+    let retrieval = match RetrievalClient::from_env() {
+        Ok(client) => client,
+        Err(_) => {
+            eprintln!("skip: Qdrant retrieval config unavailable");
+            return;
+        }
+    };
+    if !qdrant_empty_filter_delete_ready(&retrieval).await {
+        eprintln!("skip: Qdrant unreachable or collection missing (LIFE-002 replay path)");
+        return;
+    }
+
+    let workspace_id = Uuid::new_v4();
+    let document_id = Uuid::new_v4();
+    let event_id = enqueue_delete_by_document(&pool, workspace_id, document_id)
+        .await
+        .unwrap();
+
+    let first = process_qdrant_outbox(&pool, &retrieval, QdrantOutboxProcessorConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(first.fetched_rows, 1);
+    assert_eq!(first.processed_rows, 1);
+    assert_eq!(first.failed_rows, 0);
+
+    let after_first: (String, i32, Option<String>, String) = sqlx::query_as(
+        r#"
+        SELECT status, retry_count, error_message, updated_at::text
+        FROM qdrant_outbox
+        WHERE id = $1
+        "#,
+    )
+    .bind(event_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after_first.0, "PROCESSED");
+    assert_eq!(after_first.1, 0);
+    assert_eq!(after_first.2, None);
+    let updated_at_after_first = after_first.3;
+
+    // Replay ngay: claim chỉ lấy PENDING/FAILED → row PROCESSED không được đụng.
+    let second = process_qdrant_outbox(&pool, &retrieval, QdrantOutboxProcessorConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        second.fetched_rows, 0,
+        "PROCESSED row must not be claimed again on replay"
+    );
+    assert_eq!(second.processed_rows, 0);
+    assert_eq!(second.failed_rows, 0);
+    assert_eq!(second.dead_rows, 0);
+
+    let after_second: (String, i32, Option<String>, String) = sqlx::query_as(
+        r#"
+        SELECT status, retry_count, error_message, updated_at::text
+        FROM qdrant_outbox
+        WHERE id = $1
+        "#,
+    )
+    .bind(event_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after_second.0, "PROCESSED");
+    assert_eq!(after_second.1, 0);
+    assert_eq!(after_second.2, None);
+    assert_eq!(
+        after_second.3, updated_at_after_first,
+        "replay must not mutate durable PROCESSED row (including updated_at)"
     );
 }
 
