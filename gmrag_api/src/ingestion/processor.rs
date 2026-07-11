@@ -138,11 +138,15 @@ async fn process_document(
                 char_count = text.chars().count(),
                 "Page text below threshold; invoking vision OCR fallback"
             );
-            let ocr_text = vision_ocr_fallback(&page.image_bytes).await;
-            if !text.is_empty() && !ocr_text.is_empty() {
-                text.push('\n');
+            // Production trả None — không append chữ giả; OCR thật / NEEDS_OCR thuộc task sau
+            if let Some(ocr_text) = vision_ocr_fallback(&page.image_bytes).await {
+                if !ocr_text.is_empty() {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&ocr_text);
+                }
             }
-            text.push_str(&ocr_text);
         }
 
         page_texts.push(text);
