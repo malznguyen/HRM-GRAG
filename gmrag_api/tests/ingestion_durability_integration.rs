@@ -694,6 +694,62 @@ async fn non_retryable_failure_marks_document_dead_immediately() {
 }
 
 #[tokio::test]
+async fn needs_ocr_failure_persists_job_dead_and_document_failed() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skip: DATABASE_URL unavailable");
+        return;
+    };
+    let (workspace_id, document_id, user_id) = seed_document(&pool, "PROCESSING").await;
+    let config = test_worker_config(5);
+    let job = enqueue_and_claim(&pool, workspace_id, document_id, "worker-needs-ocr", config).await;
+
+    let (code, message, retryable) = ProcessError::NeedsOcr.failure_kind();
+    assert_eq!(code, "NEEDS_OCR");
+    assert!(!retryable);
+
+    assert_eq!(
+        finish_job_failure(
+            &pool,
+            &job,
+            "worker-needs-ocr",
+            JobFailure {
+                code,
+                message,
+                retryable,
+            },
+            config,
+        )
+        .await
+        .unwrap(),
+        Some(true)
+    );
+
+    let terminal: (String, String, String, String, Option<String>) = sqlx::query_as(
+        "SELECT job.status, document.status, document.processing_stage, document.failure_code, document.failure_message FROM ingestion_jobs job JOIN documents document ON document.id = job.document_id WHERE job.id = $1",
+    )
+    .bind(job.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(terminal.0, "DEAD");
+    assert_eq!(terminal.1, "FAILED");
+    assert_eq!(terminal.2, "FAILED");
+    assert_eq!(terminal.3, "NEEDS_OCR");
+    assert_eq!(
+        terminal.4.as_deref(),
+        Some("Document requires OCR and no OCR provider is available")
+    );
+    assert!(
+        claim_document_job(&pool, "worker-no-auto-retry", config, document_id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "NEEDS_OCR must not re-enter the worker claim loop"
+    );
+    cleanup(&pool, workspace_id, &user_id).await;
+}
+
+#[tokio::test]
 async fn two_workers_claim_one_job_and_stale_owner_cannot_update() {
     let Some(pool) = pool_or_skip().await else {
         eprintln!("skip: DATABASE_URL unavailable");

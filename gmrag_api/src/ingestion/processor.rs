@@ -16,7 +16,7 @@ use super::graph::{
     GraphElement, GraphError, GraphWriteBatch, bulk_upsert_graph, extract_graph_elements,
 };
 use super::ocr::vision_ocr_fallback;
-use super::pdf_parser::{PdfParseError, extract_pdf_from_bytes};
+use super::pdf_parser::{PageExtract, PdfParseError, extract_pdf_from_bytes};
 use crate::ingestion::jobs::{
     ClaimedJob, STAGE_EMBEDDING, STAGE_GRAPH_EXTRACTION, STAGE_INDEXING, STAGE_PARSING,
     STAGE_SAVING, complete_job_and_document, set_stage_for_owner,
@@ -125,32 +125,19 @@ async fn process_document(
         "PDF parse completed"
     );
 
-    let mut page_texts: Vec<String> = Vec::with_capacity(extracted.pages.len());
-
-    for page in extracted.pages {
-        let mut text = page.text;
-
+    for page in &extracted.pages {
         if page.needs_ocr {
             tracing::warn!(
                 %workspace_id,
                 %document_id,
                 page = page.page_number,
-                char_count = text.chars().count(),
-                "Page text below threshold; invoking vision OCR fallback"
+                char_count = page.text.chars().count(),
+                "Page text below threshold; OCR required"
             );
-            // Production trả None — không append chữ giả; OCR thật / NEEDS_OCR thuộc task sau
-            if let Some(ocr_text) = vision_ocr_fallback(&page.image_bytes).await {
-                if !ocr_text.is_empty() {
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                    text.push_str(&ocr_text);
-                }
-            }
         }
-
-        page_texts.push(text);
     }
+
+    let page_texts = resolve_pages_for_chunking(extracted.pages).await?;
 
     let chunk_started = Instant::now();
     let chunks = chunk_page_texts(&page_texts).map_err(ProcessError::Chunk)?;
@@ -1186,21 +1173,75 @@ struct ChunkRow {
     embedding: Vec<f32>,
 }
 
+/// Trang `needs_ocr` thiếu OCR usable → `NeedsOcr` (terminal, không auto-retry).
+pub fn finalize_page_text(
+    page: &PageExtract,
+    ocr_text: Option<&str>,
+) -> Result<String, ProcessError> {
+    if !page.needs_ocr {
+        return Ok(page.text.clone());
+    }
+
+    match ocr_text {
+        Some(ocr) if !ocr.trim().is_empty() => {
+            let mut text = page.text.clone();
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(ocr);
+            Ok(text)
+        }
+        _ => Err(ProcessError::NeedsOcr),
+    }
+}
+
+/// Dừng trước chunk/embed khi còn trang cần OCR mà không có kết quả usable.
+pub async fn resolve_pages_for_chunking(
+    pages: Vec<PageExtract>,
+) -> Result<Vec<String>, ProcessError> {
+    let mut page_texts: Vec<String> = Vec::with_capacity(pages.len());
+
+    for page in pages {
+        let ocr_text = if page.needs_ocr {
+            vision_ocr_fallback(&page.image_bytes).await
+        } else {
+            None
+        };
+        page_texts.push(finalize_page_text(&page, ocr_text.as_deref())?);
+    }
+
+    Ok(page_texts)
+}
+
 #[derive(Debug)]
 pub enum ProcessError {
     LeaseLost,
     Join,
-    DocumentNotFound { document_id: Uuid },
-    DocumentObjectMissing { object_key: String },
+    DocumentNotFound {
+        document_id: Uuid,
+    },
+    DocumentObjectMissing {
+        object_key: String,
+    },
+    /// Cần OCR nhưng chưa có kết quả usable (chưa có provider production).
+    NeedsOcr,
     Storage(StorageError),
     Parse(PdfParseError),
-    ParseTimeout { timeout_secs: u64 },
+    ParseTimeout {
+        timeout_secs: u64,
+    },
     Chunk(ChunkError),
     Embed(EmbedError),
-    EmbedTimeout { timeout_secs: u64 },
-    MissingEmbedding { chunk_index: usize },
+    EmbedTimeout {
+        timeout_secs: u64,
+    },
+    MissingEmbedding {
+        chunk_index: usize,
+    },
     Graph(GraphError),
-    GraphTimeout { timeout_secs: u64 },
+    GraphTimeout {
+        timeout_secs: u64,
+    },
     Retrieval(RetrievalError),
     Database(sqlx::Error),
 }
@@ -1215,6 +1256,12 @@ impl std::fmt::Display for ProcessError {
             }
             ProcessError::DocumentObjectMissing { object_key } => {
                 write!(f, "document object missing in storage: {object_key}")
+            }
+            ProcessError::NeedsOcr => {
+                write!(
+                    f,
+                    "document requires OCR and no usable OCR result is available"
+                )
             }
             ProcessError::Storage(err) => write!(f, "storage error: {err}"),
             ProcessError::Parse(e) => write!(f, "{e}"),
@@ -1256,6 +1303,12 @@ impl ProcessError {
                 "Original document object is missing",
                 false,
             ),
+            // Không auto-retry khi chưa có OCR provider (admin retry sau OCR-003+)
+            Self::NeedsOcr => (
+                "NEEDS_OCR",
+                "Document requires OCR and no OCR provider is available",
+                false,
+            ),
             Self::Parse(_) | Self::ParseTimeout { .. } | Self::Chunk(_) => {
                 ("PDF_PARSE_FAILED", "The PDF could not be parsed", false)
             }
@@ -1290,5 +1343,48 @@ impl ProcessError {
                 true,
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod needs_ocr_tests {
+    use super::*;
+
+    fn low_text_page(text: &str) -> PageExtract {
+        PageExtract {
+            page_number: 1,
+            text: text.to_string(),
+            needs_ocr: true,
+            image_bytes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn needs_ocr_failure_kind_is_stable_and_non_retryable() {
+        let (code, message, retryable) = ProcessError::NeedsOcr.failure_kind();
+        assert_eq!(code, "NEEDS_OCR");
+        assert_eq!(
+            message,
+            "Document requires OCR and no OCR provider is available"
+        );
+        assert!(!retryable);
+        assert!(message.chars().count() <= 240);
+    }
+
+    #[test]
+    fn finalize_page_text_appends_usable_ocr_or_fails_without() {
+        let page = low_text_page("native");
+        assert_eq!(
+            finalize_page_text(&page, Some("from ocr")).expect("usable OCR"),
+            "native\nfrom ocr"
+        );
+        assert!(matches!(
+            finalize_page_text(&page, None).unwrap_err(),
+            ProcessError::NeedsOcr
+        ));
+        assert!(matches!(
+            finalize_page_text(&page, Some("   \t")).unwrap_err(),
+            ProcessError::NeedsOcr
+        ));
     }
 }

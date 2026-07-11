@@ -312,6 +312,27 @@ Qdrant indexing, retry/backoff, lease recovery, and terminal failure updates.
 Retryable failures keep the document `PROCESSING` / `QUEUED`; non-retryable or
 exhausted failures set `FAILED` / `FAILED` with a structured `failure_code`.
 
+Stable document `failure_code` values currently emitted by the worker include:
+
+| `failure_code` | Meaning | Auto-retry |
+| --- | --- | --- |
+| `DOCUMENT_OBJECT_MISSING` | Original object absent in storage | No |
+| `NEEDS_OCR` | Page(s) need OCR and no usable OCR result is available (no production provider yet) | No |
+| `PDF_PARSE_FAILED` | PDF could not be parsed or chunked | No |
+| `EMBEDDING_PROVIDER_UNAVAILABLE` | Embeddings failed | Yes (until max attempts) |
+| `GRAPH_EXTRACTION_FAILED` | Graph extraction failed | Yes (until max attempts) |
+| `QDRANT_INDEX_FAILED` | Vector index failed | Yes (until max attempts) |
+| `DATABASE_SAVE_FAILED` | SQL persistence failed | Yes (until max attempts) |
+| `INTERNAL_INGESTION_ERROR` | Other internal ingestion error | Yes (until max attempts) |
+| `INGESTION_MAX_ATTEMPTS_EXCEEDED` | Retryable failure exhausted `max_attempts` | No (terminal after retries) |
+
+`NEEDS_OCR` is non-retryable for the worker while no OCR provider is configured,
+avoiding futile claim loops. After a future OCR provider/configuration change
+(OCR-003+), operators may re-queue via `POST .../documents/{document_id}/retry`
+(document must be terminal `FAILED`, object must still exist).
+`GET /workspaces/{workspace_id}/documents` already surfaces optional
+`failure_code` / `failure_message` on each row; no API schema change is required.
+
 ### `PATCH /workspaces/{workspace_id}/documents/{document_id}/access-mode`
 
 - Auth: bearer JWT.
