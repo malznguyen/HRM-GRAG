@@ -186,7 +186,7 @@ pub async fn enqueue_delete_object_tx(
     enqueue_event_tx(tx, StorageOutboxEventType::DeleteObject, payload).await
 }
 
-/// Enqueue `delete_prefix` (dùng sau LIFE-004/LIFE-005; không wire workspace delete ở LIFE-003).
+/// Enqueue `delete_prefix` (workspace delete: LIFE-004; tenant cascade: LIFE-005).
 pub async fn enqueue_delete_prefix(
     pool: &PgPool,
     prefix: &str,
