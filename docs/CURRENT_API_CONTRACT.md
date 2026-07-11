@@ -191,7 +191,7 @@ Payload limitation: points do not carry `tenant_id` (workspace list only). See
 - Request body: none.
 - Success: `204` empty body.
 - Errors: `403` JSON authz envelope; `404` empty body if the workspace row does not exist; `500` empty body on SQL failure.
-- Side effects: deletes the workspace row, cascades workspace data, best-effort deletes the `tenant -> workspace` tuple from OpenFGA, and best-effort deletes Qdrant points filtered by `workspace_id` (`wait=true` + short request timeout `QDRANT_DELETE_REQUEST_TIMEOUT_SECS`). On Qdrant failure/timeout, enqueues `qdrant_outbox` (`delete_by_workspace`) for operator recovery (worker uses longer `QDRANT_DELETE_WORKER_TIMEOUT_SECS`).
+- Side effects: deletes the workspace row and cascades workspace data in the same PostgreSQL transaction as inserting `qdrant_outbox` (`delete_by_workspace`), then best-effort deletes the `tenant -> workspace` tuple from OpenFGA and best-effort deletes Qdrant points filtered by `workspace_id` (`wait=true` + short request timeout `QDRANT_DELETE_REQUEST_TIMEOUT_SECS`). Qdrant failure/timeout does not fail HTTP once SQL has committed; worker recovery uses longer `QDRANT_DELETE_WORKER_TIMEOUT_SECS`.
 - Security notes: Qdrant cleanup runs after SQL commit; failures are logged and reflected in audit metadata (`qdrant_workspace_delete_succeeded`) and do not fail the HTTP delete once SQL has committed. Full object-storage prefix cleanup is not implemented yet.
 
 ## Workspace Members
@@ -292,8 +292,8 @@ Payload limitation: points do not carry `tenant_id` (workspace list only). See
 - Request body: none.
 - Success: `204` empty body.
 - Errors: `403` JSON authz envelope; `404` empty body if the document row does not exist in the workspace; `500` empty body on SQL failure.
-- Side effects: removes graph provenance and the document row in a SQL transaction, then best-effort deletes the storage object and Qdrant points for that `document_id` (filtered with `workspace_id` + `document_id`).
-- Security notes: storage and Qdrant deletes happen after SQL commit; Qdrant uses `wait=true` + short request timeout (`QDRANT_DELETE_REQUEST_TIMEOUT_SECS`) then enqueues `qdrant_outbox` on failure (worker retries with `QDRANT_DELETE_WORKER_TIMEOUT_SECS`). Cleanup failures are logged and reflected in audit metadata (`storage_delete_succeeded`, `qdrant_delete_succeeded`) for later remediation. They do not fail the HTTP delete once SQL has committed.
+- Side effects: removes graph provenance, the document row, and inserts `qdrant_outbox` (`delete_by_document`) in one SQL transaction, then best-effort deletes the storage object and Qdrant points for that `document_id` (filtered with `workspace_id` + `document_id`).
+- Security notes: storage and Qdrant deletes happen after SQL commit; Qdrant uses `wait=true` + short request timeout (`QDRANT_DELETE_REQUEST_TIMEOUT_SECS`). The outbox recovery row is committed with the SQL delete (LIFE-001); worker retries use `QDRANT_DELETE_WORKER_TIMEOUT_SECS`. Cleanup failures are logged and reflected in audit metadata (`storage_delete_succeeded`, `qdrant_delete_succeeded`) for later remediation. They do not fail the HTTP delete once SQL has committed.
 
 ### `POST /workspaces/{workspace_id}/documents/{document_id}/retry`
 

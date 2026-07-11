@@ -21,7 +21,7 @@ use crate::auth::document_acl::{
 };
 use crate::auth::outbox::enqueue_tuple_delete;
 use crate::ingestion::jobs::{IngestionWorkerConfig, enqueue_job_tx, retry_failed_document};
-use crate::retrieval::outbox::enqueue_delete_by_document;
+use crate::retrieval::outbox::enqueue_delete_by_document_tx;
 use crate::state::AppState;
 use crate::storage::build_original_document_object_key;
 
@@ -823,6 +823,10 @@ pub async fn delete_document(
         .execute(&mut *tx)
         .await?;
 
+        // Outbox cùng transaction với SQL delete — commit xong đã có recovery row
+        // dù process crash trước khi gọi Qdrant (LIFE-001).
+        enqueue_delete_by_document_tx(&mut tx, workspace_id, document_id).await?;
+
         tx.commit().await
     }
     .await;
@@ -874,9 +878,8 @@ pub async fn delete_document(
                     true
                 };
 
-            // SQL đã commit: không fail HTTP nếu Qdrant down/timeout; enqueue recovery.
-            // Dùng timeout ngắn (request path) — không block DELETE tới worker timeout;
-            // chậm/timeout → outbox, worker retry với timeout dài hơn.
+            // SQL + outbox đã commit: Qdrant best-effort sau commit; lỗi/timeout không
+            // fail HTTP (vẫn 204). Row outbox có thể còn PENDING cho worker (LIFE-002).
             let qdrant_delete_succeeded = if let Err(err) = state
                 .retrieval
                 .delete_points_by_document_for_request(workspace_id, document_id)
@@ -890,17 +893,6 @@ pub async fn delete_document(
                     request_timeout_secs = state.retrieval.delete_request_timeout_secs(),
                     "Failed to delete document points from Qdrant after database cleanup"
                 );
-
-                if let Err(outbox_err) =
-                    enqueue_delete_by_document(&state.pool, workspace_id, document_id).await
-                {
-                    error!(
-                        error = %outbox_err,
-                        workspace_id = %workspace_id,
-                        document_id = %document_id,
-                        "Failed to enqueue qdrant_outbox recovery for document delete"
-                    );
-                }
                 false
             } else {
                 true

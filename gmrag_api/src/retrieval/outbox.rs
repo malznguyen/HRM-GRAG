@@ -160,21 +160,44 @@ pub async fn enqueue_delete_by_document(
     workspace_id: Uuid,
     document_id: Uuid,
 ) -> Result<Uuid, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let id = enqueue_delete_by_document_tx(&mut tx, workspace_id, document_id).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Insert `delete_by_document` trong transaction lifecycle (cùng commit với SQL delete).
+pub async fn enqueue_delete_by_document_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    document_id: Uuid,
+) -> Result<Uuid, sqlx::Error> {
     let payload = json!({
         "workspace_id": workspace_id,
         "document_id": document_id,
     });
-    enqueue_event(pool, QdrantOutboxEventType::DeleteByDocument, payload).await
+    enqueue_event_tx(tx, QdrantOutboxEventType::DeleteByDocument, payload).await
 }
 
 pub async fn enqueue_delete_by_workspace(
     pool: &PgPool,
     workspace_id: Uuid,
 ) -> Result<Uuid, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let id = enqueue_delete_by_workspace_tx(&mut tx, workspace_id).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Insert `delete_by_workspace` trong transaction lifecycle (cùng commit với SQL delete).
+pub async fn enqueue_delete_by_workspace_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<Uuid, sqlx::Error> {
     let payload = json!({
         "workspace_id": workspace_id,
     });
-    enqueue_event(pool, QdrantOutboxEventType::DeleteByWorkspace, payload).await
+    enqueue_event_tx(tx, QdrantOutboxEventType::DeleteByWorkspace, payload).await
 }
 
 pub async fn enqueue_delete_by_workspaces(
@@ -184,11 +207,15 @@ pub async fn enqueue_delete_by_workspaces(
     let payload = json!({
         "workspace_ids": workspace_ids,
     });
-    enqueue_event(pool, QdrantOutboxEventType::DeleteByWorkspaces, payload).await
+    let mut tx = pool.begin().await?;
+    let id = enqueue_event_tx(&mut tx, QdrantOutboxEventType::DeleteByWorkspaces, payload).await?;
+    tx.commit().await?;
+    Ok(id)
 }
 
-async fn enqueue_event(
-    pool: &PgPool,
+/// Ghi outbox row trong transaction đang mở — rollback theo transaction cha.
+async fn enqueue_event_tx(
+    tx: &mut Transaction<'_, Postgres>,
     event_type: QdrantOutboxEventType,
     payload: Value,
 ) -> Result<Uuid, sqlx::Error> {
@@ -202,7 +229,7 @@ async fn enqueue_event(
     )
     .bind(event_type.as_str())
     .bind(payload)
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await
 }
 
