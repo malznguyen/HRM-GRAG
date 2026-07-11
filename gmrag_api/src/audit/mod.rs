@@ -32,6 +32,9 @@ pub enum AuditEventType {
     StorageCleanupDryRun,
     StorageCleanupCompleted,
     StorageCleanupFailed,
+    StorageOutboxProcessingStarted,
+    StorageOutboxProcessingCompleted,
+    StorageOutboxProcessingFailed,
     InvitePlaceholderCleanupDryRun,
     InvitePlaceholderCleanupCompleted,
     InvitePlaceholderCleanupFailed,
@@ -76,6 +79,11 @@ impl AuditEventType {
             AuditEventType::StorageCleanupDryRun => "storage_cleanup_dry_run",
             AuditEventType::StorageCleanupCompleted => "storage_cleanup_completed",
             AuditEventType::StorageCleanupFailed => "storage_cleanup_failed",
+            AuditEventType::StorageOutboxProcessingStarted => "storage_outbox_processing_started",
+            AuditEventType::StorageOutboxProcessingCompleted => {
+                "storage_outbox_processing_completed"
+            }
+            AuditEventType::StorageOutboxProcessingFailed => "storage_outbox_processing_failed",
             AuditEventType::InvitePlaceholderCleanupDryRun => "invite_placeholder_cleanup_dry_run",
             AuditEventType::InvitePlaceholderCleanupCompleted => {
                 "invite_placeholder_cleanup_completed"

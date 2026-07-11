@@ -1,4 +1,5 @@
 pub mod cleanup;
+pub mod outbox;
 
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::Client;
@@ -6,6 +7,7 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use std::fmt;
+use std::time::Duration;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +149,14 @@ pub struct StorageObjectInfo {
     pub size_bytes: Option<i64>,
 }
 
+/// Tuỳ chọn client (timeout/retry) — chủ yếu cho test outage fail-fast; production dùng default.
+#[derive(Debug, Clone, Default)]
+pub struct StorageClientOptions {
+    pub connect_timeout: Option<Duration>,
+    pub operation_timeout: Option<Duration>,
+    pub max_attempts: Option<u32>,
+}
+
 #[derive(Clone)]
 pub struct StorageClient {
     client: Client,
@@ -155,6 +165,13 @@ pub struct StorageClient {
 
 impl StorageClient {
     pub async fn from_config(config: StorageConfig) -> Self {
+        Self::from_config_with_options(config, StorageClientOptions::default()).await
+    }
+
+    pub async fn from_config_with_options(
+        config: StorageConfig,
+        options: StorageClientOptions,
+    ) -> Self {
         let credentials = aws_sdk_s3::config::Credentials::new(
             config.access_key_id,
             config.secret_access_key,
@@ -174,6 +191,23 @@ impl StorageClient {
 
         if let Some(endpoint_url) = config.endpoint_url {
             builder = builder.endpoint_url(endpoint_url);
+        }
+
+        if options.connect_timeout.is_some() || options.operation_timeout.is_some() {
+            let mut timeout_builder = aws_sdk_s3::config::timeout::TimeoutConfig::builder();
+            if let Some(connect_timeout) = options.connect_timeout {
+                timeout_builder = timeout_builder.connect_timeout(connect_timeout);
+            }
+            if let Some(operation_timeout) = options.operation_timeout {
+                timeout_builder = timeout_builder.operation_timeout(operation_timeout);
+            }
+            builder = builder.timeout_config(timeout_builder.build());
+        }
+
+        if let Some(max_attempts) = options.max_attempts {
+            builder = builder.retry_config(
+                aws_sdk_s3::config::retry::RetryConfig::standard().with_max_attempts(max_attempts),
+            );
         }
 
         let client = Client::from_conf(builder.build());
@@ -244,10 +278,20 @@ impl StorageClient {
         Ok(body.into_bytes().to_vec())
     }
 
+    /// Xóa object trong bucket mặc định của client (request-path / configured runtime).
     pub async fn delete_object(&self, object_key: &str) -> Result<(), StorageError> {
+        self.delete_object_in_bucket(&self.bucket, object_key).await
+    }
+
+    /// Xóa object trong bucket chỉ định — recovery outbox dùng `payload.bucket` từ SQL.
+    pub async fn delete_object_in_bucket(
+        &self,
+        bucket: &str,
+        object_key: &str,
+    ) -> Result<(), StorageError> {
         self.client
             .delete_object()
-            .bucket(&self.bucket)
+            .bucket(bucket)
             .key(object_key)
             .send()
             .await
@@ -280,11 +324,20 @@ impl StorageClient {
         &self,
         prefix: Option<&str>,
     ) -> Result<Vec<StorageObjectInfo>, StorageError> {
+        self.list_objects_in_bucket(&self.bucket, prefix).await
+    }
+
+    /// List object theo prefix trong bucket chỉ định (prefix cleanup recovery).
+    pub async fn list_objects_in_bucket(
+        &self,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> Result<Vec<StorageObjectInfo>, StorageError> {
         let mut continuation_token: Option<String> = None;
         let mut objects: Vec<StorageObjectInfo> = Vec::new();
 
         loop {
-            let mut request = self.client.list_objects_v2().bucket(&self.bucket);
+            let mut request = self.client.list_objects_v2().bucket(bucket);
             if let Some(prefix) = prefix {
                 request = request.prefix(prefix);
             }
@@ -298,7 +351,7 @@ impl StorageClient {
                 .map_err(|err| StorageError::OperationFailed {
                     message: format!(
                         "S3 list_objects_v2 failed for bucket={} prefix={}: {}",
-                        self.bucket,
+                        bucket,
                         prefix.unwrap_or_default(),
                         err
                     ),
@@ -330,6 +383,16 @@ impl StorageClient {
     }
 
     pub async fn delete_objects(&self, object_keys: &[String]) -> Result<usize, StorageError> {
+        self.delete_objects_in_bucket(&self.bucket, object_keys)
+            .await
+    }
+
+    /// Batch delete trong bucket chỉ định — không silent fallback sang bucket runtime.
+    pub async fn delete_objects_in_bucket(
+        &self,
+        bucket: &str,
+        object_keys: &[String],
+    ) -> Result<usize, StorageError> {
         if object_keys.is_empty() {
             return Ok(0);
         }
@@ -359,15 +422,12 @@ impl StorageClient {
             let response = self
                 .client
                 .delete_objects()
-                .bucket(&self.bucket)
+                .bucket(bucket)
                 .delete(delete_payload)
                 .send()
                 .await
                 .map_err(|err| StorageError::OperationFailed {
-                    message: format!(
-                        "S3 delete_objects failed for bucket={}: {}",
-                        self.bucket, err
-                    ),
+                    message: format!("S3 delete_objects failed for bucket={bucket}: {err}"),
                 })?;
 
             for err in response.errors() {

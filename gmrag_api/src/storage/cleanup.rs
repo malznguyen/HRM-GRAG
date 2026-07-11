@@ -156,7 +156,19 @@ pub async fn cleanup_prefix(
     prefix: String,
     allow_delete: bool,
 ) -> Result<PrefixCleanupReport, StorageCleanupError> {
-    let listed_objects = storage.list_objects(Some(&prefix)).await?;
+    cleanup_prefix_in_bucket(storage, storage.bucket(), prefix, allow_delete).await
+}
+
+/// Prefix cleanup trong bucket chỉ định (outbox recovery dùng `payload.bucket` từ SQL).
+pub async fn cleanup_prefix_in_bucket(
+    storage: &StorageClient,
+    bucket: &str,
+    prefix: String,
+    allow_delete: bool,
+) -> Result<PrefixCleanupReport, StorageCleanupError> {
+    let listed_objects = storage
+        .list_objects_in_bucket(bucket, Some(&prefix))
+        .await?;
     let object_keys: Vec<String> = listed_objects
         .iter()
         .map(|object| object.key.clone())
@@ -166,7 +178,9 @@ pub async fn cleanup_prefix(
     let deleted_objects = if keys_to_delete.is_empty() {
         0
     } else {
-        storage.delete_objects(&keys_to_delete).await?
+        storage
+            .delete_objects_in_bucket(bucket, &keys_to_delete)
+            .await?
     };
 
     Ok(PrefixCleanupReport {

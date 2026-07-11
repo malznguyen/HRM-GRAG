@@ -163,6 +163,7 @@ cargo run --bin report-identity-consistency
 
 # Phase 3B — Qdrant lifecycle / recovery
 cargo run --bin process-qdrant-outbox
+cargo run --bin process-storage-outbox
 cargo run --bin cleanup-qdrant-orphans -- --dry-run
 cargo run --bin cleanup-qdrant-orphans -- --delete
 cargo run --bin cleanup-qdrant-orphans -- --full-scan --dry-run
@@ -207,8 +208,8 @@ Identity E2E cleanup removes tracked SQL rows, Keycloak `e2e_` users, and OpenFG
 ## Current Implementation Notes
 
 - Original PDFs live in MinIO/S3; they are no longer stored on local disk as the source of truth.
-- Document delete performs SQL cleanup first and storage cleanup second on a best-effort basis.
+- Document delete performs SQL cleanup + `storage_outbox` / `qdrant_outbox` insert in one transaction, then best-effort storage/Qdrant cleanup after commit (LIFE-001 / LIFE-003).
 - Retry reads the original object from storage and returns `DOCUMENT_OBJECT_MISSING` when the object is gone.
 - Document-level ACL enforcement, restricted-document behavior, and Qdrant retrieval are fully implemented and verified.
-- Document/workspace delete is SQL-first then **best-effort** Qdrant filter-delete + outbox enqueue (not a distributed transaction). Recovery: `process-qdrant-outbox` / `cleanup-qdrant-orphans` — see `docs/RUNBOOK.md` §7.
+- Document/workspace delete is SQL-first with transactional outbox rows then **best-effort** S3/Qdrant cleanup (not a distributed transaction). Recovery: `process-storage-outbox` / `process-qdrant-outbox` / `cleanup-qdrant-orphans` — see `docs/RUNBOOK.md` §3 and §7. Workspace storage prefix auto-enqueue is LIFE-004; scheduled storage outbox is OPS-003.
 - Operator runbook for Phase 2/3A/3B (including Ollama, HNSW, graph node embedding backfill, and Qdrant outbox) is in `docs/RUNBOOK.md`.

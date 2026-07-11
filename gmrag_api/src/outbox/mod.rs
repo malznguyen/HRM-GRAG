@@ -1,7 +1,7 @@
 //! Logic dùng chung cho outbox processor (claim lease, exponential backoff, poison).
 //!
-//! Hiện qdrant_outbox dùng module này; authz_outbox có thể tái sử dụng sau
-//! mà không bắt buộc đổi schema/authz trong cùng PR.
+//! Hiện `qdrant_outbox` và `storage_outbox` dùng module này; authz_outbox có thể
+//! tái sử dụng sau mà không bắt buộc đổi schema/authz trong cùng PR.
 
 use std::time::Duration;
 

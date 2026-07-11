@@ -24,6 +24,7 @@ use crate::ingestion::jobs::{IngestionWorkerConfig, enqueue_job_tx, retry_failed
 use crate::retrieval::outbox::enqueue_delete_by_document_tx;
 use crate::state::AppState;
 use crate::storage::build_original_document_object_key;
+use crate::storage::outbox::enqueue_delete_object_tx;
 
 #[derive(Deserialize)]
 pub struct SetDocumentAccessModeRequest {
@@ -99,6 +100,7 @@ struct ChunkWithDocumentAclRow {
 #[derive(sqlx::FromRow)]
 struct DocumentDeleteTarget {
     object_key: String,
+    bucket: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -728,7 +730,7 @@ pub async fn delete_document(
 
     let delete_target: Result<Option<DocumentDeleteTarget>, sqlx::Error> = sqlx::query_as(
         r#"
-        SELECT object_key
+        SELECT object_key, bucket
         FROM documents
         WHERE id = $1 AND workspace_id = $2
         "#,
@@ -824,8 +826,16 @@ pub async fn delete_document(
         .await?;
 
         // Outbox cùng transaction với SQL delete — commit xong đã có recovery row
-        // dù process crash trước khi gọi Qdrant (LIFE-001).
+        // dù process crash trước khi gọi Qdrant/S3 (LIFE-001 / LIFE-003).
         enqueue_delete_by_document_tx(&mut tx, workspace_id, document_id).await?;
+        enqueue_delete_object_tx(
+            &mut tx,
+            &delete_target.object_key,
+            &delete_target.bucket,
+            workspace_id,
+            document_id,
+        )
+        .await?;
 
         tx.commit().await
     }
@@ -862,9 +872,9 @@ pub async fn delete_document(
                 }
             }
 
+            // Best-effort sau commit; outbox storage_outbox đã durable (LIFE-003).
             let storage_delete_succeeded =
                 if let Err(err) = state.storage.delete_object(&delete_target.object_key).await {
-                    // TODO: Phase 3 can bo sung cleanup worker/outbox de xu ly object con sot sau delete.
                     error!(
                         error = %err,
                         user_id = %authz.user_id,

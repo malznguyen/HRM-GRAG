@@ -292,8 +292,8 @@ Payload limitation: points do not carry `tenant_id` (workspace list only). See
 - Request body: none.
 - Success: `204` empty body.
 - Errors: `403` JSON authz envelope; `404` empty body if the document row does not exist in the workspace; `500` empty body on SQL failure.
-- Side effects: removes graph provenance, the document row, and inserts `qdrant_outbox` (`delete_by_document`) in one SQL transaction, then best-effort deletes the storage object and Qdrant points for that `document_id` (filtered with `workspace_id` + `document_id`).
-- Security notes: storage and Qdrant deletes happen after SQL commit; Qdrant uses `wait=true` + short request timeout (`QDRANT_DELETE_REQUEST_TIMEOUT_SECS`). The outbox recovery row is committed with the SQL delete (LIFE-001); worker retries use `QDRANT_DELETE_WORKER_TIMEOUT_SECS`. Cleanup failures are logged and reflected in audit metadata (`storage_delete_succeeded`, `qdrant_delete_succeeded`) for later remediation. They do not fail the HTTP delete once SQL has committed.
+- Side effects: removes graph provenance, the document row, and inserts `qdrant_outbox` (`delete_by_document`) plus `storage_outbox` (`delete_object` with SQL-captured `object_key`/`bucket`) in one SQL transaction, then best-effort deletes the storage object and Qdrant points for that `document_id` (filtered with `workspace_id` + `document_id`). HTTP remains `204` on storage/Qdrant failure after commit.
+- Security notes: storage and Qdrant deletes happen after SQL commit; Qdrant uses `wait=true` + short request timeout (`QDRANT_DELETE_REQUEST_TIMEOUT_SECS`). Qdrant recovery row is committed with the SQL delete (LIFE-001); storage recovery row is also committed with the SQL delete (LIFE-003). Worker retries: `process-qdrant-outbox` / `process-storage-outbox`. Cleanup failures are logged and reflected in audit metadata (`storage_delete_succeeded`, `qdrant_delete_succeeded`) for later remediation. They do not fail the HTTP delete once SQL has committed. Object keys are not exposed to the client.
 
 ### `POST /workspaces/{workspace_id}/documents/{document_id}/retry`
 
