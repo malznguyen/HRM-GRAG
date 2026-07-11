@@ -174,7 +174,7 @@ cargo run --bin backfill-graph-node-embeddings -- --apply
 ```
 
 - **Qdrant outbox:** claim with `FOR UPDATE SKIP LOCKED` + lease, exponential backoff on `FAILED`, status `DEAD` for poison/exhausted retries. See `docs/RUNBOOK.md` §7 (env vars, DEAD inspection, dual-write caveat).
-- **Orphan cleanup:** prioritizes outbox (`PENDING`/`FAILED`/`DEAD`) + failed audit deletes; optional expensive `--full-scan`. Default dry-run; mutations need `--delete`.
+- **Orphan cleanup (LIFE-006):** storage full list vs SQL (`cleanup-storage-objects`) and Qdrant outbox/audit/`--full-scan` (`cleanup-qdrant-orphans`). Default dry-run; mutations need explicit `--delete` (storage also `--delete-orphans`). Idempotent re-run. Unattended schedule = OPS-002/OPS-003, not automatic.
 - Graph node embedding backfill fills legacy `graph_nodes.embedding IS NULL` only (manual; default dry-run). See `docs/RUNBOOK.md` §10. HNSW apply notes: §9.
 
 ## Test Commands
