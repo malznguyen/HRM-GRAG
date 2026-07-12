@@ -8,17 +8,21 @@ use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
+const DEFAULT_LOOP_INTERVAL_SECS: u64 = 3600;
+
 #[derive(Debug, Default)]
 struct CleanupArgs {
     dry_run: bool,
     delete: bool,
     delete_orphans: bool,
+    loop_mode: bool,
+    interval_secs: u64,
     workspace_id: Option<Uuid>,
     tenant_id: Option<Uuid>,
     mark_missing_documents_failed: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum CleanupMode {
     Scan,
     WorkspacePrefix {
@@ -55,6 +59,12 @@ async fn main() {
         }
     };
 
+    if let Err(message) = validate_args(&args) {
+        eprintln!("{message}");
+        print_usage();
+        std::process::exit(1);
+    }
+
     let mode = match resolve_mode(&args) {
         Ok(mode) => mode,
         Err(message) => {
@@ -78,6 +88,11 @@ async fn main() {
 
     let storage_config = StorageConfig::from_env().expect("Failed to load storage config");
     let storage = StorageClient::from_config(storage_config).await;
+
+    if args.loop_mode {
+        run_loop(&pool, &storage, &args, mode).await;
+        return;
+    }
 
     let operation_result = run_cleanup(&pool, &storage, &args, mode).await;
 
@@ -111,6 +126,58 @@ async fn main() {
             .await;
 
             std::process::exit(1);
+        }
+    }
+}
+
+async fn run_loop(
+    pool: &sqlx::PgPool,
+    storage: &StorageClient,
+    args: &CleanupArgs,
+    mode: CleanupMode,
+) {
+    let interval = std::time::Duration::from_secs(args.interval_secs);
+
+    loop {
+        let result = run_cleanup(pool, storage, args, mode.clone()).await;
+        match result {
+            Ok(metadata) => {
+                let _ = insert_audit_event(
+                    pool,
+                    AuditEventRecord::new(AuditEventType::StorageOrphanScanReport).with_metadata(
+                        json!({
+                            "success": true,
+                            "interval_secs": args.interval_secs,
+                            "report": metadata
+                        }),
+                    ),
+                )
+                .await;
+            }
+            Err(err) => {
+                let _ = insert_audit_event(
+                    pool,
+                    AuditEventRecord::new(AuditEventType::StorageOrphanScanReport).with_metadata(
+                        json!({
+                            "success": false,
+                            "interval_secs": args.interval_secs,
+                            "error_code": sanitize_error_code(&err.to_string())
+                        }),
+                    ),
+                )
+                .await;
+
+                eprintln!("Storage orphan scan failed: {err}");
+                std::process::exit(1);
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                println!("Received shutdown signal; stopping storage-orphan-scan");
+                return;
+            }
+            _ = tokio::time::sleep(interval) => {}
         }
     }
 }
@@ -240,6 +307,7 @@ fn print_prefix_report(scope: &str, report: &PrefixCleanupReport, delete_enabled
 fn parse_args(args: impl Iterator<Item = String>) -> Result<CleanupArgs, String> {
     let mut parsed = CleanupArgs {
         dry_run: true,
+        interval_secs: DEFAULT_LOOP_INTERVAL_SECS,
         ..CleanupArgs::default()
     };
 
@@ -257,6 +325,15 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CleanupArgs, String>
             }
             "--delete-orphans" => {
                 parsed.delete_orphans = true;
+            }
+            "--loop" => {
+                parsed.loop_mode = true;
+            }
+            "--interval-secs" => {
+                let Some(value) = pending.next() else {
+                    return Err("Missing value for --interval-secs".to_string());
+                };
+                parsed.interval_secs = parse_interval_secs(&value)?;
             }
             "--mark-missing-documents-failed" => {
                 parsed.mark_missing_documents_failed = true;
@@ -281,6 +358,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CleanupArgs, String>
                 let value = arg.trim_start_matches("--tenant-id=");
                 parsed.tenant_id = Some(parse_uuid_arg("--tenant-id", value)?);
             }
+            _ if arg.starts_with("--interval-secs=") => {
+                let value = arg.trim_start_matches("--interval-secs=");
+                parsed.interval_secs = parse_interval_secs(value)?;
+            }
             _ => {
                 return Err(format!("Unknown argument: {arg}"));
             }
@@ -288,6 +369,44 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<CleanupArgs, String>
     }
 
     Ok(parsed)
+}
+
+fn validate_args(args: &CleanupArgs) -> Result<(), String> {
+    if !args.loop_mode {
+        return Ok(());
+    }
+
+    let mut destructive_flags = Vec::new();
+    if args.delete {
+        destructive_flags.push("--delete");
+    }
+    if args.delete_orphans {
+        destructive_flags.push("--delete-orphans");
+    }
+    if args.mark_missing_documents_failed {
+        destructive_flags.push("--mark-missing-documents-failed");
+    }
+
+    if destructive_flags.is_empty() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "--loop chỉ hỗ trợ dry-run/report; không được dùng cùng {}",
+        destructive_flags.join(", ")
+    ))
+}
+
+fn parse_interval_secs(value: &str) -> Result<u64, String> {
+    let interval_secs = value
+        .parse::<u64>()
+        .map_err(|_| format!("Invalid value for --interval-secs: {value}"))?;
+
+    if interval_secs == 0 {
+        return Err("--interval-secs must be greater than zero".to_string());
+    }
+
+    Ok(interval_secs)
 }
 
 fn resolve_mode(args: &CleanupArgs) -> Result<CleanupMode, String> {
@@ -327,8 +446,38 @@ options:
   --dry-run
   --delete
   --delete-orphans
+  --loop
+  --interval-secs <seconds>
   --workspace-id <uuid>
   --tenant-id <uuid>
   --mark-missing-documents-failed"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loop_rejects_destructive_flags_before_startup() {
+        let args = parse_args(["--loop", "--delete"].into_iter().map(String::from)).unwrap();
+
+        let error = validate_args(&args).unwrap_err();
+
+        assert!(error.contains("--loop"));
+        assert!(error.contains("--delete"));
+    }
+
+    #[test]
+    fn loop_accepts_dry_run_with_interval() {
+        let args = parse_args(
+            ["--loop", "--dry-run", "--interval-secs=7"]
+                .into_iter()
+                .map(String::from),
+        )
+        .unwrap();
+
+        assert!(validate_args(&args).is_ok());
+        assert_eq!(args.interval_secs, 7);
+    }
 }

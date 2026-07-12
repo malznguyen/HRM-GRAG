@@ -32,6 +32,7 @@ pub enum AuditEventType {
     StorageCleanupDryRun,
     StorageCleanupCompleted,
     StorageCleanupFailed,
+    StorageOrphanScanReport,
     StorageOutboxProcessingStarted,
     StorageOutboxProcessingCompleted,
     StorageOutboxProcessingFailed,
@@ -83,6 +84,7 @@ impl AuditEventType {
             AuditEventType::StorageCleanupDryRun => "storage_cleanup_dry_run",
             AuditEventType::StorageCleanupCompleted => "storage_cleanup_completed",
             AuditEventType::StorageCleanupFailed => "storage_cleanup_failed",
+            AuditEventType::StorageOrphanScanReport => "storage_orphan_scan_report",
             AuditEventType::StorageOutboxProcessingStarted => "storage_outbox_processing_started",
             AuditEventType::StorageOutboxProcessingCompleted => {
                 "storage_outbox_processing_completed"

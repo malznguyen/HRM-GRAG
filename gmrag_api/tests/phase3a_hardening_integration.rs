@@ -1,3 +1,4 @@
+use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 
 use reqwest::Client;
@@ -301,6 +302,97 @@ async fn storage_cleanup_dry_run_lists_orphan_without_deleting_it() {
         .unwrap();
 
     assert!(report.orphan_object_keys.contains(&object_key));
+    assert!(storage.object_exists(&object_key).await.unwrap());
+
+    let _ = storage.delete_object(&object_key).await;
+}
+
+#[tokio::test]
+async fn storage_orphan_scan_loop_reports_each_round_without_deleting_objects() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    let storage = setup_storage().await;
+
+    let object_key = format!("ops003/{}.pdf", Uuid::new_v4());
+    storage
+        .put_original_document(
+            &object_key,
+            sample_pdf_bytes().as_slice(),
+            Some("application/pdf"),
+        )
+        .await
+        .unwrap();
+
+    let before_reports: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM audit_events WHERE event_type = 'storage_orphan_scan_report'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let binary_path = std::env::var("CARGO_BIN_EXE_cleanup-storage-objects")
+        .expect("Cargo must expose the cleanup-storage-objects binary for integration tests");
+    let mut child = tokio::process::Command::new(binary_path)
+        .args(["--loop", "--dry-run", "--interval-secs", "2"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let report_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM audit_events WHERE event_type = 'storage_orphan_scan_report'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        if report_count - before_reports >= 2 {
+            break;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            let _ = child.kill().await;
+            let output = child.wait_with_output().await.unwrap();
+            panic!(
+                "storage orphan scan loop did not report twice: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    let _ = child.kill().await;
+    let _ = child.wait_with_output().await.unwrap();
+
+    let after_reports: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM audit_events WHERE event_type = 'storage_orphan_scan_report'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after_reports - before_reports, 2);
+
+    let report_metadata: Vec<(serde_json::Value,)> = sqlx::query_as(
+        r#"
+        SELECT metadata
+        FROM audit_events
+        WHERE event_type = 'storage_orphan_scan_report'
+        ORDER BY created_at DESC
+        LIMIT 2
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        report_metadata
+            .iter()
+            .all(|(metadata,)| !metadata.to_string().contains("object_key"))
+    );
     assert!(storage.object_exists(&object_key).await.unwrap());
 
     let _ = storage.delete_object(&object_key).await;

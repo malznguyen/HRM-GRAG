@@ -108,3 +108,30 @@ services:
     volumes:
       # File phải tên <realm>-realm.json theo convention import-at-startup của Keycloak
       - ./docker/keycloak/gmrag-realm.json:/opt/keycloak/data/import/gmrag-realm.json:ro
+
+  # Storage orphan scan (local demo). Chỉ dry-run/report, không tự động xoá object.
+  storage-orphan-scan:
+    build:
+      context: ./gmrag_api
+      dockerfile: ../docker/outbox-workers.Dockerfile
+    image: gmrag/outbox-workers:local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-gmrag_user}:${POSTGRES_PASSWORD:-change_me}@postgres:5432/${POSTGRES_DB:-gmrag}
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-gmrag-documents}
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      S3_PRESIGN_EXPIRY_SECS: ${S3_PRESIGN_EXPIRY_SECS:-900}
+      STORAGE_ORPHAN_SCAN_INTERVAL_SECS: ${STORAGE_ORPHAN_SCAN_INTERVAL_SECS:-3600}
+      RUST_LOG: ${RUST_LOG:-info}
+    command:
+      ["/usr/local/bin/cleanup-storage-objects", "--loop", "--dry-run", "--interval-secs", "${STORAGE_ORPHAN_SCAN_INTERVAL_SECS:-3600}"]
+    stop_grace_period: 30s
