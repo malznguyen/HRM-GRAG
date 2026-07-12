@@ -1,5 +1,6 @@
 pub mod cleanup;
 pub mod outbox;
+pub mod outbox_health;
 
 use std::collections::HashSet;
 use std::fmt;
