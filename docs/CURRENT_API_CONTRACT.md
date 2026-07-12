@@ -58,6 +58,17 @@ The API is partially standardized today.
 - `DELETE /workspaces/{workspace_id}/members/{member_id}` returns JSON envelopes for `500 AUTHZ_REVOKE_FAILED` and `500 MEMBER_REMOVE_FAILED` (fail-closed revoke; see Workspace Members).
 - Many validation, not-found, and internal errors still return plain text or an empty body.
 
+### Rate Limiting
+
+- Current middleware applies in-memory sliding-window limits on selected routes:
+  - `POST /workspaces/{workspace_id}/chat`
+  - `POST /workspaces/{workspace_id}/documents/upload`
+  - auth-sensitive routes: `POST /users/sync`, `POST /tenants`, `POST /tenants/{tenant_id}/owners`, `POST /workspaces/{workspace_id}/members`, `PATCH /workspaces/{workspace_id}/members/{member_id}`, `DELETE /workspaces/{workspace_id}/members/{member_id}`.
+- User-scoped keys are derived from verified JWT `sub`; tenant-owner bootstrap route uses tenant-scoped keys (`tenant_id`).
+- Limit breach returns `429` JSON envelope:
+  - `{"error":{"code":"RATE_LIMITED","message":"Too many requests. Please retry later."}}`
+- Config envs: `RATE_LIMIT_WINDOW_SECS`, `RATE_LIMIT_CHAT_PER_WINDOW`, `RATE_LIMIT_UPLOAD_PER_WINDOW`, `RATE_LIMIT_AUTH_PER_WINDOW`.
+
 ### Current Storage Contract
 
 - Upload stores original PDFs in MinIO/S3 through the storage module.

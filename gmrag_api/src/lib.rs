@@ -6,6 +6,7 @@ pub mod ingestion;
 pub mod invite;
 pub mod invite_cleanup;
 pub mod outbox;
+pub mod rate_limit;
 pub mod retrieval;
 pub mod routes;
 pub mod state;
@@ -249,6 +250,7 @@ async fn check_dependency(
 pub fn app_router(state: AppState) -> Router {
     const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
     let cors = cors_layer();
+    let rate_limit_layer = axum::middleware::from_fn(rate_limit::enforce_rate_limits);
     telemetry::init_metrics_recorder();
 
     Router::new()
@@ -320,6 +322,7 @@ pub fn app_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(
             telemetry::http_metrics_middleware,
         ))
+        .layer(rate_limit_layer)
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(cors)
         .with_state(state)
