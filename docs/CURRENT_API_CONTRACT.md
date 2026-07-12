@@ -431,6 +431,7 @@ avoiding futile claim loops. After a future OCR provider/configuration change
 - Errors: `400` plain text `Message is required`; `403` JSON authz envelope or plain text `Chat session not accessible`; `502` plain text for embedding or generation failures; `500` plain text or empty body on DB failure.
 - Side effects: ensures the chat session, persists the user message, builds RAG context, streams model tokens, resolves citations, and persists the assistant message after streaming.
 - Security notes: retrieval is ACL-scoped and uses Qdrant filter-then-search to ensure only permitted chunks are processed, backed by OpenFGA viewer permission re-checks.
+- Timeout/cancellation notes: DeepSeek request establishment is bounded by `DEEPSEEK_REQUEST_TIMEOUT_SECS`; stream idle gaps are bounded by `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS`; when the SSE client disconnects, the upstream stream is dropped/cancelled by connection teardown.
 
 Current SSE events:
 

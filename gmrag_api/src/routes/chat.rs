@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::authz::{Authz, Object, Relation};
-use crate::chat::deepseek::{DeepseekTokenParser, next_stream_token};
+use crate::chat::deepseek::{DeepseekTokenParser, deepseek_stream_idle_timeout, next_stream_token};
 use crate::chat::retrieval::{StoredChatMessage, fetch_session_chat_messages};
 use crate::chat::{
     ChatPipelineError, SessionError, build_chat_context, delete_chat_session, ensure_chat_session,
@@ -300,13 +300,14 @@ pub async fn workspace_chat(
     let session_id = body.session_id;
     let chunk_ids = context.chunk_ids;
     let byte_stream = deepseek_response.bytes_stream();
+    let idle_timeout = deepseek_stream_idle_timeout();
 
     let event_stream = async_stream::stream! {
         let mut byte_stream = byte_stream;
         let mut parser = DeepseekTokenParser::new();
         let mut assistant_buffer = String::new();
 
-        while let Some(token_result) = next_stream_token(&mut byte_stream, &mut parser).await {
+        while let Some(token_result) = next_stream_token(&mut byte_stream, &mut parser, idle_timeout).await {
             match token_result {
                 Ok(token) => {
                     assistant_buffer.push_str(&token);
