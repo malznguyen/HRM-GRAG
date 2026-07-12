@@ -6,3 +6,4 @@ pub mod jobs;
 pub mod ocr;
 pub mod pdf_parser;
 pub mod processor;
+pub mod stuck_health;
