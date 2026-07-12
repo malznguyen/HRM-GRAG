@@ -245,6 +245,23 @@ impl RetrievalClient {
         self.config.top_k
     }
 
+    pub async fn readiness_probe(&self) -> Result<(), RetrievalError> {
+        let url = format!("{}/collections", self.config.qdrant_url);
+        let request = self.http.get(url);
+        let response = self.with_auth_header(request).send().await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        Err(RetrievalError::Api {
+            status,
+            body,
+            operation: "collections_list",
+        })
+    }
+
     pub async fn upsert_chunk_points(&self, points: &[ChunkPoint]) -> Result<(), RetrievalError> {
         if points.is_empty() {
             return Ok(());

@@ -67,6 +67,7 @@ The API is partially standardized today.
 | Method | Path | Authorization |
 | --- | --- | --- |
 | `GET` | `/health` | public |
+| `GET` | `/ready` | public |
 | `GET` | `/users/me` | authenticated user |
 | `POST` | `/users/sync` | authenticated user |
 | `POST` | `/tenants` | `admin` on `platform:system` |
@@ -105,6 +106,17 @@ The API is partially standardized today.
 - Errors: `500` empty body if `SELECT 1` fails.
 - Side effects: none.
 - Security notes: safe public liveness check only.
+
+### `GET /ready`
+
+- Auth: none.
+- Authorization: none.
+- Request body: none.
+- Success: `200` with JSON `{ status: "ready", role, dependencies, failed_dependencies }` when every required dependency for `APP_RUNTIME_ROLE` is healthy.
+- Errors: `503` with the same JSON shape and `status: "not_ready"` when one or more required dependencies fail.
+- Dependency matrix by role: `api` requires PostgreSQL + OpenFGA; `ingestion-worker` requires PostgreSQL + Qdrant + object storage; `process-authz-outbox` requires PostgreSQL + OpenFGA; `process-qdrant-outbox` requires PostgreSQL + Qdrant; `storage-worker` requires PostgreSQL + object storage.
+- Side effects: none.
+- Security notes: dependency checks are metadata only (no mutation); this endpoint is intended for orchestrator readiness probes.
 
 ## User Endpoints
 

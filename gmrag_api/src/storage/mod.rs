@@ -222,6 +222,18 @@ impl StorageClient {
         &self.bucket
     }
 
+    pub async fn readiness_probe(&self) -> Result<(), StorageError> {
+        self.client
+            .head_bucket()
+            .bucket(&self.bucket)
+            .send()
+            .await
+            .map_err(|err| StorageError::OperationFailed {
+                message: format!("S3 head_bucket failed for bucket={}: {}", self.bucket, err),
+            })?;
+        Ok(())
+    }
+
     pub async fn put_original_document(
         &self,
         object_key: &str,

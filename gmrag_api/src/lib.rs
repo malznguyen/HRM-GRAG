@@ -12,6 +12,7 @@ pub mod state;
 pub mod storage;
 pub mod tenant_cleanup;
 
+use auth::authz::{Object, Relation};
 use axum::{
     Router,
     extract::{DefaultBodyLimit, State},
@@ -40,11 +41,101 @@ use routes::workspaces::{
 use serde::Serialize;
 use state::AppState;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use uuid::Uuid;
 
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
     db: &'static str,
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeRole {
+    Api,
+    IngestionWorker,
+    AuthzOutboxWorker,
+    QdrantOutboxWorker,
+    StorageWorker,
+}
+
+impl RuntimeRole {
+    fn from_env() -> Self {
+        let value = std::env::var("APP_RUNTIME_ROLE")
+            .unwrap_or_else(|_| "api".to_string())
+            .to_ascii_lowercase();
+
+        match value.as_str() {
+            "ingestion-worker" | "ingestion_worker" => Self::IngestionWorker,
+            "process-authz-outbox" | "authz-outbox-worker" | "authz_outbox_worker" => {
+                Self::AuthzOutboxWorker
+            }
+            "process-qdrant-outbox" | "qdrant-outbox-worker" | "qdrant_outbox_worker" => {
+                Self::QdrantOutboxWorker
+            }
+            "process-storage-outbox"
+            | "storage-orphan-scan"
+            | "storage-worker"
+            | "storage_worker" => Self::StorageWorker,
+            _ => Self::Api,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Api => "api",
+            Self::IngestionWorker => "ingestion-worker",
+            Self::AuthzOutboxWorker => "process-authz-outbox",
+            Self::QdrantOutboxWorker => "process-qdrant-outbox",
+            Self::StorageWorker => "storage-worker",
+        }
+    }
+
+    fn required_dependencies(self) -> &'static [DependencyName] {
+        match self {
+            Self::Api => &[DependencyName::Postgres, DependencyName::OpenFga],
+            Self::IngestionWorker => &[
+                DependencyName::Postgres,
+                DependencyName::Qdrant,
+                DependencyName::ObjectStorage,
+            ],
+            Self::AuthzOutboxWorker => &[DependencyName::Postgres, DependencyName::OpenFga],
+            Self::QdrantOutboxWorker => &[DependencyName::Postgres, DependencyName::Qdrant],
+            Self::StorageWorker => &[DependencyName::Postgres, DependencyName::ObjectStorage],
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DependencyName {
+    Postgres,
+    OpenFga,
+    Qdrant,
+    ObjectStorage,
+}
+
+impl DependencyName {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::OpenFga => "openfga",
+            Self::Qdrant => "qdrant",
+            Self::ObjectStorage => "object_storage",
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ReadyDependencyStatus {
+    name: &'static str,
+    healthy: bool,
+}
+
+#[derive(Serialize)]
+struct ReadyResponse {
+    status: &'static str,
+    role: &'static str,
+    dependencies: Vec<ReadyDependencyStatus>,
+    failed_dependencies: Vec<&'static str>,
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
@@ -64,12 +155,86 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+async fn ready(State(state): State<AppState>) -> impl IntoResponse {
+    let role = RuntimeRole::from_env();
+    let mut dependencies = Vec::new();
+    let mut failed_dependencies = Vec::new();
+
+    for dependency in role.required_dependencies() {
+        let result = check_dependency(state.clone(), *dependency).await;
+        if let Err(error) = &result {
+            tracing::warn!(
+                role = role.as_str(),
+                dependency = dependency.as_str(),
+                error = %error,
+                "Readiness dependency check failed"
+            );
+            failed_dependencies.push(dependency.as_str());
+        }
+
+        dependencies.push(ReadyDependencyStatus {
+            name: dependency.as_str(),
+            healthy: result.is_ok(),
+        });
+    }
+
+    let ready = failed_dependencies.is_empty();
+    let response = ReadyResponse {
+        status: if ready { "ready" } else { "not_ready" },
+        role: role.as_str(),
+        dependencies,
+        failed_dependencies,
+    };
+
+    if ready {
+        (StatusCode::OK, Json(response)).into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(response)).into_response()
+    }
+}
+
+async fn check_dependency(
+    state: AppState,
+    dependency: DependencyName,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match dependency {
+        DependencyName::Postgres => {
+            sqlx::query_scalar::<_, i32>("SELECT 1")
+                .fetch_one(&state.pool)
+                .await
+                .map(|_| ())?;
+            Ok(())
+        }
+        DependencyName::OpenFga => {
+            state
+                .authz_client
+                .check_fga(
+                    "user:readiness-probe",
+                    Relation::Member,
+                    &Object::Workspace(Uuid::nil()),
+                )
+                .await
+                .map(|_| ())?;
+            Ok(())
+        }
+        DependencyName::Qdrant => {
+            state.retrieval.readiness_probe().await?;
+            Ok(())
+        }
+        DependencyName::ObjectStorage => {
+            state.storage.readiness_probe().await?;
+            Ok(())
+        }
+    }
+}
+
 pub fn app_router(state: AppState) -> Router {
     const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
     let cors = cors_layer();
 
     Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route("/users/me", get(get_current_user))
         .route("/users/sync", post(sync_current_user))
         .route("/tenants", post(create_tenant))
