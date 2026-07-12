@@ -3,6 +3,7 @@ pub mod retrieval;
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
+use std::time::Instant;
 
 use chrono::NaiveDateTime;
 use regex::Regex;
@@ -17,6 +18,7 @@ use crate::auth::document_acl::{
 };
 use crate::ingestion::embedding::{EmbedError, embed_text, format_pgvector};
 use crate::retrieval::{RetrievalClient, RetrievalError};
+use crate::telemetry;
 
 use self::deepseek::{ChatMessage, DeepseekStreamError, stream_chat_completion};
 use self::retrieval::{
@@ -151,9 +153,15 @@ pub async fn build_chat_context(
         "RAG pipeline: embedding user query via Ollama (shared ADR-21 model)"
     );
 
+    let embedding_started = Instant::now();
     let embedding = embed_text(client, user_message)
         .await
         .map_err(ChatPipelineError::Embed)?;
+    telemetry::record_model_latency(
+        "ollama",
+        "chat_query_embedding",
+        embedding_started.elapsed(),
+    );
     let embedding_literal = format_pgvector(&embedding);
 
     tracing::info!(
@@ -249,9 +257,18 @@ pub async fn prepare_deepseek_stream(
         "RAG pipeline: starting DeepSeek text generation stream"
     );
 
-    stream_chat_completion(client, &context.system_prompt, &context.messages)
+    let generation_started = Instant::now();
+    let response = stream_chat_completion(client, &context.system_prompt, &context.messages)
         .await
-        .map_err(ChatPipelineError::Generation)
+        .map_err(ChatPipelineError::Generation)?;
+
+    telemetry::record_model_latency(
+        "deepseek",
+        "chat_stream_request",
+        generation_started.elapsed(),
+    );
+
+    Ok(response)
 }
 
 #[derive(sqlx::FromRow)]

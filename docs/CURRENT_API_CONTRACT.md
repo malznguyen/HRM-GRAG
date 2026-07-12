@@ -1,13 +1,16 @@
 # Current API Contract
 
 This document reflects the routes registered by `gmrag_api/src/lib.rs` after Phase 2
-and Phase 3A hardening.
+and Phase 3 hardening.
 Historical audit snapshots are archived under `docs/archive/v1/`.
 
-Phase 3A hardening is internal operational work (workers, cleanup, audit
-hardening) and does not introduce new public HTTP endpoints. Operator-only
-binaries (including `backfill-graph-node-embeddings`) are documented in
-`docs/RUNBOOK.md`, not as HTTP routes.
+Phase 3 adds operational endpoints for deployment/runtime observability:
+
+- `GET /ready` for dependency-aware readiness checks.
+- `GET /metrics` for Prometheus scrape output.
+
+Operator-only binaries (including `backfill-graph-node-embeddings`) are still
+documented in `docs/RUNBOOK.md`, not as HTTP routes.
 
 Some existing write/delete endpoints now emit metadata-only audit events and may
 enqueue internal authz outbox recovery rows on non-blocking OpenFGA sync failures.
@@ -68,6 +71,7 @@ The API is partially standardized today.
 | --- | --- | --- |
 | `GET` | `/health` | public |
 | `GET` | `/ready` | public |
+| `GET` | `/metrics` | public |
 | `GET` | `/users/me` | authenticated user |
 | `POST` | `/users/sync` | authenticated user |
 | `POST` | `/tenants` | `admin` on `platform:system` |
@@ -117,6 +121,16 @@ The API is partially standardized today.
 - Dependency matrix by role: `api` requires PostgreSQL + OpenFGA; `ingestion-worker` requires PostgreSQL + Qdrant + object storage; `process-authz-outbox` requires PostgreSQL + OpenFGA; `process-qdrant-outbox` requires PostgreSQL + Qdrant; `storage-worker` requires PostgreSQL + object storage.
 - Side effects: none.
 - Security notes: dependency checks are metadata only (no mutation); this endpoint is intended for orchestrator readiness probes.
+
+### `GET /metrics`
+
+- Auth: none.
+- Authorization: none.
+- Request body: none.
+- Success: `200` text format Prometheus exposition (`text/plain; version=0.0.4`) with runtime and operational metrics.
+- Current metric groups: HTTP request count by `method`/`route`/`status`, model latency histogram (`gmrag_model_latency_seconds`), ingestion latency gauges (`avg`/`max`), ingestion failure count, and outbox depth gauges (`authz`/`qdrant`/`storage` by status).
+- Side effects: no business-data mutation; scrape path may run read-only SQL aggregates/counts for operational gauges.
+- Security notes: endpoint is intentionally unauthenticated for Prometheus scrape compatibility; operators must restrict network exposure at deployment boundary.
 
 ## User Endpoints
 

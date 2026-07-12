@@ -10,6 +10,7 @@ pub mod retrieval;
 pub mod routes;
 pub mod state;
 pub mod storage;
+pub mod telemetry;
 pub mod tenant_cleanup;
 
 use auth::authz::{Object, Relation};
@@ -193,6 +194,23 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    if let Err(error) = telemetry::refresh_operational_metrics(&state.pool).await {
+        tracing::warn!(error = %error, "Failed to refresh operational metrics before scrape");
+    }
+
+    let body = telemetry::metrics_handle().render();
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    )
+        .into_response()
+}
+
 async fn check_dependency(
     state: AppState,
     dependency: DependencyName,
@@ -231,10 +249,12 @@ async fn check_dependency(
 pub fn app_router(state: AppState) -> Router {
     const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
     let cors = cors_layer();
+    telemetry::init_metrics_recorder();
 
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/metrics", get(metrics))
         .route("/users/me", get(get_current_user))
         .route("/users/sync", post(sync_current_user))
         .route("/tenants", post(create_tenant))
@@ -297,6 +317,9 @@ pub fn app_router(state: AppState) -> Router {
             "/workspaces/{workspace_id}/members/{member_id}",
             delete(remove_workspace_member).patch(update_workspace_member_role),
         )
+        .layer(axum::middleware::from_fn(
+            telemetry::http_metrics_middleware,
+        ))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(cors)
         .with_state(state)
