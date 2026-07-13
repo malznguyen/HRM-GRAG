@@ -219,6 +219,31 @@ $env:KEYCLOAK_ADMIN_PASSWORD = "admin"
 
 Identity E2E cleanup removes tracked SQL rows, Keycloak `e2e_` users, and OpenFGA tuples written by the run (set `KEEP_E2E_DATA=1` to retain). Browser smoke manages its own frontend process lifecycle when port 3000 is free.
 
+## Local frontend role fixtures
+
+For local frontend demos only, seed five persistent Keycloak identities plus a
+single tenant/workspace fixture. The script preserves Keycloak as the login
+page and uses the existing authenticated API/operator flows; it does not add a
+backend password login or frontend role flags.
+
+```powershell
+$env:APP_ENV = "test"
+./scripts/seed-local-test-users.ps1
+```
+
+| Username | Password | Domain role |
+| --- | --- | --- |
+| `super.test` | `Test1234!` | Platform Admin |
+| `owner.test` | `Test1234!` | Tenant Owner |
+| `wsadmin.test` | `Test1234!` | Workspace Admin |
+| `member.test` | `Test1234!` | Workspace Member |
+| `outsider.test` | `Test1234!` | Authenticated outsider |
+
+Login continues to redirect to the Keycloak-hosted Authorization Code + PKCE
+page for the public `gmrag-frontend` client. These credentials are local test
+data only and must not be used outside local/test environments. See
+`docs/RUNBOOK.md` for dry-run, reset, and verification steps.
+
 ## Current Implementation Notes
 
 - Original PDFs live in MinIO/S3; they are no longer stored on local disk as the source of truth.
