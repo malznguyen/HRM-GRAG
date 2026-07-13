@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
 };
@@ -10,14 +10,26 @@ use serde_json::json;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event};
-use crate::auth::authz::{Authz, Object, Relation, TupleKey};
-use crate::auth::outbox::{enqueue_tuple_delete, enqueue_tuple_write};
+use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event, insert_audit_event_tx};
+use crate::auth::authz::{ApiError, Authz, Object, Relation, TupleKey, delete_tuples_fga_first};
+use crate::auth::outbox::enqueue_tuple_write;
+use crate::auth::resource_cleanup::capture_workspace_delete_plan;
 use crate::invite::{normalize_email, upsert_user};
 use crate::retrieval::outbox::enqueue_delete_by_workspace_tx;
 use crate::state::AppState;
 use crate::storage::cleanup::build_workspace_prefix;
 use crate::storage::outbox::enqueue_delete_prefix_tx;
+use crate::tenant_directory::{TenantDirectoryPage, list_tenants as read_tenants};
+
+const DEFAULT_TENANT_PAGE_LIMIT: i64 = 20;
+const MAX_TENANT_PAGE_LIMIT: i64 = 100;
+
+#[derive(Deserialize)]
+pub struct ListTenantsQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+    q: Option<String>,
+}
 
 #[derive(Deserialize)]
 pub struct CreateTenantRequest {
@@ -46,6 +58,37 @@ pub struct WorkspaceResponse {
     pub id: Uuid,
     pub name: String,
     pub created_at: NaiveDateTime,
+}
+
+/// Liệt kê tenant cho Platform Admin từ SQL read model.
+pub async fn list_tenants(
+    State(state): State<AppState>,
+    authz: Authz,
+    Query(query): Query<ListTenantsQuery>,
+) -> Result<Json<TenantDirectoryPage>, crate::api_error::ApiError> {
+    let limit = query.limit.unwrap_or(DEFAULT_TENANT_PAGE_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+    if !(0..=MAX_TENANT_PAGE_LIMIT).contains(&limit) || offset < 0 {
+        return Err(crate::api_error::ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "limit must be between 0 and 100 and offset must be non-negative",
+        ));
+    }
+
+    authz
+        .require_relation(Relation::Admin, &Object::Platform)
+        .await?;
+
+    let normalized_query = query.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
+    let page = read_tenants(&state.pool, limit, offset, normalized_query)
+        .await
+        .map_err(|err| {
+            error!(error = %err, "Failed to list tenants");
+            crate::api_error::ApiError::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+        })?;
+
+    Ok(Json(page))
 }
 
 /// POST /tenants
@@ -440,34 +483,35 @@ pub async fn delete_workspace(
         return err.into_response();
     }
 
-    // SQL delete + qdrant_outbox + storage_outbox (delete_prefix) cùng transaction
-    // (LIFE-001 / LIFE-004). Không gọi S3 prefix cleanup trên request path.
-    let result: Result<Option<Uuid>, sqlx::Error> = async {
-        let mut tx = state.pool.begin().await?;
-
-        // Capture tenant_id tin cậy từ SQL trước khi DELETE (không client-supplied).
-        let tenant_id: Option<Uuid> =
-            sqlx::query_scalar("SELECT tenant_id FROM workspaces WHERE id = $1")
-                .bind(workspace_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-        let Some(tenant_id) = tenant_id else {
-            return Ok(None);
-        };
-
-        let outcome = sqlx::query("DELETE FROM workspaces WHERE id = $1")
-            .bind(workspace_id)
-            .execute(&mut *tx)
-            .await?;
-
-        if outcome.rows_affected() == 0 {
-            return Ok(None);
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            error!(error = %err, workspace_id = %workspace_id, "Failed to start workspace delete transaction");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+    };
+    let plan = match capture_workspace_delete_plan(&mut tx, workspace_id).await {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            error!(error = %err, workspace_id = %workspace_id, "Failed to capture workspace authorization cleanup plan");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
+    if let Err(err) = delete_tuples_fga_first(&state.authz_client, &plan.tuples).await {
+        error!(error = %err, workspace_id = %workspace_id, "Failed to revoke workspace subtree tuples in OpenFGA");
+        return ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "AUTHZ_REVOKE_FAILED",
+            message: "Failed to revoke workspace authorization before deletion".to_string(),
+        }
+        .into_response();
+    }
+
+    let tenant_id = plan.tenant_id;
+    let result: Result<(), sqlx::Error> = async {
         enqueue_delete_by_workspace_tx(&mut tx, workspace_id).await?;
-
-        // Prefix + bucket từ SQL-trusted IDs + configured storage bucket (không client input).
         let prefix = build_workspace_prefix(tenant_id, workspace_id);
         enqueue_delete_prefix_tx(
             &mut tx,
@@ -477,18 +521,38 @@ pub async fn delete_workspace(
             Some(workspace_id),
         )
         .await?;
-
-        tx.commit().await?;
-        Ok(Some(tenant_id))
+        insert_audit_event_tx(
+            &mut tx,
+            AuditEventRecord::new(AuditEventType::WorkspaceDeleted)
+                .with_actor_user_id(authz.user_id.clone())
+                .with_workspace_id(workspace_id)
+                .with_tenant_id(tenant_id)
+                .with_target("workspace", workspace_id.to_string())
+                .with_metadata(json!({
+                    "openfga_tuples_revoked": plan.tuples.len(),
+                    "qdrant_cleanup": "outbox_enqueued",
+                    "storage_cleanup": "outbox_enqueued",
+                })),
+        )
+        .await?;
+        let outcome = sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind(workspace_id)
+            .execute(&mut *tx)
+            .await?;
+        if outcome.rows_affected() != 1 {
+            return Err(sqlx::Error::Protocol(
+                "workspace disappeared before delete could commit".to_string(),
+            ));
+        }
+        tx.commit().await
     }
     .await;
 
     match result {
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Ok(Some(tenant_id)) => {
+        Ok(()) => {
             // wait=true + timeout ngắn (request path). Outbox đã durable sau commit.
             // Không dùng worker timeout trên HTTP — tránh treo DELETE khi Qdrant chậm.
-            let qdrant_workspace_delete_succeeded = if let Err(err) = state
+            if let Err(err) = state
                 .retrieval
                 .delete_points_by_workspace_for_request(workspace_id)
                 .await
@@ -499,54 +563,6 @@ pub async fn delete_workspace(
                     workspace_id = %workspace_id,
                     request_timeout_secs = state.retrieval.delete_request_timeout_secs(),
                     "Failed to delete workspace points from Qdrant after database cleanup"
-                );
-                false
-            } else {
-                true
-            };
-
-            let audit_metadata = json!({
-                "qdrant_workspace_delete_succeeded": qdrant_workspace_delete_succeeded,
-                "tenant_id": tenant_id
-            });
-
-            let audit_record = AuditEventRecord::new(AuditEventType::WorkspaceDeleted)
-                .with_actor_user_id(authz.user_id.clone())
-                .with_workspace_id(workspace_id)
-                .with_tenant_id(tenant_id)
-                .with_target("workspace", workspace_id.to_string())
-                .with_metadata(audit_metadata);
-
-            let workspace_tenant_tuple = TupleKey {
-                user: format!("tenant:{tenant_id}"),
-                relation: Relation::Tenant.as_str().to_string(),
-                object: Object::Workspace(workspace_id).to_string(),
-            };
-
-            if let Err(err) = state
-                .authz_client
-                .write_tuples(Vec::new(), vec![workspace_tenant_tuple.clone()])
-                .await
-            {
-                error!(error = %err, workspace_id = %workspace_id, "Failed to delete workspace tenant from OpenFGA");
-
-                if let Err(outbox_err) =
-                    enqueue_tuple_delete(&state.pool, &workspace_tenant_tuple).await
-                {
-                    error!(
-                        error = %outbox_err,
-                        workspace_id = %workspace_id,
-                        "Failed to enqueue authz outbox recovery event for workspace delete"
-                    );
-                }
-            }
-
-            if let Err(err) = insert_audit_event(&state.pool, audit_record).await {
-                error!(
-                    error = %err,
-                    actor_user_id = %authz.user_id,
-                    workspace_id = %workspace_id,
-                    "Failed to write audit event for workspace deletion"
                 );
             }
 

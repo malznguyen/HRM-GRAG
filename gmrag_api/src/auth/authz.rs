@@ -13,6 +13,15 @@ pub use crate::api_error::ApiError;
 use crate::auth::extractor::AuthUser;
 use crate::state::AppState;
 
+/// Connect timeout mặc định tới OpenFGA (giây). Authz là gate trên hot path của
+/// MỌI request nên phải fail fast: nếu OpenFGA sập/không reachable, chặn nhanh
+/// thay vì để connect treo và cạn connection pool.
+const DEFAULT_OPENFGA_CONNECT_TIMEOUT_SECS: u64 = 2;
+/// Request timeout mặc định tới OpenFGA (giây). Một authz check chậm hơn mức này
+/// đã là outage — thà fail-closed nhanh còn hơn để request treo vô hạn. Giữ ngắn
+/// có chủ đích: 10s ở đây tự nó là một outage.
+const DEFAULT_OPENFGA_REQUEST_TIMEOUT_SECS: u64 = 3;
+
 /// Đại diện cho các relation trong OpenFGA model
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Relation {
@@ -189,8 +198,16 @@ struct WriteRequest {
 
 impl AuthzClient {
     pub fn new(api_url: String, store_id: String, model_id: Option<String>) -> Self {
+        let connect_timeout_secs = super::auth_timeout_secs_from_env(
+            "OPENFGA_CONNECT_TIMEOUT_SECS",
+            DEFAULT_OPENFGA_CONNECT_TIMEOUT_SECS,
+        );
+        let request_timeout_secs = super::auth_timeout_secs_from_env(
+            "OPENFGA_REQUEST_TIMEOUT_SECS",
+            DEFAULT_OPENFGA_REQUEST_TIMEOUT_SECS,
+        );
         Self {
-            client: reqwest::Client::new(),
+            client: super::build_auth_http_client(connect_timeout_secs, request_timeout_secs),
             api_url,
             store_id,
             model_id,
@@ -451,6 +468,35 @@ impl AuthzClient {
     }
 }
 
+/// Xoá từng tuple theo thứ tự fail-closed; tuple đã thiếu được coi là idempotent success.
+///
+/// Không batch ở đây: nếu một revoke lỗi, caller phải giữ SQL nguyên vẹn để có thể retry.
+pub async fn delete_tuples_fga_first(
+    authz_client: &AuthzClient,
+    tuples: &[TupleKey],
+) -> Result<(), AuthzError> {
+    for tuple in tuples {
+        match authz_client
+            .write_tuples(Vec::new(), vec![tuple.clone()])
+            .await
+        {
+            Ok(()) => {}
+            Err(error) if is_missing_tuple_delete_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// OpenFGA có thể báo lỗi khi revoke một tuple đã bị dọn bởi lần chạy trước.
+pub fn is_missing_tuple_delete_error(error: &AuthzError) -> bool {
+    let AuthzError::OpenFga { body, .. } = error else {
+        return false;
+    };
+    let body = body.to_ascii_lowercase();
+    body.contains("does not exist") || body.contains("not found")
+}
+
 /// Extractor của axum thực hiện kiểm tra quyền
 pub struct Authz {
     pub client: AuthzClient,
@@ -533,5 +579,100 @@ impl FromRequestParts<AppState> for Authz {
             email_verified: auth_user.email_verified,
             cache,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    /// Listener chấp nhận kết nối nhưng không bao giờ trả response — mô phỏng OpenFGA
+    /// treo giữa chừng (khác với connection-refused: đây là hang thực sự sau khi connect).
+    fn spawn_blackhole_openfga() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind blackhole listener");
+        let addr = listener.local_addr().expect("blackhole addr");
+        std::thread::spawn(move || {
+            // Giữ mọi socket mở, đọc rồi lờ đi; không bao giờ ghi response.
+            let mut held = Vec::new();
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(mut socket) => {
+                        let mut scratch = [0u8; 1024];
+                        let _ = socket.read(&mut scratch);
+                        held.push(socket);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// Client trỏ tới blackhole với request timeout 1s để test chạy nhanh và xác định.
+    fn blackhole_client() -> AuthzClient {
+        AuthzClient {
+            client: crate::auth::build_auth_http_client(2, 1),
+            api_url: spawn_blackhole_openfga(),
+            store_id: "test-store".to_string(),
+            model_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn check_fga_times_out_against_unresponsive_openfga() {
+        let client = blackhole_client();
+
+        let start = Instant::now();
+        let result = client
+            .check_fga("user:u1", Relation::Member, &Object::Workspace(Uuid::nil()))
+            .await;
+        let elapsed = start.elapsed();
+
+        // Không được resolve thành một quyết định (true/false); phải là lỗi.
+        assert!(
+            result.is_err(),
+            "unresponsive OpenFGA must surface an error, not a decision"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "authz call must time out fast instead of blocking, took {elapsed:?}"
+        );
+        match result {
+            Err(AuthzError::Http(err)) => {
+                assert!(err.is_timeout(), "expected a timeout error, got: {err}");
+            }
+            other => panic!("expected an Http timeout error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn authz_timeout_denies_instead_of_allowing() {
+        let authz = Authz {
+            client: blackhole_client(),
+            user_id: "u1".to_string(),
+            email: None,
+            email_verified: false,
+            cache: RequestAuthzCache::default(),
+        };
+
+        // `check` không bao giờ được trả Ok(true) khi dependency treo.
+        let decision = authz
+            .check(Relation::Member, &Object::Workspace(Uuid::nil()))
+            .await;
+        assert!(
+            decision.is_err(),
+            "timeout must surface as Err, never Ok(true)"
+        );
+
+        // `require_relation` phải fail-closed: 500 AUTHZ_ERROR, không cho qua.
+        let required = authz
+            .require_relation(Relation::Admin, &Object::Workspace(Uuid::nil()))
+            .await;
+        let error = required.expect_err("authz timeout must deny the request");
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.code, "AUTHZ_ERROR");
     }
 }

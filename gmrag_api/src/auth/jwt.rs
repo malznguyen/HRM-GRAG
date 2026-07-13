@@ -8,6 +8,26 @@ use tracing::{error, warn};
 
 use crate::auth::test_bypass_enabled;
 
+/// Connect timeout mặc định khi fetch JWKS (giây). JWKS fetch nằm trên request path
+/// của mọi token chưa cache key; IdP treo không được kéo theo token validation treo.
+const DEFAULT_JWKS_CONNECT_TIMEOUT_SECS: u64 = 3;
+/// Request timeout mặc định khi fetch JWKS (giây). Ít khi chạy (key được cache) nhưng
+/// vẫn phải bounded để không treo request đầu tiên sau khi key xoay vòng.
+const DEFAULT_JWKS_REQUEST_TIMEOUT_SECS: u64 = 5;
+
+/// Dựng HTTP client cho JWKS fetch với connect + request timeout (đọc từ env, có default).
+fn build_jwks_client() -> Client {
+    let connect_timeout_secs = crate::auth::auth_timeout_secs_from_env(
+        "JWT_JWKS_CONNECT_TIMEOUT_SECS",
+        DEFAULT_JWKS_CONNECT_TIMEOUT_SECS,
+    );
+    let request_timeout_secs = crate::auth::auth_timeout_secs_from_env(
+        "JWT_JWKS_REQUEST_TIMEOUT_SECS",
+        DEFAULT_JWKS_REQUEST_TIMEOUT_SECS,
+    );
+    crate::auth::build_auth_http_client(connect_timeout_secs, request_timeout_secs)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum JwtError {
     MissingConfig(&'static str),
@@ -62,7 +82,7 @@ impl JwtValidator {
                 issuer: None,
                 audience: None,
                 jwks_url: None,
-                client: Client::new(),
+                client: build_jwks_client(),
                 keys: Arc::new(RwLock::new(HashMap::new())),
             }));
         }
@@ -78,7 +98,7 @@ impl JwtValidator {
             issuer: Some(issuer),
             audience: Some(audience),
             jwks_url: Some(jwks_url),
-            client: Client::new(),
+            client: build_jwks_client(),
             keys: Arc::new(RwLock::new(HashMap::new())),
         }))
     }

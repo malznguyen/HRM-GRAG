@@ -12,14 +12,14 @@ use sqlx::PgPool;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event};
-use crate::auth::authz::{ApiError, Authz, Object, Relation, TupleKey};
+use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event, insert_audit_event_tx};
+use crate::auth::authz::{ApiError, Authz, Object, Relation, delete_tuples_fga_first};
 use crate::auth::document_acl::{
     DocumentAccessMode, DocumentAclRow, can_user_view_document, collect_viewable_document_ids,
     ensure_document_workspace_relation, grant_document_explicit_viewer,
-    remove_document_workspace_relation, revoke_document_explicit_viewer, set_document_access_mode,
+    revoke_document_explicit_viewer, set_document_access_mode,
 };
-use crate::auth::outbox::enqueue_tuple_delete;
+use crate::auth::resource_cleanup::capture_document_delete_plan;
 use crate::ingestion::jobs::{IngestionWorkerConfig, enqueue_job_tx, retry_failed_document};
 use crate::retrieval::outbox::enqueue_delete_by_document_tx;
 use crate::state::AppState;
@@ -95,12 +95,6 @@ struct ChunkWithDocumentAclRow {
     original_text: String,
     document_id: Uuid,
     access_mode: String,
-}
-
-#[derive(sqlx::FromRow)]
-struct DocumentDeleteTarget {
-    object_key: String,
-    bucket: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -728,19 +722,8 @@ pub async fn delete_document(
         }
     };
 
-    let delete_target: Result<Option<DocumentDeleteTarget>, sqlx::Error> = sqlx::query_as(
-        r#"
-        SELECT object_key, bucket
-        FROM documents
-        WHERE id = $1 AND workspace_id = $2
-        "#,
-    )
-    .bind(document_id)
-    .bind(workspace_id)
-    .fetch_optional(&mut *tx)
-    .await;
-
-    let delete_target = match delete_target {
+    let delete_target = match capture_document_delete_plan(&mut tx, workspace_id, document_id).await
+    {
         Ok(Some(target)) => target,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(err) => {
@@ -755,7 +738,32 @@ pub async fn delete_document(
         }
     };
 
+    if let Err(err) = delete_tuples_fga_first(&state.authz_client, &delete_target.tuples).await {
+        error!(error = %err, workspace_id = %workspace_id, document_id = %document_id, "Failed to revoke document tuples in OpenFGA before deletion");
+        return ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "AUTHZ_REVOKE_FAILED",
+            message: "Failed to revoke document authorization before deletion".to_string(),
+        }
+        .into_response();
+    }
+
     let result = async {
+        insert_audit_event_tx(
+            &mut tx,
+            AuditEventRecord::new(AuditEventType::DocumentDeleted)
+                .with_actor_user_id(authz.user_id.clone())
+                .with_workspace_id(workspace_id)
+                .with_document_id(document_id)
+                .with_target("document", document_id.to_string())
+                .with_metadata(json!({
+                    "openfga_tuples_revoked": delete_target.tuples.len(),
+                    "qdrant_cleanup": "outbox_enqueued",
+                    "storage_cleanup": "outbox_enqueued",
+                })),
+        )
+        .await?;
+
         sqlx::query(
             r#"
             DELETE FROM graph_edge_sources
@@ -843,54 +851,21 @@ pub async fn delete_document(
 
     match result {
         Ok(_) => {
-            if let Err(err) =
-                remove_document_workspace_relation(&state.authz_client, workspace_id, document_id)
-                    .await
-            {
+            // Best-effort sau commit; outbox storage_outbox đã durable (LIFE-003).
+            if let Err(err) = state.storage.delete_object(&delete_target.object_key).await {
                 error!(
                     error = %err,
                     user_id = %authz.user_id,
                     workspace_id = %workspace_id,
                     document_id = %document_id,
-                    "Failed to delete document workspace relation in OpenFGA"
+                    object_key = %delete_target.object_key,
+                    "Failed to delete document object after database cleanup"
                 );
-
-                let tuple = TupleKey {
-                    user: format!("workspace:{workspace_id}"),
-                    relation: Relation::Workspace.as_str().to_string(),
-                    object: Object::Document(document_id).to_string(),
-                };
-
-                if let Err(outbox_err) = enqueue_tuple_delete(&state.pool, &tuple).await {
-                    error!(
-                        error = %outbox_err,
-                        user_id = %authz.user_id,
-                        workspace_id = %workspace_id,
-                        document_id = %document_id,
-                        "Failed to enqueue authz outbox recovery event for document delete"
-                    );
-                }
             }
-
-            // Best-effort sau commit; outbox storage_outbox đã durable (LIFE-003).
-            let storage_delete_succeeded =
-                if let Err(err) = state.storage.delete_object(&delete_target.object_key).await {
-                    error!(
-                        error = %err,
-                        user_id = %authz.user_id,
-                        workspace_id = %workspace_id,
-                        document_id = %document_id,
-                        object_key = %delete_target.object_key,
-                        "Failed to delete document object after database cleanup"
-                    );
-                    false
-                } else {
-                    true
-                };
 
             // SQL + outbox đã commit: Qdrant best-effort sau commit; lỗi/timeout không
             // fail HTTP (vẫn 204). Row outbox có thể còn PENDING cho worker (LIFE-002).
-            let qdrant_delete_succeeded = if let Err(err) = state
+            if let Err(err) = state
                 .retrieval
                 .delete_points_by_document_for_request(workspace_id, document_id)
                 .await
@@ -902,32 +877,6 @@ pub async fn delete_document(
                     document_id = %document_id,
                     request_timeout_secs = state.retrieval.delete_request_timeout_secs(),
                     "Failed to delete document points from Qdrant after database cleanup"
-                );
-                false
-            } else {
-                true
-            };
-
-            if let Err(err) = insert_audit_event(
-                &state.pool,
-                AuditEventRecord::new(AuditEventType::DocumentDeleted)
-                    .with_actor_user_id(authz.user_id.clone())
-                    .with_workspace_id(workspace_id)
-                    .with_document_id(document_id)
-                    .with_target("document", document_id.to_string())
-                    .with_metadata(json!({
-                        "storage_delete_succeeded": storage_delete_succeeded,
-                        "qdrant_delete_succeeded": qdrant_delete_succeeded
-                    })),
-            )
-            .await
-            {
-                error!(
-                    error = %err,
-                    actor_user_id = %authz.user_id,
-                    workspace_id = %workspace_id,
-                    document_id = %document_id,
-                    "Failed to write audit event for document delete"
                 );
             }
 

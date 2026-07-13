@@ -665,8 +665,8 @@ async fn delete_document_succeeds_when_qdrant_unavailable() {
     .unwrap();
 
     if let Some(metadata) = audit_metadata {
-        assert_eq!(metadata["qdrant_delete_succeeded"], false);
-        assert_eq!(metadata["storage_delete_succeeded"], true);
+        assert_eq!(metadata["qdrant_cleanup"], "outbox_enqueued");
+        assert_eq!(metadata["storage_cleanup"], "outbox_enqueued");
     }
 
     // Fail path phải enqueue recovery — không để orphan vĩnh viễn.
@@ -863,7 +863,7 @@ async fn delete_workspace_also_removes_qdrant_points() {
     .unwrap();
 
     if let Some(metadata) = audit_metadata {
-        assert_eq!(metadata["qdrant_workspace_delete_succeeded"], true);
+        assert_eq!(metadata["qdrant_cleanup"], "outbox_enqueued");
     }
 }
 
@@ -914,7 +914,7 @@ async fn delete_workspace_succeeds_when_qdrant_unavailable() {
     .unwrap();
 
     if let Some(metadata) = audit_metadata {
-        assert_eq!(metadata["qdrant_workspace_delete_succeeded"], false);
+        assert_eq!(metadata["qdrant_cleanup"], "outbox_enqueued");
     }
 
     let outbox_count: i64 = sqlx::query_scalar(
@@ -974,9 +974,7 @@ async fn delete_workspace_is_idempotent_when_no_qdrant_points() {
     .unwrap();
 
     if let Some(metadata) = audit_metadata {
-        // Collection có thể chưa tồn tại: Qdrant thường vẫn 2xx cho filter delete empty,
-        // hoặc trả lỗi API — dù vậy HTTP delete workspace đã thành công.
-        assert!(metadata.get("qdrant_workspace_delete_succeeded").is_some());
+        assert_eq!(metadata["qdrant_cleanup"], "outbox_enqueued");
     }
 }
 
