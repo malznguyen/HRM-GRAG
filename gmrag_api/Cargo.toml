@@ -31,3 +31,15 @@ async-stream = "0.3.6"
 futures = "0.3.32"
 metrics = "0.24.2"
 metrics-exporter-prometheus = "0.17.2"
+
+[[bin]]
+name = "delete-tenant"
+path = "src/bin/delete-tenant.rs"
+
+[[bin]]
+name = "report-authz-orphans"
+path = "src/bin/report-authz-orphans.rs"
+
+[[bin]]
+name = "cleanup-authz-orphans"
+path = "src/bin/cleanup-authz-orphans.rs"
