@@ -5,7 +5,35 @@ pub mod jwt;
 pub mod keycloak;
 pub mod outbox;
 pub mod outbox_health;
+pub mod resource_cleanup;
 pub mod workspace_role;
+
+/// Trần an toàn chung cho mọi HTTP timeout của auth layer (giây) — chặn cấu hình
+/// cực lớn tự biến thành treo pool (một authz check chậm cỡ này đã là outage).
+const MAX_AUTH_HTTP_TIMEOUT_SECS: u64 = 30;
+
+/// Đọc timeout (giây) từ env theo convention `*_TIMEOUT_SECS` (giống
+/// `QDRANT_DELETE_*_TIMEOUT_SECS`): parse, fallback default, clamp về [1, trần].
+pub(crate) fn auth_timeout_secs_from_env(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+        .clamp(1, MAX_AUTH_HTTP_TIMEOUT_SECS)
+}
+
+/// Dựng reqwest client với connect + request timeout tường minh cho outbound của auth layer.
+///
+/// Panic ngay lúc boot nếu không dựng được client (chỉ xảy ra khi init TLS backend lỗi):
+/// thà fail loud lúc khởi động còn hơn âm thầm chạy với client không timeout —
+/// đúng tinh thần fail-closed, vì client không timeout là DoS tự gây, không log, không crash.
+pub(crate) fn build_auth_http_client(connect_secs: u64, request_secs: u64) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(connect_secs))
+        .timeout(std::time::Duration::from_secs(request_secs))
+        .build()
+        .expect("failed to build auth-layer HTTP client with timeouts")
+}
 
 const TEST_BYPASS_FLAGS: [&str; 2] = ["TEST_BYPASS_JWT", "TEST_BYPASS_KEYCLOAK"];
 const UNSAFE_SECRET_DEFAULTS: [(&str, &str); 5] = [

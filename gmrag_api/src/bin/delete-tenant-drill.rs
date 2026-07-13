@@ -4,8 +4,7 @@
 //!
 //! Mặc định dry-run (chỉ capture + in plan). Xoá thật cần `--delete`.
 //!
-//! Sau commit: chạy manual `process-qdrant-outbox` / `process-storage-outbox`
-//! (unattended scheduling = OPS-003). OpenFGA tenant tuples không được dọn ở đây.
+//! `--delete` đã bị vô hiệu hoá: dùng `delete-tenant` để revoke OpenFGA trước SQL.
 
 use gmrag_api::audit::{AuditEventRecord, AuditEventType, insert_audit_event, sanitize_error_code};
 use gmrag_api::storage::StorageConfig;
@@ -53,6 +52,13 @@ async fn main() {
         print_usage();
         std::process::exit(1);
     };
+
+    if args.delete {
+        eprintln!(
+            "delete-tenant-drill --delete is disabled because it can leave OpenFGA orphan tuples. Use: cargo run --locked --bin delete-tenant -- --tenant-id {tenant_id} --delete --yes"
+        );
+        std::process::exit(1);
+    }
 
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let pool = PgPoolOptions::new()
@@ -250,7 +256,7 @@ fn print_usage() {
         "\
 Usage:
   cargo run --bin delete-tenant-drill -- --tenant-id <uuid>           # dry-run (default)
-  cargo run --bin delete-tenant-drill -- --tenant-id <uuid> --delete  # SQL cascade + outbox
+  cargo run --bin delete-tenant-drill -- --tenant-id <uuid> --delete  # refused; use delete-tenant
 
 Notes:
   - No public DELETE /tenants route. Operator/library drill only.
@@ -258,6 +264,6 @@ Notes:
   - Captures workspace IDs before SQL cascade; enqueues qdrant delete_by_workspaces
     and storage delete_prefix (tenants/{{tenant_id}}/) in the same transaction.
   - Empty workspace list is explicit (valid for empty tenant); missing tenant is an error.
-  - Does not call S3/Qdrant; run process-*-outbox manually (OPS-003 for scheduling)."
+  - This drill never performs SQL deletion. Use delete-tenant for the FGA-first lifecycle."
     );
 }

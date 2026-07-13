@@ -4,6 +4,9 @@
 !.env.example
 !**/.env.example
 !**/.env.local.example
+gmrag_ui/.env
+gmrag_ui/.env.*
+!gmrag_ui/.env.example
 *.local
 *.pem
 *.key
@@ -46,3 +49,7 @@ coverage/
 # Generated docs only (source-of-truth Markdown under docs/ and plans/ is tracked)
 docs/generated/
 **/generated-docs/
+
+# Operator recovery snapshots emitted by delete-tenant / cleanup-authz-orphans (never commit)
+authz-orphan-recovery-*.json
+tenant-delete-recovery-*.json

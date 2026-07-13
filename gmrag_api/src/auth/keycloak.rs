@@ -7,6 +7,26 @@ use tokio::sync::RwLock;
 use crate::auth::test_bypass_enabled;
 use crate::invite::normalize_email;
 
+/// Connect timeout mặc định tới Keycloak Admin API (giây). Admin lookup nằm trên
+/// request path (user sync / member add); Keycloak treo không được kéo theo API treo.
+const DEFAULT_KEYCLOAK_CONNECT_TIMEOUT_SECS: u64 = 3;
+/// Request timeout mặc định tới Keycloak Admin API (giây). Token exchange + user
+/// search nặng hơn một authz check nên biên rộng hơn OpenFGA, nhưng vẫn phải bounded.
+const DEFAULT_KEYCLOAK_REQUEST_TIMEOUT_SECS: u64 = 5;
+
+/// Dựng HTTP client cho Keycloak với connect + request timeout (đọc từ env, có default).
+fn build_keycloak_client() -> Client {
+    let connect_timeout_secs = crate::auth::auth_timeout_secs_from_env(
+        "KEYCLOAK_CONNECT_TIMEOUT_SECS",
+        DEFAULT_KEYCLOAK_CONNECT_TIMEOUT_SECS,
+    );
+    let request_timeout_secs = crate::auth::auth_timeout_secs_from_env(
+        "KEYCLOAK_REQUEST_TIMEOUT_SECS",
+        DEFAULT_KEYCLOAK_REQUEST_TIMEOUT_SECS,
+    );
+    crate::auth::build_auth_http_client(connect_timeout_secs, request_timeout_secs)
+}
+
 /// Client tương tác với Keycloak Admin REST API
 #[derive(Clone)]
 pub struct KeycloakClient {
@@ -37,7 +57,7 @@ impl KeycloakClient {
     pub fn from_env() -> Result<Self, String> {
         if test_bypass_enabled("TEST_BYPASS_KEYCLOAK") {
             return Ok(Self {
-                client: Client::new(),
+                client: build_keycloak_client(),
                 admin_url: "http://test-bypass-keycloak".to_string(),
                 realm: "test".to_string(),
                 client_id: "test".to_string(),
@@ -51,7 +71,7 @@ impl KeycloakClient {
         let client_id = required_env("KEYCLOAK_CLIENT_ID")?;
         let client_secret = required_env("KEYCLOAK_CLIENT_SECRET")?;
         Ok(Self {
-            client: Client::new(),
+            client: build_keycloak_client(),
             admin_url: admin_url.trim_end_matches('/').to_string(),
             realm,
             client_id,

@@ -50,6 +50,12 @@ Current relation-to-error mapping for `403` responses:
 | `can_assign_role` | `{"error":{"code":"ROLE_ASSIGNMENT_DENIED","message":"Only tenant owners can assign roles"}}` |
 | `member` and other default cases | `{"error":{"code":"FORBIDDEN","message":"Access denied"}}` |
 
+A `403` above means OpenFGA answered "not allowed". When the OpenFGA **dependency
+itself** fails — unreachable, error response, or **timeout** (the OpenFGA client has
+explicit short connect/request timeouts; see `docs/RUNBOOK.md`) — the request
+**fails closed** with `500` `AUTHZ_ERROR` (`{"error":{"code":"AUTHZ_ERROR","message":"Authorization service unavailable"}}`).
+An authz-dependency failure is **never** treated as "allow".
+
 ### Error Response Format
 
 Every HTTP application failure returns the JSON envelope shown below. This includes

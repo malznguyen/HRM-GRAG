@@ -4,8 +4,8 @@ use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::authz::{AuthzClient, AuthzError, Object, Relation};
-use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event};
+use super::authz::{AuthzClient, AuthzError, Object, Relation, TupleKey, delete_tuples_fga_first};
+use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event_tx};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DocumentAccessMode {
@@ -315,16 +315,18 @@ pub async fn set_document_access_mode(
     access_mode: DocumentAccessMode,
     actor_user_id: &str,
 ) -> Result<Option<()>, DocumentAclError> {
+    let mut tx = pool.begin().await?;
     let current_raw: Option<String> = sqlx::query_scalar(
         r#"
         SELECT access_mode
         FROM documents
         WHERE id = $1 AND workspace_id = $2
+        FOR UPDATE
         "#,
     )
     .bind(document_id)
     .bind(workspace_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
     let Some(current_raw) = current_raw else {
@@ -337,8 +339,26 @@ pub async fn set_document_access_mode(
             raw_mode: current_raw,
         })?;
 
-    // UPDATE mode trước cleanup: nếu revoke share trước khi flip mode mà UPDATE fail,
-    // user mất explicit access trong lúc document vẫn restricted.
+    let share_user_ids: Vec<String> = if access_mode.is_restricted() {
+        Vec::new()
+    } else {
+        sqlx::query_scalar("SELECT user_id FROM document_shares WHERE document_id = $1")
+            .bind(document_id)
+            .fetch_all(&mut *tx)
+            .await?
+    };
+    let tuples: Vec<TupleKey> = share_user_ids
+        .iter()
+        .map(|user_id| TupleKey {
+            user: format_user(user_id),
+            relation: Relation::ExplicitViewer.as_str().to_string(),
+            object: Object::Document(document_id).to_string(),
+        })
+        .collect();
+
+    // Revoke OpenFGA trước để SQL không thể commit khi quyền cũ vẫn còn sống.
+    delete_tuples_fga_first(authz_client, &tuples).await?;
+
     sqlx::query(
         r#"
         UPDATE documents
@@ -349,16 +369,18 @@ pub async fn set_document_access_mode(
     .bind(access_mode.as_str())
     .bind(document_id)
     .bind(workspace_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
-    let mut shares_cleaned = 0usize;
     if !access_mode.is_restricted() {
-        shares_cleaned = clear_document_explicit_shares(pool, authz_client, document_id).await?;
+        sqlx::query("DELETE FROM document_shares WHERE document_id = $1")
+            .bind(document_id)
+            .execute(&mut *tx)
+            .await?;
     }
 
-    insert_audit_event(
-        pool,
+    insert_audit_event_tx(
+        &mut tx,
         AuditEventRecord::new(AuditEventType::DocumentAccessModeChanged)
             .with_actor_user_id(actor_user_id.to_string())
             .with_workspace_id(workspace_id)
@@ -367,36 +389,13 @@ pub async fn set_document_access_mode(
             .with_metadata(json!({
                 "previous_access_mode": previous_mode.as_str(),
                 "access_mode": access_mode.as_str(),
-                "shares_cleaned": shares_cleaned,
+                "shares_cleaned": share_user_ids.len(),
             })),
     )
     .await?;
+    tx.commit().await?;
 
     Ok(Some(()))
-}
-
-/// Xoá toàn bộ share SQL + tuple OpenFGA của một document (reuse revoke helper).
-async fn clear_document_explicit_shares(
-    pool: &PgPool,
-    authz_client: &AuthzClient,
-    document_id: Uuid,
-) -> Result<usize, DocumentAclError> {
-    let user_ids: Vec<String> = sqlx::query_scalar(
-        r#"
-        SELECT user_id
-        FROM document_shares
-        WHERE document_id = $1
-        "#,
-    )
-    .bind(document_id)
-    .fetch_all(pool)
-    .await?;
-
-    for user_id in &user_ids {
-        revoke_document_explicit_viewer(pool, authz_client, document_id, user_id).await?;
-    }
-
-    Ok(user_ids.len())
 }
 
 pub async fn grant_document_explicit_viewer(

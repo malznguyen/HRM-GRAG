@@ -1,5 +1,5 @@
 use serde_json::{Map, Value};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +44,7 @@ pub enum AuditEventType {
     TenantDeleteDrillDryRun,
     TenantDeleteDrillCompleted,
     TenantDeleteDrillFailed,
+    TenantDeleted,
     GraphNodeEmbeddingBackfillCompleted,
     GraphNodeEmbeddingBackfillFailed,
     /// OCR-004 apply bị refuse (OCR capability đóng); metadata-only.
@@ -104,6 +105,7 @@ impl AuditEventType {
             AuditEventType::TenantDeleteDrillDryRun => "tenant_delete_drill_dry_run",
             AuditEventType::TenantDeleteDrillCompleted => "tenant_delete_drill_completed",
             AuditEventType::TenantDeleteDrillFailed => "tenant_delete_drill_failed",
+            AuditEventType::TenantDeleted => "tenant_deleted",
             AuditEventType::GraphNodeEmbeddingBackfillCompleted => {
                 "graph_node_embedding_backfill_completed"
             }
@@ -209,6 +211,42 @@ pub async fn insert_audit_event(pool: &PgPool, event: AuditEventRecord) -> Resul
     .bind(event.target_id)
     .bind(metadata)
     .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Ghi audit event trong transaction lifecycle khi event phải commit cùng thay đổi nghiệp vụ.
+pub async fn insert_audit_event_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    event: AuditEventRecord,
+) -> Result<(), sqlx::Error> {
+    let metadata = sanitize_metadata(event.metadata);
+
+    sqlx::query(
+        r#"
+        INSERT INTO audit_events (
+            actor_user_id,
+            tenant_id,
+            workspace_id,
+            document_id,
+            event_type,
+            target_type,
+            target_id,
+            metadata
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        "#,
+    )
+    .bind(event.actor_user_id)
+    .bind(event.tenant_id)
+    .bind(event.workspace_id)
+    .bind(event.document_id)
+    .bind(event.event_type.as_str())
+    .bind(event.target_type)
+    .bind(event.target_id)
+    .bind(metadata)
+    .execute(&mut **tx)
     .await?;
 
     Ok(())
