@@ -50,10 +50,6 @@ impl KeycloakClient {
         let realm = required_env("KEYCLOAK_REALM")?;
         let client_id = required_env("KEYCLOAK_CLIENT_ID")?;
         let client_secret = required_env("KEYCLOAK_CLIENT_SECRET")?;
-        if client_secret == "dummy_secret" {
-            return Err("KEYCLOAK_CLIENT_SECRET must not use dummy_secret".to_string());
-        }
-
         Ok(Self {
             client: Client::new(),
             admin_url: admin_url.trim_end_matches('/').to_string(),

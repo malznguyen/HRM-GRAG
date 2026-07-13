@@ -23,6 +23,11 @@ async fn main() {
         std::process::exit(1);
     }
 
+    if let Err(error) = auth::validate_secret_configuration() {
+        eprintln!("Invalid secret configuration: {error}");
+        std::process::exit(1);
+    }
+
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let max_connections = std::env::var("DATABASE_POOL_SIZE")
         .ok()

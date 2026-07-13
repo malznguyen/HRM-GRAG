@@ -8,6 +8,17 @@ pub mod outbox_health;
 pub mod workspace_role;
 
 const TEST_BYPASS_FLAGS: [&str; 2] = ["TEST_BYPASS_JWT", "TEST_BYPASS_KEYCLOAK"];
+const UNSAFE_SECRET_DEFAULTS: [(&str, &str); 5] = [
+    ("KEYCLOAK_CLIENT_SECRET", "dummy_secret"),
+    (
+        "KEYCLOAK_CLIENT_SECRET",
+        "replace_with_keycloak_admin_client_secret",
+    ),
+    ("S3_ACCESS_KEY_ID", "minioadmin"),
+    ("S3_SECRET_ACCESS_KEY", "minioadmin"),
+    // So sánh toàn chuỗi để không chặn nhầm API key thật tình cờ cùng prefix `sk-`.
+    ("DEEPSEEK_API_KEY", "sk-your-deepseek-api-key"),
+];
 
 /// Chỉ cho phép bypass xác thực khi cờ được bật trong môi trường test tường minh.
 pub fn test_bypass_enabled(flag_name: &str) -> bool {
@@ -31,6 +42,64 @@ pub fn validate_test_bypass_configuration() -> Result<(), TestBypassConfiguratio
 
     Ok(())
 }
+
+/// Từ chối placeholder credential khi không chạy test tường minh.
+pub fn validate_secret_configuration() -> Result<(), SecretConfigurationError> {
+    validate_secret_configuration_with(
+        std::env::var("APP_ENV").ok().as_deref(),
+        std::env::var("ALLOW_INSECURE_DEFAULTS").ok().as_deref(),
+        |key| std::env::var(key).ok(),
+    )
+}
+
+fn validate_secret_configuration_with<F>(
+    app_env: Option<&str>,
+    allow_insecure_defaults: Option<&str>,
+    mut env_getter: F,
+) -> Result<(), SecretConfigurationError>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    if app_env == Some("test") || allow_insecure_defaults == Some("1") {
+        return Ok(());
+    }
+
+    for (key, unsafe_value) in UNSAFE_SECRET_DEFAULTS {
+        if env_getter(key)
+            .as_deref()
+            .is_some_and(|value| value.trim() == unsafe_value)
+        {
+            return Err(SecretConfigurationError { key });
+        }
+    }
+
+    // Đây là kiểm tra substring đơn giản cho password placeholder, không phải URL parser đầy đủ.
+    if env_getter("DATABASE_URL").is_some_and(|database_url| database_url.contains("change_me")) {
+        return Err(SecretConfigurationError {
+            key: "DATABASE_URL",
+        });
+    }
+
+    Ok(())
+}
+
+/// Lỗi credential placeholder không được phép ngoài test.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SecretConfigurationError {
+    key: &'static str,
+}
+
+impl std::fmt::Display for SecretConfigurationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{0} uses an unsafe placeholder value; set a real credential, APP_ENV=test, or ALLOW_INSECURE_DEFAULTS=1 for a local demo only",
+            self.key
+        )
+    }
+}
+
+impl std::error::Error for SecretConfigurationError {}
 
 /// Lỗi cấu hình bypass xác thực không an toàn.
 #[derive(Debug, PartialEq, Eq)]
@@ -104,5 +173,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn unsafe_secret_defaults_fail_outside_test_only() {
+        for (key, value) in UNSAFE_SECRET_DEFAULTS {
+            let error = validate_secret_configuration_with(Some("production"), None, |candidate| {
+                (candidate == key).then(|| value.to_string())
+            });
+            assert_eq!(error, Err(SecretConfigurationError { key }));
+
+            let test_result = validate_secret_configuration_with(Some("test"), None, |candidate| {
+                (candidate == key).then(|| value.to_string())
+            });
+            assert_eq!(test_result, Ok(()));
+
+            let local_result =
+                validate_secret_configuration_with(Some("development"), Some("1"), |candidate| {
+                    (candidate == key).then(|| value.to_string())
+                });
+            assert_eq!(local_result, Ok(()));
+        }
+    }
+
+    #[test]
+    fn database_url_placeholder_fails_outside_test_without_opt_in() {
+        let database_url = "postgres://gmrag_user:change_me@127.0.0.1:5432/gmrag";
+        let rejected = validate_secret_configuration_with(Some("development"), None, |key| {
+            (key == "DATABASE_URL").then(|| database_url.to_string())
+        });
+        assert_eq!(
+            rejected,
+            Err(SecretConfigurationError {
+                key: "DATABASE_URL"
+            })
+        );
     }
 }
