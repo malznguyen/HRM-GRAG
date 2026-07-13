@@ -14,6 +14,7 @@ use tokio::sync::Semaphore;
 const PROTECTED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/users/me"),
     ("POST", "/users/sync"),
+    ("GET", "/tenants"),
     ("POST", "/tenants"),
     (
         "POST",
