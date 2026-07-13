@@ -89,9 +89,6 @@ services:
   # Qdrant — vector store cho Phase 2 retrieval (local demo)
   qdrant:
     image: qdrant/qdrant:v1.18.2
-    ports:
-      - "6333:6333" # REST
-      - "6334:6334" # gRPC
     volumes:
       - ./.docker_data/qdrant:/qdrant/storage
 
