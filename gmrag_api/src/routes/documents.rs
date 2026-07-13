@@ -545,7 +545,7 @@ pub async fn share_document(
             return ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "AUTHZ_ERROR",
-                message: format!("Authorization check failed: {err}"),
+                message: "Authorization service unavailable".to_string(),
             }
             .into_response();
         }

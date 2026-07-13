@@ -1,3 +1,4 @@
+pub mod api_error;
 pub mod audit;
 pub mod auth;
 pub mod chat;
@@ -13,6 +14,7 @@ pub mod state;
 pub mod storage;
 pub mod telemetry;
 pub mod tenant_cleanup;
+pub mod workspace_admin_recovery;
 
 use auth::authz::{Object, Relation};
 use axum::{
@@ -319,10 +321,15 @@ pub fn app_router(state: AppState) -> Router {
             "/workspaces/{workspace_id}/members/{member_id}",
             delete(remove_workspace_member).patch(update_workspace_member_role),
         )
+        .fallback(|| async { crate::api_error::not_found().await })
+        .method_not_allowed_fallback(|| async { crate::api_error::method_not_allowed().await })
         .layer(axum::middleware::from_fn(
             telemetry::http_metrics_middleware,
         ))
         .layer(rate_limit_layer)
+        .layer(axum::middleware::from_fn(
+            api_error::normalize_error_responses,
+        ))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(cors)
         .with_state(state)

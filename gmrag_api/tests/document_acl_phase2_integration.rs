@@ -429,6 +429,9 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
     assert_eq!(unknown_preview.status(), reqwest::StatusCode::NOT_FOUND);
     let unknown_preview_body = unknown_preview.text().await.unwrap();
     assert_eq!(member_preview_body, unknown_preview_body);
+    let preview_error: Value = serde_json::from_str(&member_preview_body).unwrap();
+    assert_eq!(preview_error["error"]["code"], "RESOURCE_NOT_FOUND");
+    assert!(preview_error["error"]["message"].is_string());
 
     let viewer_preview = client
         .get(format!(
@@ -477,6 +480,9 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
     assert_eq!(unknown_chunk.status(), reqwest::StatusCode::NOT_FOUND);
     let unknown_chunk_body = unknown_chunk.text().await.unwrap();
     assert_eq!(member_chunk_body, unknown_chunk_body);
+    let chunk_error: Value = serde_json::from_str(&member_chunk_body).unwrap();
+    assert_eq!(chunk_error["error"]["code"], "RESOURCE_NOT_FOUND");
+    assert!(chunk_error["error"]["message"].is_string());
 
     let viewer_chunk = client
         .get(format!(

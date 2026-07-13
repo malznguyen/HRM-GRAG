@@ -163,6 +163,7 @@ impl KeycloakClient {
         let expected_email = normalize_email(email);
         let verified_user = users.into_iter().find(|user| {
             user.email_verified.unwrap_or(false)
+                && user.enabled.unwrap_or(true)
                 && user
                     .email
                     .as_deref()

@@ -1,3 +1,4 @@
+use crate::api_error::ApiError;
 use crate::auth::jwt::JwtError;
 use crate::state::AppState;
 use axum::{
@@ -12,16 +13,19 @@ pub struct AuthUser {
 }
 
 impl FromRequestParts<AppState> for AuthUser {
-    type Rejection = (StatusCode, &'static str);
+    type Rejection = ApiError;
 
     async fn from_request_parts(
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let token = bearer_token(parts).ok_or((
-            StatusCode::UNAUTHORIZED,
-            "Missing or invalid Authorization header",
-        ))?;
+        let token = bearer_token(parts).ok_or_else(|| {
+            ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "UNAUTHORIZED",
+                "Missing or invalid Authorization header",
+            )
+        })?;
 
         let claims = state.jwt.validate(token).await.map_err(jwt_rejection)?;
 
@@ -39,14 +43,18 @@ fn bearer_token(parts: &Parts) -> Option<&str> {
     value.strip_prefix(prefix).filter(|t| !t.is_empty())
 }
 
-fn jwt_rejection(err: JwtError) -> (StatusCode, &'static str) {
+fn jwt_rejection(err: JwtError) -> ApiError {
     match err {
-        JwtError::MissingConfig(_) | JwtError::InvalidConfig(_) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, "JWT not configured")
-        }
+        JwtError::MissingConfig(_) | JwtError::InvalidConfig(_) => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "Authentication service unavailable",
+        ),
         JwtError::FetchJwks | JwtError::InvalidJwks | JwtError::UnknownKeyId => {
-            (StatusCode::UNAUTHORIZED, "Invalid token")
+            ApiError::new(StatusCode::UNAUTHORIZED, "INVALID_TOKEN", "Invalid token")
         }
-        JwtError::InvalidToken => (StatusCode::UNAUTHORIZED, "Invalid token"),
+        JwtError::InvalidToken => {
+            ApiError::new(StatusCode::UNAUTHORIZED, "INVALID_TOKEN", "Invalid token")
+        }
     }
 }

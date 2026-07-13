@@ -402,13 +402,10 @@ async fn upload_rejects_non_pdf_bytes_with_pdf_filename_without_creating_storage
         .await
         .unwrap();
 
-    // Contract: empty 400 when no acceptable PDF was accepted
     assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
-    let body = response.bytes().await.unwrap();
-    assert!(
-        body.is_empty(),
-        "rejected non-PDF upload must keep empty 400 body"
-    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "INVALID_REQUEST");
+    assert!(body["error"]["message"].is_string());
 
     let docs_after: i64 =
         sqlx::query_scalar("SELECT COUNT(*)::bigint FROM documents WHERE workspace_id = $1")

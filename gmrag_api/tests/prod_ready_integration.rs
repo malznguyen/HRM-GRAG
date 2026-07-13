@@ -76,10 +76,12 @@ async fn ready_returns_503_when_postgres_is_down() {
 
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     let payload: serde_json::Value = response.json().await.expect("/ready payload as JSON");
-    assert_eq!(payload["status"], "not_ready");
-    assert_eq!(dependency_health(&payload, "postgres"), Some(false));
-    assert_eq!(dependency_health(&payload, "openfga"), Some(true));
-    assert!(failed_dependencies(&payload).contains(&"postgres"));
+    assert_eq!(payload["error"]["code"], "SERVICE_UNAVAILABLE");
+    let details = &payload["error"]["details"];
+    assert_eq!(details["status"], "not_ready");
+    assert_eq!(dependency_health(details, "postgres"), Some(false));
+    assert_eq!(dependency_health(details, "openfga"), Some(true));
+    assert!(failed_dependencies(details).contains(&"postgres"));
 }
 
 #[tokio::test]
@@ -107,10 +109,12 @@ async fn ready_returns_503_when_openfga_is_down() {
 
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     let payload: serde_json::Value = response.json().await.expect("/ready payload as JSON");
-    assert_eq!(payload["status"], "not_ready");
-    assert_eq!(dependency_health(&payload, "postgres"), Some(true));
-    assert_eq!(dependency_health(&payload, "openfga"), Some(false));
-    assert!(failed_dependencies(&payload).contains(&"openfga"));
+    assert_eq!(payload["error"]["code"], "SERVICE_UNAVAILABLE");
+    let details = &payload["error"]["details"];
+    assert_eq!(details["status"], "not_ready");
+    assert_eq!(dependency_health(details, "postgres"), Some(true));
+    assert_eq!(dependency_health(details, "openfga"), Some(false));
+    assert!(failed_dependencies(details).contains(&"openfga"));
 }
 
 async fn openfga_check_stub() -> Json<serde_json::Value> {

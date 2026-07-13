@@ -2,7 +2,7 @@
 
 GMRAG is a multi-tenant GraphRAG platform under active refactor.
 
-Current live architecture after Phase 2 + Phase 3A hardening:
+Current live architecture after Phase 4 API consistency and defense-in-depth closure:
 
 - tenant and workspace hierarchy in PostgreSQL,
 - OpenFGA as the authorization source of truth,
@@ -35,6 +35,7 @@ Historical v1 audit snapshots are archived under `docs/archive/v1/`.
 | Phase 3A hardening | ✅ complete — authz outbox processor, storage cleanup, invite-placeholder cleanup, audit trail (see `docs/RUNBOOK.md`) |
 | Phase 1 durable ingestion | ✅ complete — API enqueue only; independent worker claim/lease, retry/backoff, stable Qdrant replay, restart recovery, and terminal failure states (see `docs/RUNBOOK.md` §11) |
 | Phase 3B/3C | 🟡 partial — Qdrant lifecycle/outbox (claim, backoff, `DEAD`) + orphan cleanup shipped; daemon orchestration and other follow-up remain (see `docs/authz-refactor-taskboard.md`) |
+| Phase 4 | ✅ complete — shared JSON API errors, hidden-not-found ACL behavior, operator-only workspace-admin recovery, route contract coverage, and ADR-25 (PostgreSQL RLS deferred) |
 
 ## Local Services
 
@@ -201,6 +202,8 @@ cargo test --locked --test document_acl_phase2_integration -- --test-threads=1
 cargo test --locked --test storage_integration -- --nocapture
 cargo test --locked --test phase3a_hardening_integration -- --test-threads=1
 cargo test --locked --test graph_node_embedding_backfill_integration -- --test-threads=1
+cargo test --locked --test phase4_api_contract -- --test-threads=1
+cargo test --locked --test workspace_admin_recovery -- --test-threads=1
 ```
 
 Real-Keycloak identity E2E (requires local Docker Keycloak/Postgres/OpenFGA and a running API with real JWT config, not bypass):
@@ -225,3 +228,4 @@ Identity E2E cleanup removes tracked SQL rows, Keycloak `e2e_` users, and OpenFG
 - Document-level ACL enforcement, restricted-document behavior, and Qdrant retrieval are fully implemented and verified.
 - Document/workspace delete is SQL-first with transactional outbox rows then **best-effort** S3/Qdrant cleanup (not a distributed transaction). Recovery: `process-storage-outbox` / `process-qdrant-outbox` / `cleanup-qdrant-orphans` — see `docs/RUNBOOK.md` §3 and §7. Scheduled storage outbox is OPS-003; tenant cascade is LIFE-005.
 - Operator runbook for Phase 2/3A/3B (including Ollama, HNSW, graph node embedding backfill, and Qdrant outbox) is in `docs/RUNBOOK.md`.
+- HTTP application failures use the shared JSON envelope `{ "error": { "code", "message", "details"? } }`; successful `204` responses intentionally remain bodyless. `recover-workspace-admin` is an operator-only CLI, never an HTTP bypass.

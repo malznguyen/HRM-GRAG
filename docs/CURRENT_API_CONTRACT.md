@@ -1,7 +1,7 @@
 # Current API Contract
 
-This document reflects the routes registered by `gmrag_api/src/lib.rs` after Phase 2
-and Phase 3 hardening.
+This document reflects the routes registered by `gmrag_api/src/lib.rs` after Phase 4
+API consistency and defense-in-depth closure.
 Historical audit snapshots are archived under `docs/archive/v1/`.
 
 Phase 3 adds operational endpoints for deployment/runtime observability:
@@ -50,13 +50,26 @@ Current relation-to-error mapping for `403` responses:
 
 ### Error Response Format
 
-The API is partially standardized today.
+Every HTTP application failure returns the JSON envelope shown below. This includes
+handler failures, JWT/authz extraction failures, Axum request rejections, rate
+limits, unknown routes, wrong methods, readiness failures, and initial chat
+generation failures before SSE starts. Client messages are sanitized and never
+contain raw SQL, OpenFGA, Keycloak, storage, or provider response bodies.
 
-- Authz denials use the JSON envelope shown above.
-- `POST /workspaces/{workspace_id}/documents/{document_id}/retry` also returns a JSON envelope for `410 DOCUMENT_OBJECT_MISSING`.
-- `POST /workspaces/{workspace_id}/members` returns a JSON envelope for `404 USER_NOT_FOUND_IN_IDENTITY` when the target email is not a verified Keycloak user (see Workspace Members).
-- `DELETE /workspaces/{workspace_id}/members/{member_id}` returns JSON envelopes for `500 AUTHZ_REVOKE_FAILED` and `500 MEMBER_REMOVE_FAILED` (fail-closed revoke; see Workspace Members).
-- Many validation, not-found, and internal errors still return plain text or an empty body.
+```json
+{
+  "error": {
+    "code": "STABLE_MACHINE_CODE",
+    "message": "Safe client-facing message",
+    "details": {}
+  }
+}
+```
+
+`details` is omitted unless safe and useful. `GET /ready` returns `503
+SERVICE_UNAVAILABLE` with its dependency report in `error.details`. Success
+`204` responses and successful `/metrics` Prometheus output intentionally do
+not use this envelope.
 
 ### Rate Limiting
 
@@ -77,6 +90,10 @@ The API is partially standardized today.
 - Public API responses do not expose raw storage object keys.
 
 ## Endpoint Inventory
+
+All endpoint-specific error bullets below define only the relevant HTTP status
+and stable domain code; the cross-cutting Phase 4 error contract applies to
+every application failure.
 
 | Method | Path | Authorization |
 | --- | --- | --- |
@@ -118,7 +135,7 @@ The API is partially standardized today.
 - Authorization: none.
 - Request body: none.
 - Success: `200` with `{ status, db }`.
-- Errors: `500` empty body if `SELECT 1` fails.
+- Errors: `500 INTERNAL_ERROR` JSON envelope if `SELECT 1` fails.
 - Side effects: none.
 - Security notes: safe public liveness check only.
 
@@ -128,7 +145,7 @@ The API is partially standardized today.
 - Authorization: none.
 - Request body: none.
 - Success: `200` with JSON `{ status: "ready", role, dependencies, failed_dependencies }` when every required dependency for `APP_RUNTIME_ROLE` is healthy.
-- Errors: `503` with the same JSON shape and `status: "not_ready"` when one or more required dependencies fail.
+- Errors: `503` JSON envelope `SERVICE_UNAVAILABLE` when one or more required dependencies fail. Its `error.details` is `{ status: "not_ready", role, dependencies, failed_dependencies }`.
 - Dependency matrix by role: `api` requires PostgreSQL + OpenFGA; `ingestion-worker` requires PostgreSQL + Qdrant + object storage; `process-authz-outbox` requires PostgreSQL + OpenFGA; `process-qdrant-outbox` requires PostgreSQL + Qdrant; `storage-worker` requires PostgreSQL + object storage.
 - Side effects: none.
 - Security notes: dependency checks are metadata only (no mutation); this endpoint is intended for orchestrator readiness probes.
@@ -151,7 +168,7 @@ The API is partially standardized today.
 - Authorization: any authenticated user.
 - Request body: none.
 - Success: `200` with the current SQL user row plus a boolean platform-admin flag derived from OpenFGA.
-- Errors: `404` plain text `User not found`; `500` empty body on DB failure.
+- Errors: `404 RESOURCE_NOT_FOUND`; `500 INTERNAL_ERROR`, both JSON envelopes.
 - Side effects: none (invite reconciliation was removed from this path).
 - Security notes: platform-admin status is derived from OpenFGA, not a SQL column.
 
@@ -161,7 +178,7 @@ The API is partially standardized today.
 - Authorization: any authenticated user.
 - Request body: none.
 - Success: `200` empty body.
-- Errors: `400` JSON `IDENTITY_EMAIL_REQUIRED` or `IDENTITY_EMAIL_UNVERIFIED`; `409` JSON `IDENTITY_EMAIL_CONFLICT`; `500` empty body on upsert failure.
+- Errors: `400 IDENTITY_EMAIL_REQUIRED` or `IDENTITY_EMAIL_UNVERIFIED`; `409 IDENTITY_EMAIL_CONFLICT`; `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: upserts the SQL `users` row for verified JWT `sub` + verified `email` claim. It never accepts an email from the request body and never reconciles identities.
 
 ## Tenant And Workspace Lifecycle
@@ -172,7 +189,7 @@ The API is partially standardized today.
 - Authorization: `admin` on `platform:system`.
 - Request body: JSON `{ "name": "Tenant Name" }`.
 - Success: `201` with `{ id, name, created_at }`.
-- Errors: `400` plain text `Tenant name is required`; `403` JSON authz envelope; `500` empty body on SQL or OpenFGA write failure.
+- Errors: `400 INVALID_REQUEST`; authz `403`; `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: inserts the tenant row and writes the `platform -> tenant` tuple in OpenFGA.
 - Security notes: creating a tenant does not grant the caller implicit business-data access inside its workspaces.
 
@@ -182,7 +199,7 @@ The API is partially standardized today.
 - Authorization: `admin` on `platform:system`.
 - Request body: JSON `{ "email": "owner@example.com" }`.
 - Success: `204` empty body.
-- Errors: `400` plain text for invalid email or unverified/missing Keycloak user; `403` JSON authz envelope; `500` empty body on lookup, SQL, or OpenFGA failure.
+- Errors: `400 INVALID_REQUEST`; authz `403`; `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: ensures a SQL `users` row exists, inserts `tenant_members`, and writes the `user owner tenant` tuple.
 - Security notes: only verified users from Keycloak are accepted as tenant owners.
 
@@ -192,7 +209,7 @@ The API is partially standardized today.
 - Authorization: `owner` on `tenant:{tenant_id}`.
 - Request body: JSON `{ "name": "Workspace Name" }`.
 - Success: `201` with `{ id, name, created_at }`.
-- Errors: `400` plain text `Workspace name is required`; `403` JSON authz envelope; `500` empty body on SQL or OpenFGA failure.
+- Errors: `400 INVALID_REQUEST`; authz `403`; `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: inserts the workspace row, inserts a SQL `workspace_members` admin row for the creator, writes the `tenant -> workspace` tuple, and writes the workspace-admin tuple for the creator.
 - Security notes: current workspace creation is tenant-owner only.
 
@@ -202,7 +219,7 @@ The API is partially standardized today.
 - Authorization: any authenticated user; each SQL candidate is then checked for OpenFGA `member` on `workspace:{id}` (admin and tenant owner inherit `member` via the model).
 - Request body: none.
 - Success: `200` with an array of `{ id, name, created_at }` that pass **both** SQL candidate membership (workspace_members or tenant OWNER) **and** OpenFGA `member`. Deterministic order by `created_at DESC`; duplicates removed.
-- Errors: `500` empty body on SQL failure; `500` JSON `AUTHZ_ERROR` if OpenFGA check fails (fail-closed — never returns the SQL-only candidate list).
+- Errors: `500 INTERNAL_ERROR` on SQL failure or `500 AUTHZ_ERROR` if OpenFGA check fails; both are JSON envelopes and never return the SQL-only candidate list.
 - Side effects: none.
 - Security notes: SQL membership is a read-model candidate list only. Stale SQL rows without an OpenFGA relation are omitted. Platform Admin without a business relation is not listed.
 
@@ -227,7 +244,7 @@ Payload limitation: points do not carry `tenant_id` (workspace list only). See
 - Authorization: `can_assign_role` on `workspace:{workspace_id}`.
 - Request body: none.
 - Success: `204` empty body.
-- Errors: `403` JSON authz envelope; `404` empty body if the workspace row does not exist; `500` empty body on SQL failure.
+- Errors: authz `403`; `404 RESOURCE_NOT_FOUND`; `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: deletes the workspace row and cascades workspace data in the same PostgreSQL transaction as inserting `qdrant_outbox` (`delete_by_workspace`) and `storage_outbox` (`delete_prefix` with canonical `tenants/{tenant_id}/workspaces/{workspace_id}/` prefix, SQL-trusted tenant/workspace IDs, and configured storage bucket — not client-supplied). Then best-effort deletes the `tenant -> workspace` tuple from OpenFGA and best-effort deletes Qdrant points filtered by `workspace_id` (`wait=true` + short request timeout `QDRANT_DELETE_REQUEST_TIMEOUT_SECS`). Qdrant failure/timeout does not fail HTTP once SQL has committed; worker recovery uses longer `QDRANT_DELETE_WORKER_TIMEOUT_SECS`. **No** S3 prefix delete runs on the HTTP request path; prefix recovery is via `process-storage-outbox` (unattended scheduling: OPS-003).
 - Security notes: Qdrant cleanup runs after SQL commit; failures are logged and reflected in audit metadata (`qdrant_workspace_delete_succeeded`) and do not fail the HTTP delete once SQL has committed. Storage prefix cleanup is durable via `storage_outbox` after SQL commit (LIFE-004); missing workspace leaves no outbox row. Tenant-wide cascade strategy remains LIFE-005.
 
@@ -239,7 +256,7 @@ Payload limitation: points do not carry `tenant_id` (workspace list only). See
 - Authorization: `member` on `workspace:{workspace_id}`.
 - Request body: none.
 - Success: `200` with an array of member rows containing user id, email, role, and join time.
-- Errors: `403` JSON authz envelope; `500` empty body on SQL failure.
+- Errors: authz `403` or `500 INTERNAL_ERROR`, both JSON envelopes.
 - Side effects: none.
 - Security notes: role values are SQL read-model data; authorization still comes from OpenFGA.
 
@@ -260,7 +277,7 @@ Payload limitation: points do not carry `tenant_id` (workspace list only). See
   | `403` | JSON `ROLE_ASSIGNMENT_DENIED` / message *Only tenant owners can assign workspace admin roles* | Workspace Admin (or other non-owner) requested `role=admin` |
   | `404` | JSON `USER_NOT_FOUND_IN_IDENTITY` | Keycloak has no **verified** user for that email |
   | `409` | JSON `ALREADY_WORKSPACE_MEMBER` | Membership row already exists |
-  | `500` | empty body | Keycloak lookup, SQL, or unexpected failure |
+  | `500` | JSON `INTERNAL_ERROR` | Keycloak lookup, SQL, or unexpected failure |
 - Side effects (only after all authz checks pass):
   1. Looks up a **verified** Keycloak user by email.
   2. Upserts SQL `users` with Keycloak `sub` + email (no `invite_*`).
@@ -275,7 +292,7 @@ Payload limitation: points do not carry `tenant_id` (workspace list only). See
 - Authorization: `can_assign_role` on `workspace:{workspace_id}` (Tenant Owner only).
 - Request body: JSON `{ "role": "member|admin" }` only.
 - Success: `204` empty body. Idempotent if already that role.
-- Errors: `400` JSON `INVALID_MEMBER_ROLE`; `403` JSON authz envelope; `404` empty body if member missing; `409` JSON `LAST_WORKSPACE_ADMIN` when demoting the last valid management path (see below); `500` on SQL/OpenFGA failure.
+- Errors: `400 INVALID_MEMBER_ROLE`; authz `403`; `404 RESOURCE_NOT_FOUND`; `409 LAST_WORKSPACE_ADMIN`; or `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: serializes via workspace row lock (`FOR UPDATE`), reloads target role, last-admin guard on ADMIN→MEMBER, then updates SQL + swaps OpenFGA tuples before commit.
 - Security notes: role changes are tenant-owner-only. Last-admin guard requires another verified workspace ADMIN (SQL + FGA) or a valid Tenant Owner (SQL OWNER + FGA owner on tenant).
 
@@ -288,7 +305,7 @@ Payload limitation: points do not carry `tenant_id` (workspace list only). See
 - Errors:
   - `400` JSON `CANNOT_REMOVE_SELF`
   - `403` JSON authz envelope
-  - `404` empty body if the member row is not found
+  - `404` JSON `RESOURCE_NOT_FOUND` if the member row is not found
   - `409` JSON `LAST_WORKSPACE_ADMIN` when removing the last valid management path
   - `500` JSON `AUTHZ_REVOKE_FAILED` when OpenFGA revoke fails — SQL is not mutated
   - `500` JSON `MEMBER_REMOVE_FAILED` when SQL deletion fails after a successful OpenFGA revoke
@@ -308,7 +325,7 @@ Payload limitation: points do not carry `tenant_id` (workspace list only). See
 - Authorization: `member` on `workspace:{workspace_id}`.
 - Request body: none.
 - Success: `200` with document rows containing `id`, `filename`, `status`, `processing_stage`, optional `failure_code`/`failure_message`, and `created_at`.
-- Errors: `403` JSON authz envelope; `500` empty body on SQL failure.
+- Errors: authz `403` or `500 INTERNAL_ERROR`, both JSON envelopes.
 - Side effects: none.
 - Security notes: visibility is ACL-scoped; users only see documents they have explicit or bypass viewer access to.
 
@@ -318,7 +335,7 @@ Payload limitation: points do not carry `tenant_id` (workspace list only). See
 - Authorization: `admin` on `workspace:{workspace_id}`.
 - Request body: `multipart/form-data` with one or more `file` parts, and an optional text field `access_mode` (`workspace_default` | `restricted`). When omitted, `access_mode` defaults to `workspace_default`. The same `access_mode` applies to every accepted file in the request.
 - Success: `202` with `{ documents: [{ document_id, filename }] }` for the accepted files.
-- Errors: `400` empty body if no acceptable PDF was accepted; `400` JSON `{"error":{"code":"INVALID_ACCESS_MODE","message":"access_mode must be workspace_default or restricted"}}` if `access_mode` is present but not one of the two allowed values; `403` JSON authz envelope; `404` empty body if the workspace cannot be resolved to a tenant; `500` empty body on tenant lookup failure.
+- Errors: `400 INVALID_REQUEST` when no acceptable PDF is accepted; `400 INVALID_ACCESS_MODE`; authz `403`; `404 RESOURCE_NOT_FOUND`; or `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: uploads original bytes to MinIO/S3, then atomically inserts `documents` metadata (including `access_mode`) and one durable `ingestion_jobs` row. Processing is performed by the separate ingestion worker after commit.
 - Security notes: filename and client MIME type are stored as metadata only. Acceptance requires a `%PDF-` signature and successful structural validation (`lopdf`) of the submitted bytes before object-key generation or S3/MinIO upload; a filename suffix alone is never enough. Responses do not expose raw object keys. Uploading as `restricted` does not auto-create `document_shares` or `explicit_viewer` tuples for the uploader; visibility follows the same restricted-document rules as after `PATCH .../access-mode`.
 
@@ -328,7 +345,7 @@ Payload limitation: points do not carry `tenant_id` (workspace list only). See
 - Authorization: `admin` on `workspace:{workspace_id}`.
 - Request body: none.
 - Success: `204` empty body.
-- Errors: `403` JSON authz envelope; `404` empty body if the document row does not exist in the workspace; `500` empty body on SQL failure.
+- Errors: authz `403`; `404 RESOURCE_NOT_FOUND`; or `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: removes graph provenance, the document row, and inserts `qdrant_outbox` (`delete_by_document`) plus `storage_outbox` (`delete_object` with SQL-captured `object_key`/`bucket`) in one SQL transaction, then best-effort deletes the storage object and Qdrant points for that `document_id` (filtered with `workspace_id` + `document_id`). HTTP remains `204` on storage/Qdrant failure after commit.
 - Security notes: storage and Qdrant deletes happen after SQL commit; Qdrant uses `wait=true` + short request timeout (`QDRANT_DELETE_REQUEST_TIMEOUT_SECS`). Qdrant recovery row is committed with the SQL delete (LIFE-001); storage recovery row is also committed with the SQL delete (LIFE-003). Worker retries: `process-qdrant-outbox` / `process-storage-outbox`. Cleanup failures are logged and reflected in audit metadata (`storage_delete_succeeded`, `qdrant_delete_succeeded`) for later remediation. They do not fail the HTTP delete once SQL has committed. Object keys are not exposed to the client.
 
@@ -338,7 +355,7 @@ Payload limitation: points do not carry `tenant_id` (workspace list only). See
 - Authorization: `admin` on `workspace:{workspace_id}`.
 - Request body: none.
 - Success: `202` empty body.
-- Errors: `403` JSON authz envelope; `404` empty body if the document is missing; `409` JSON `DOCUMENT_NOT_RETRYABLE` when it is not a failed document with no active job; `410` JSON `{ "error": { "code": "DOCUMENT_OBJECT_MISSING", "message": "Original document object is missing" } }`; `500` empty body on SQL or storage lookup failure.
+- Errors: authz `403`; `404 RESOURCE_NOT_FOUND`; `409 DOCUMENT_NOT_RETRYABLE`; `410 DOCUMENT_OBJECT_MISSING`; or `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: checks object existence in MinIO/S3, then atomically resets a `FAILED` document to `PROCESSING` / `QUEUED`, clears prior failure fields, and inserts exactly one durable job. Concurrent retries have one `202` winner.
 - Invariant: only `COMPLETED` / `DONE` documents can contribute Qdrant chunks to chat retrieval. `INDEXING` is the final non-terminal processing stage.
 - Security notes: retry is object-storage-based and does not depend on a local source file.
@@ -383,7 +400,7 @@ write metadata-only audit rows. See `docs/RUNBOOK.md` (OCR-004 section).
 - Authorization: `admin` on `workspace:{workspace_id}`.
 - Request body: JSON `{ "access_mode": "workspace_default" | "restricted" }`.
 - Success: `204` empty body.
-- Errors: `400` JSON `{"error":{"code":"INVALID_ACCESS_MODE","message":"access_mode must be workspace_default or restricted"}}`; `403` JSON authz envelope; `404` empty body if the document does not exist in the workspace; `500` empty body on SQL or OpenFGA failure.
+- Errors: `400 INVALID_ACCESS_MODE`; authz `403`; `404 RESOURCE_NOT_FOUND`; or `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: updates `documents.access_mode`; when the target mode is `workspace_default`, deletes all `document_shares` rows for the document and removes the corresponding `explicit_viewer` OpenFGA tuples (OpenFGA first, then SQL); writes a metadata-only `audit_events` row recording the previous mode, new mode, and `shares_cleaned` count.
 - Security notes: mode is updated before share cleanup so a mid-cleanup failure cannot leave the document `restricted` without its prior explicit viewers. Cleanup also runs on re-apply of `workspace_default` so a partial previous cleanup can be retried safely. Setting `restricted` does not create shares.
 
@@ -393,7 +410,7 @@ write metadata-only audit rows. See `docs/RUNBOOK.md` (OCR-004 section).
 - Authorization: `admin` on `workspace:{workspace_id}`.
 - Request body: none.
 - Success: `201` empty body.
-- Errors: `400` JSON `USER_NOT_WORKSPACE_MEMBER` when target fails **SQL membership or OpenFGA `member`** (including stale SQL after FGA revoke); `403` JSON authz envelope; `404` empty body if the document does not exist in the workspace; `500` JSON `AUTHZ_ERROR` if OpenFGA check fails (fail-closed, no share/tuple write); `500` empty body on other SQL/OpenFGA grant failures.
+- Errors: `400 USER_NOT_WORKSPACE_MEMBER`; authz `403`; `404 RESOURCE_NOT_FOUND`; `500 AUTHZ_ERROR` on fail-closed membership check; or `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: verifies SQL `workspace_members` **and** OpenFGA `member` (admin inherits member), then inserts `document_shares`, writes `explicit_viewer`, and audit. No mutation when either membership check fails.
 - Security notes: this only grants viewer access; it does not change `documents.access_mode`. FGA-only membership without SQL row is also denied under current business contract.
 
@@ -403,7 +420,7 @@ write metadata-only audit rows. See `docs/RUNBOOK.md` (OCR-004 section).
 - Authorization: `admin` on `workspace:{workspace_id}`.
 - Request body: none.
 - Success: `204` empty body.
-- Errors: `403` JSON authz envelope; `404` empty body if the document does not exist in the workspace; `500` empty body on SQL or OpenFGA failure.
+- Errors: authz `403`; `404 RESOURCE_NOT_FOUND`; or `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: deletes the matching `document_shares` row, removes the `explicit_viewer` OpenFGA tuple, and writes a metadata-only `audit_events` row.
 - Security notes: revoking a share that does not exist is not specifically guarded against and currently succeeds as a no-op-equivalent deletion; verify this against `gmrag_api/src/auth/document_acl.rs::revoke_document_explicit_viewer` if idempotency guarantees matter for your use case.
 
@@ -413,7 +430,7 @@ write metadata-only audit rows. See `docs/RUNBOOK.md` (OCR-004 section).
 - Authorization: `member` on `workspace:{workspace_id}`.
 - Request body: none.
 - Success: `200` with `{ content, chunks }`, where `chunks` is ordered by `chunk_index`.
-- Errors: `403` JSON authz envelope; `404` empty body if the document is missing; `409` empty body if the document is not `COMPLETED`; `500` empty body on SQL failure.
+- Errors: authz `403`; `404 RESOURCE_NOT_FOUND`; `409 CONFLICT` when the document is not `COMPLETED`; or `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: none.
 - Security notes: preview checks document-level ACL viewer permissions.
 
@@ -423,7 +440,7 @@ write metadata-only audit rows. See `docs/RUNBOOK.md` (OCR-004 section).
 - Authorization: `member` on `workspace:{workspace_id}`.
 - Request body: none.
 - Success: `200` with `{ id, original_text }`.
-- Errors: `403` JSON authz envelope; `404` empty body if the chunk is missing; `500` empty body on SQL failure.
+- Errors: authz `403`; `404 RESOURCE_NOT_FOUND`; or `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: none.
 - Security notes: chunk lookup checks document-level ACL viewer permissions.
 
@@ -435,7 +452,7 @@ write metadata-only audit rows. See `docs/RUNBOOK.md` (OCR-004 section).
 - Authorization: `member` on `workspace:{workspace_id}`, then chat-session ownership inside the session helpers.
 - Request body: JSON `{ "session_id": "uuid", "message": "..." }`.
 - Success: `200` `text/event-stream`.
-- Errors: `400` plain text `Message is required`; `403` JSON authz envelope or plain text `Chat session not accessible`; `502` plain text `Generation service unavailable` for DeepSeek failures (including upstream status, timeout, and stream errors); `500` plain text or empty body on DB failure. Upstream response bodies and credentials are never exposed in HTTP or SSE error payloads.
+- Errors before SSE begins: `400 INVALID_REQUEST`, `403 FORBIDDEN`, `502 GENERATION_SERVICE_UNAVAILABLE`, or `500 INTERNAL_ERROR` JSON envelopes. After SSE starts, the protocol uses a sanitized `error` event. Upstream response bodies and credentials are never exposed.
 - Side effects: ensures the chat session, persists the user message, builds RAG context, streams model tokens, resolves citations, and persists the assistant message after streaming.
 - Security notes: retrieval is ACL-scoped and uses Qdrant filter-then-search to ensure only permitted chunks are processed, backed by OpenFGA viewer permission re-checks.
 - Timeout/cancellation notes: DeepSeek request establishment is bounded by `DEEPSEEK_REQUEST_TIMEOUT_SECS`; stream idle gaps are bounded by `DEEPSEEK_STREAM_IDLE_TIMEOUT_SECS`; when the SSE client disconnects, the upstream stream is dropped/cancelled by connection teardown.
@@ -453,7 +470,7 @@ Current SSE events:
 - Request body: none.
 - Query: `session_id=<uuid>`.
 - Success: `200` with ordered chat messages containing `id`, `role`, `content`, `citations`, and `created_at`.
-- Errors: `403` JSON authz envelope or plain text `Chat session not accessible`; `500` empty body on SQL failure.
+- Errors: `403 FORBIDDEN` or `500 INTERNAL_ERROR` JSON envelopes.
 - Side effects: none.
 - Security notes: a missing session currently returns `200 []` instead of `404`.
 
@@ -463,7 +480,7 @@ Current SSE events:
 - Authorization: `member` on `workspace:{workspace_id}`.
 - Request body: none.
 - Success: `200` with session summaries `{ id, title, created_at }` owned by the caller.
-- Errors: `403` JSON authz envelope; `500` empty body on SQL failure.
+- Errors: authz `403` or `500 INTERNAL_ERROR`, both JSON envelopes.
 - Side effects: none.
 - Security notes: callers only see their own chat sessions, not other members' sessions.
 
@@ -473,7 +490,7 @@ Current SSE events:
 - Authorization: `member` on `workspace:{workspace_id}` plus chat-session ownership.
 - Request body: none.
 - Success: `200` with ordered message rows containing structured `citations`.
-- Errors: `403` JSON authz envelope or plain text `Chat session not accessible`; `500` empty body on SQL failure.
+- Errors: `403 FORBIDDEN` or `500 INTERNAL_ERROR` JSON envelopes.
 - Side effects: none.
 - Security notes: a missing session currently returns `200 []` instead of `404`.
 
@@ -483,7 +500,7 @@ Current SSE events:
 - Authorization: `member` on `workspace:{workspace_id}` plus chat-session ownership.
 - Request body: none.
 - Success: `204` empty body.
-- Errors: `403` JSON authz envelope or plain text `Chat session not accessible`; `404` empty body if the session does not exist; `500` empty body on SQL failure.
+- Errors: `403 FORBIDDEN`, `404 RESOURCE_NOT_FOUND`, or `500 INTERNAL_ERROR` JSON envelopes.
 - Side effects: deletes the chat session row and cascades chat messages.
 - Security notes: only the owner can delete a session.
 
@@ -495,6 +512,17 @@ Current SSE events:
 - Authorization: `member` on `workspace:{workspace_id}`.
 - Request body: none.
 - Success: `200` with `{ nodes, links }`, where nodes expose entity metadata and links expose `source`, `target`, `relationship`, and `description`.
-- Errors: `403` JSON authz envelope; `500` empty body on SQL failure.
+- Errors: authz `403` or `500 INTERNAL_ERROR`, both JSON envelopes.
 - Side effects: none.
+
 - Security notes: graph nodes and edges are filtered to only return sources the user has document-level ACL access to.
+
+## Phase 4 visibility policy
+
+| Boundary | Unauthorized behavior |
+| --- | --- |
+| Workspace membership | `403` envelope theo workspace boundary contract. |
+| Restricted document, preview, chunk, citation | `404 RESOURCE_NOT_FOUND`, giống resource không tồn tại. |
+| Document list, graph, retrieval, chat citations | Omit resource; không placeholder. |
+| Chat session không thuộc caller | Không phân biệt session của người khác với session không tồn tại khi helper ownership trả hidden result. |
+| Admin mutation | Check OpenFGA workspace relation trước resource mutation; deny không tạo SQL/FGA/outbox side effect. |

@@ -1,8 +1,6 @@
 use axum::{
-    Json,
     extract::FromRequestParts,
     http::{StatusCode, request::Parts},
-    response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -11,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+pub use crate::api_error::ApiError;
 use crate::auth::extractor::AuthUser;
 use crate::state::AppState;
 
@@ -452,37 +451,6 @@ impl AuthzClient {
     }
 }
 
-/// Cấu trúc phản hồi lỗi chuẩn của API
-#[derive(Serialize)]
-pub struct ApiErrorPayload {
-    pub code: String,
-    pub message: String,
-}
-
-#[derive(Serialize)]
-pub struct ApiErrorResponse {
-    pub error: ApiErrorPayload,
-}
-
-#[derive(Debug)]
-pub struct ApiError {
-    pub status: StatusCode,
-    pub code: &'static str,
-    pub message: String,
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let payload = ApiErrorResponse {
-            error: ApiErrorPayload {
-                code: self.code.to_string(),
-                message: self.message,
-            },
-        };
-        (self.status, Json(payload)).into_response()
-    }
-}
-
 /// Extractor của axum thực hiện kiểm tra quyền
 pub struct Authz {
     pub client: AuthzClient,
@@ -509,10 +477,12 @@ impl Authz {
         relation: Relation,
         object: &Object,
     ) -> Result<(), ApiError> {
-        let allowed = self.check(relation, object).await.map_err(|err| ApiError {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "AUTHZ_ERROR",
-            message: format!("Authorization check failed: {}", err),
+        let allowed = self.check(relation, object).await.map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "AUTHZ_ERROR",
+                "Authorization service unavailable",
+            )
         })?;
 
         if allowed {
@@ -534,17 +504,13 @@ impl Authz {
                 }
                 _ => "Access denied".to_string(),
             };
-            Err(ApiError {
-                status: StatusCode::FORBIDDEN,
-                code,
-                message,
-            })
+            Err(ApiError::new(StatusCode::FORBIDDEN, code, message))
         }
     }
 }
 
 impl FromRequestParts<AppState> for Authz {
-    type Rejection = (StatusCode, &'static str);
+    type Rejection = ApiError;
 
     async fn from_request_parts(
         parts: &mut Parts,

@@ -411,7 +411,7 @@ pub async fn list_workspaces(State(state): State<AppState>, authz: Authz) -> imp
             return crate::auth::authz::ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "AUTHZ_ERROR",
-                message: format!("Authorization check failed: {err}"),
+                message: "Authorization service unavailable".to_string(),
             }
             .into_response();
         }

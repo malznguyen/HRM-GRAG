@@ -105,11 +105,11 @@ pub async fn add_workspace_member(
                 }
                 .into_response();
             }
-            Err(err) => {
+            Err(_) => {
                 return ApiError {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
                     code: "AUTHZ_ERROR",
-                    message: format!("Authorization check failed: {err}"),
+                    message: "Authorization service unavailable".to_string(),
                 }
                 .into_response();
             }
