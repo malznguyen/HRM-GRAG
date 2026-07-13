@@ -4,6 +4,8 @@ This document reflects the routes registered by `gmrag_api/src/lib.rs` after Pha
 API consistency and defense-in-depth closure.
 Historical audit snapshots are archived under `docs/archive/v1/`.
 
+**As of Phase 4 source baseline:** `3c865ebaf542c5880b1a83462452ce206b4719bb`.
+
 Phase 3 adds operational endpoints for deployment/runtime observability:
 
 - `GET /ready` for dependency-aware readiness checks.
