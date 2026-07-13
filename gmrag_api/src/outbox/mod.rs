@@ -115,6 +115,14 @@ pub fn parse_env_i32(name: &str, default: i32, min: i32, max: i32) -> i32 {
         .clamp(min, max)
 }
 
+pub fn parse_env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

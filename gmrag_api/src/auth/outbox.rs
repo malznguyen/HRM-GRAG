@@ -114,13 +114,13 @@ impl AuthzOutboxProcessorConfig {
     }
 }
 
-/// Chế độ chạy binary `process-authz-outbox` (one-shot cron vs loop daemon).
+/// Chế độ chạy binary `process-authz-outbox` (one-shot thủ công vs loop Compose).
 ///
-/// Không chứa logic xử lý row — chỉ cấu hình scheduler; processor vẫn là
+/// Không chứa logic xử lý row — chỉ cấu hình vòng lặp; processor vẫn là
 /// [`process_authz_outbox`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthzOutboxRunMode {
-    /// `true` = lặp drain + sleep; `false` = một lần rồi thoát (mặc định cron/timer).
+    /// `true` = lặp drain + sleep; `false` = một lần rồi thoát (mặc định, manual/debug).
     pub loop_mode: bool,
     /// Khoảng nghỉ giữa các lần drain khi `loop_mode` (giây).
     pub interval_secs: u64,
@@ -182,7 +182,7 @@ impl AuthzOutboxRunMode {
 }
 
 /// Exit code binary: `0` khi drain xong (one-shot) hoặc shutdown sạch (loop);
-/// `1` khi lỗi cứng (DB/SQL) — supervisor restart / CronJob OnFailure.
+/// `1` khi lỗi cứng (DB/SQL) — Compose restart (local demo).
 pub const AUTHZ_OUTBOX_EXIT_SUCCESS: i32 = 0;
 pub const AUTHZ_OUTBOX_EXIT_FAILURE: i32 = 1;
 

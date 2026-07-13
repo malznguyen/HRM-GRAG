@@ -65,7 +65,7 @@ async fn run_loop(
     loop {
         let code = run_once(pool, authz_client, config).await;
         if code != 0 {
-            // Thoát non-zero để Compose/systemd/K8s restart — không nuốt lỗi trong loop.
+            // Thoát non-zero để Compose restart — không nuốt lỗi trong loop.
             error!(
                 exit_code = code,
                 "Authz outbox drain failed; exiting for supervisor restart"
@@ -152,8 +152,8 @@ fn print_usage() {
     println!(
         "Usage: process-authz-outbox [--once|--loop] [--interval-secs <n>]\n\n\
          Drains authz_outbox via the shared process_authz_outbox library.\n\
-         Default is --once (cron/timer/CronJob). --loop sleeps between drains;\n\
-         hard failures exit non-zero so a supervisor can restart the process.\n\n\
+         Default is --once (manual/debug). --loop sleeps between drains;\n\
+         hard failures exit non-zero so Docker Compose can restart the process.\n\n\
          Env: DATABASE_URL, OPENFGA_API_URL, OPENFGA_STORE_ID, OPENFGA_MODEL_ID,\n\
               AUTHZ_OUTBOX_BATCH_SIZE, AUTHZ_OUTBOX_MAX_RETRIES,\n\
               AUTHZ_OUTBOX_POLL_INTERVAL_SECS, RUST_LOG"

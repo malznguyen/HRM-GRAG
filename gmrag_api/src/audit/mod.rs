@@ -45,6 +45,10 @@ pub enum AuditEventType {
     TenantDeleteDrillFailed,
     GraphNodeEmbeddingBackfillCompleted,
     GraphNodeEmbeddingBackfillFailed,
+    /// OCR-004 apply bị refuse (OCR capability đóng); metadata-only.
+    OcrAffectedDocumentsApplyRefused,
+    /// OCR-004 bounded requeue đã chạy (khi OCR available); metadata-only.
+    OcrAffectedDocumentsApplyCompleted,
 }
 
 impl AuditEventType {
@@ -103,6 +107,12 @@ impl AuditEventType {
             }
             AuditEventType::GraphNodeEmbeddingBackfillFailed => {
                 "graph_node_embedding_backfill_failed"
+            }
+            AuditEventType::OcrAffectedDocumentsApplyRefused => {
+                "ocr_affected_documents_apply_refused"
+            }
+            AuditEventType::OcrAffectedDocumentsApplyCompleted => {
+                "ocr_affected_documents_apply_completed"
             }
         }
     }

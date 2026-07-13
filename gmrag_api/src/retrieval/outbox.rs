@@ -18,7 +18,7 @@ use uuid::Uuid;
 use super::{RetrievalClient, RetrievalError};
 use crate::outbox::{
     FailureDisposition, OutboxBackoffConfig, STATUS_DEAD, STATUS_FAILED, STATUS_PROCESSED,
-    disposition_after_failure, parse_env_i32, parse_env_i64,
+    disposition_after_failure, parse_env_i32, parse_env_i64, parse_env_u64,
 };
 
 const DEFAULT_QDRANT_OUTBOX_BATCH_SIZE: i64 = 50;
@@ -26,6 +26,7 @@ const DEFAULT_QDRANT_OUTBOX_MAX_RETRIES: i32 = 5;
 const DEFAULT_QDRANT_OUTBOX_BASE_BACKOFF_SECS: i64 = 2;
 const DEFAULT_QDRANT_OUTBOX_MAX_BACKOFF_SECS: i64 = 300;
 const DEFAULT_QDRANT_OUTBOX_CLAIM_LEASE_SECS: i64 = 120;
+const DEFAULT_QDRANT_OUTBOX_POLL_INTERVAL_SECS: u64 = 30;
 const MAX_ERROR_MESSAGE_LEN: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +129,86 @@ impl QdrantOutboxProcessorConfig {
                 ),
             },
         }
+    }
+}
+
+/// Chế độ chạy binary `process-qdrant-outbox` (one-shot thủ công vs loop Compose).
+///
+/// Không chứa logic claim/process row — chỉ cấu hình vòng lặp; processor vẫn là
+/// [`process_qdrant_outbox`] (SKIP LOCKED + lease, multi-replica an toàn).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QdrantOutboxRunMode {
+    /// `true` = lặp drain + sleep; `false` = một lần rồi thoát (mặc định, manual/debug).
+    pub loop_mode: bool,
+    /// Khoảng nghỉ giữa các lần drain khi `loop_mode` (giây).
+    pub interval_secs: u64,
+}
+
+impl Default for QdrantOutboxRunMode {
+    fn default() -> Self {
+        Self {
+            loop_mode: false,
+            interval_secs: DEFAULT_QDRANT_OUTBOX_POLL_INTERVAL_SECS,
+        }
+    }
+}
+
+impl QdrantOutboxRunMode {
+    /// Parse CLI + env. CLI thắng env. Mặc định one-shot.
+    pub fn from_args_and_env(args: &[String]) -> Self {
+        let mut mode = Self {
+            loop_mode: false,
+            interval_secs: parse_env_u64(
+                "QDRANT_OUTBOX_POLL_INTERVAL_SECS",
+                DEFAULT_QDRANT_OUTBOX_POLL_INTERVAL_SECS,
+                1,
+                86_400,
+            ),
+        };
+
+        let mut index = 0;
+        while index < args.len() {
+            let arg = args[index].as_str();
+            match arg {
+                "--loop" => mode.loop_mode = true,
+                "--once" => mode.loop_mode = false,
+                "--interval-secs" => {
+                    index += 1;
+                    if let Some(raw) = args.get(index) {
+                        if let Ok(parsed) = raw.parse::<u64>() {
+                            mode.interval_secs = parsed.clamp(1, 86_400);
+                        }
+                    }
+                }
+                _ if arg.starts_with("--interval-secs=") => {
+                    if let Some(raw) = arg.strip_prefix("--interval-secs=") {
+                        if let Ok(parsed) = raw.parse::<u64>() {
+                            mode.interval_secs = parsed.clamp(1, 86_400);
+                        }
+                    }
+                }
+                "--help" | "-h" => {
+                    // Binary in ra usage rồi exit; giữ parse pure cho unit test.
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+
+        mode
+    }
+}
+
+/// Exit code binary: `0` khi drain xong (one-shot) hoặc shutdown sạch (loop);
+/// `1` khi lỗi cứng (DB/SQL) — Compose restart (local demo).
+pub const QDRANT_OUTBOX_EXIT_SUCCESS: i32 = 0;
+pub const QDRANT_OUTBOX_EXIT_FAILURE: i32 = 1;
+
+/// Map kết quả processor → exit code quan sát được cho failure drill / orchestrator.
+pub fn qdrant_outbox_exit_code<T, E>(result: &Result<T, E>) -> i32 {
+    match result {
+        Ok(_) => QDRANT_OUTBOX_EXIT_SUCCESS,
+        Err(_) => QDRANT_OUTBOX_EXIT_FAILURE,
     }
 }
 
@@ -650,5 +731,38 @@ mod tests {
         assert_eq!(STATUS_PROCESSED, "PROCESSED");
         assert_eq!(STATUS_FAILED, "FAILED");
         assert_eq!(STATUS_DEAD, "DEAD");
+    }
+
+    #[test]
+    fn run_mode_defaults_to_once() {
+        let mode = QdrantOutboxRunMode::from_args_and_env(&[]);
+        assert!(!mode.loop_mode);
+        assert!(mode.interval_secs >= 1);
+    }
+
+    #[test]
+    fn run_mode_parses_loop_and_interval_cli() {
+        let args = vec![
+            "--loop".to_string(),
+            "--interval-secs".to_string(),
+            "15".to_string(),
+        ];
+        let mode = QdrantOutboxRunMode::from_args_and_env(&args);
+        assert!(mode.loop_mode);
+        assert_eq!(mode.interval_secs, 15);
+
+        let once = QdrantOutboxRunMode::from_args_and_env(&["--once".to_string()]);
+        assert!(!once.loop_mode);
+
+        let eq = QdrantOutboxRunMode::from_args_and_env(&["--interval-secs=45".to_string()]);
+        assert_eq!(eq.interval_secs, 45);
+    }
+
+    #[test]
+    fn exit_code_maps_ok_and_err_for_failure_drill() {
+        let ok: Result<(), &str> = Ok(());
+        let err: Result<(), &str> = Err("db_unavailable");
+        assert_eq!(qdrant_outbox_exit_code(&ok), QDRANT_OUTBOX_EXIT_SUCCESS);
+        assert_eq!(qdrant_outbox_exit_code(&err), QDRANT_OUTBOX_EXIT_FAILURE);
     }
 }

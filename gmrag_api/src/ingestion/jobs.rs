@@ -368,24 +368,70 @@ pub async fn retry_failed_document(
     workspace_id: Uuid,
     max_attempts: i32,
 ) -> Result<bool, sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    let changed = sqlx::query(
-        r#"
-        UPDATE documents
-        SET status = 'PROCESSING', processing_stage = 'QUEUED', failure_code = NULL,
-            failure_message = NULL, failed_at = NULL
-        WHERE id = $1 AND workspace_id = $2 AND status = 'FAILED'
-          AND NOT EXISTS (
-            SELECT 1 FROM ingestion_jobs
-            WHERE document_id = $1 AND status IN ('QUEUED', 'PROCESSING')
-          )
-        "#,
+    requeue_document_for_reingest(
+        pool,
+        document_id,
+        workspace_id,
+        max_attempts,
+        RequeueEligibility::FailedOnly,
     )
-    .bind(document_id)
-    .bind(workspace_id)
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
+    .await
+}
+
+/// Điều kiện requeue durable: chỉ FAILED (retry HTTP) hoặc FAILED+COMPLETED (OCR remediation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequeueEligibility {
+    FailedOnly,
+    FailedOrCompleted,
+}
+
+/// Atomic: không active job → PROCESSING/QUEUED + một `ingestion_jobs` row.
+/// Idempotent: lần 2 trả `false` (đã PROCESSING hoặc còn job QUEUED/PROCESSING).
+pub async fn requeue_document_for_reingest(
+    pool: &PgPool,
+    document_id: Uuid,
+    workspace_id: Uuid,
+    max_attempts: i32,
+    eligibility: RequeueEligibility,
+) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // Hai literal SQL tĩnh — tránh dynamic string (sqlx SqlSafeStr).
+    let changed = match eligibility {
+        RequeueEligibility::FailedOnly => sqlx::query(
+            r#"
+                UPDATE documents
+                SET status = 'PROCESSING', processing_stage = 'QUEUED', failure_code = NULL,
+                    failure_message = NULL, failed_at = NULL
+                WHERE id = $1 AND workspace_id = $2 AND status = 'FAILED'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM ingestion_jobs
+                    WHERE document_id = $1 AND status IN ('QUEUED', 'PROCESSING')
+                  )
+                "#,
+        )
+        .bind(document_id)
+        .bind(workspace_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected(),
+        RequeueEligibility::FailedOrCompleted => sqlx::query(
+            r#"
+                UPDATE documents
+                SET status = 'PROCESSING', processing_stage = 'QUEUED', failure_code = NULL,
+                    failure_message = NULL, failed_at = NULL
+                WHERE id = $1 AND workspace_id = $2 AND status IN ('FAILED', 'COMPLETED')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM ingestion_jobs
+                    WHERE document_id = $1 AND status IN ('QUEUED', 'PROCESSING')
+                  )
+                "#,
+        )
+        .bind(document_id)
+        .bind(workspace_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected(),
+    };
     if changed != 1 {
         tx.rollback().await?;
         return Ok(false);

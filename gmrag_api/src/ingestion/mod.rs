@@ -4,6 +4,7 @@ pub mod embedding;
 pub mod graph;
 pub mod jobs;
 pub mod ocr;
+pub mod ocr_audit;
 pub mod pdf_parser;
 pub mod processor;
 pub mod stuck_health;

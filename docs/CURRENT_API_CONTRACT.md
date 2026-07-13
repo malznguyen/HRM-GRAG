@@ -370,6 +370,13 @@ avoiding futile claim loops. After a future OCR provider/configuration change
 `GET /workspaces/{workspace_id}/documents` already surfaces optional
 `failure_code` / `failure_message` on each row; no API schema change is required.
 
+OCR-004 corpus audit/reingest planning is an **operator binary**
+(`audit-ocr-affected-documents`), not a public REST endpoint. Dry-run is the
+default and is fully read-only (no SQL mutation including no `audit_events`, no
+object/Qdrant writes). `--apply` is refused while production OCR capability is
+closed so operators do not enqueue futile jobs; refused/completed apply may
+write metadata-only audit rows. See `docs/RUNBOOK.md` (OCR-004 section).
+
 ### `PATCH /workspaces/{workspace_id}/documents/{document_id}/access-mode`
 
 - Auth: bearer JWT.

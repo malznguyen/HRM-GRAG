@@ -106,6 +106,55 @@ services:
       # File phải tên <realm>-realm.json theo convention import-at-startup của Keycloak
       - ./docker/keycloak/gmrag-realm.json:/opt/keycloak/data/import/gmrag-realm.json:ro
 
+  # Authz outbox worker (local demo). Single replica — không scale; không có SKIP LOCKED lease.
+  # OPENFGA_STORE_ID do operator tạo store rồi inject (root .env / shell); worker crash-loop tới khi có.
+  process-authz-outbox:
+    build:
+      context: ./gmrag_api
+      dockerfile: ../docker/outbox-workers.Dockerfile
+    image: gmrag/outbox-workers:local
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - openfga
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-gmrag_user}:${POSTGRES_PASSWORD:-change_me}@postgres:5432/${POSTGRES_DB:-gmrag}
+      OPENFGA_API_URL: http://openfga:8080
+      OPENFGA_STORE_ID: ${OPENFGA_STORE_ID:-}
+      OPENFGA_MODEL_ID: ${OPENFGA_MODEL_ID:-}
+      AUTHZ_OUTBOX_BATCH_SIZE: ${AUTHZ_OUTBOX_BATCH_SIZE:-50}
+      AUTHZ_OUTBOX_MAX_RETRIES: ${AUTHZ_OUTBOX_MAX_RETRIES:-5}
+      AUTHZ_OUTBOX_POLL_INTERVAL_SECS: ${AUTHZ_OUTBOX_POLL_INTERVAL_SECS:-30}
+      RUST_LOG: ${RUST_LOG:-info}
+    command: ["/usr/local/bin/process-authz-outbox", "--loop"]
+    stop_grace_period: 30s
+
+  # Qdrant outbox worker (local demo). Multi-replica an toàn nhờ FOR UPDATE SKIP LOCKED + claim lease.
+  process-qdrant-outbox:
+    build:
+      context: ./gmrag_api
+      dockerfile: ../docker/outbox-workers.Dockerfile
+    image: gmrag/outbox-workers:local
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - qdrant
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-gmrag_user}:${POSTGRES_PASSWORD:-change_me}@postgres:5432/${POSTGRES_DB:-gmrag}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-gmrag_document_chunks}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      QDRANT_OUTBOX_BATCH_SIZE: ${QDRANT_OUTBOX_BATCH_SIZE:-50}
+      QDRANT_OUTBOX_MAX_RETRIES: ${QDRANT_OUTBOX_MAX_RETRIES:-5}
+      QDRANT_OUTBOX_BASE_BACKOFF_SECS: ${QDRANT_OUTBOX_BASE_BACKOFF_SECS:-2}
+      QDRANT_OUTBOX_MAX_BACKOFF_SECS: ${QDRANT_OUTBOX_MAX_BACKOFF_SECS:-300}
+      QDRANT_OUTBOX_CLAIM_LEASE_SECS: ${QDRANT_OUTBOX_CLAIM_LEASE_SECS:-120}
+      QDRANT_OUTBOX_POLL_INTERVAL_SECS: ${QDRANT_OUTBOX_POLL_INTERVAL_SECS:-30}
+      QDRANT_DELETE_WORKER_TIMEOUT_SECS: ${QDRANT_DELETE_WORKER_TIMEOUT_SECS:-60}
+      RUST_LOG: ${RUST_LOG:-info}
+    command: ["/usr/local/bin/process-qdrant-outbox", "--loop"]
+    stop_grace_period: 30s
+
   # Storage orphan scan (local demo). Chỉ dry-run/report, không tự động xoá object.
   storage-orphan-scan:
     build:

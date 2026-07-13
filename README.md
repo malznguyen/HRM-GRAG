@@ -48,6 +48,12 @@ Historical v1 audit snapshots are archived under `docs/archive/v1/`.
 - minio-init bucket creation
 - Qdrant (REST `6333`, gRPC `6334`)
 - Keycloak (`8080`, `start-dev` + realm import for browser OIDC and Admin API)
+- `process-authz-outbox` (loop drain of `authz_outbox`; requires `OPENFGA_STORE_ID`)
+- `process-qdrant-outbox` (loop drain of `qdrant_outbox`; multi-replica claim-safe)
+
+**Local-demo only.** Docker Compose is the only supported orchestration. Workers are built from `docker/outbox-workers.Dockerfile` (existing Rust binaries). They are not staging/production readiness proof.
+
+**Worker bootstrap note:** create an OpenFGA store (and optional model), then set `OPENFGA_STORE_ID` (and optionally `OPENFGA_MODEL_ID`) in a root `.env` or the shell before/while compose runs. Until `OPENFGA_STORE_ID` is set, `process-authz-outbox` will exit and restart (`restart: unless-stopped`).
 
 **Ollama is not in Docker.** Install Ollama on the host and pull the ADR-21 embedding model before ingestion or chat retrieval:
 
@@ -152,8 +158,8 @@ cargo run --bin recover-stale-ingestion-jobs -- --apply
 
 # Phase 3A — authz + storage + invite cleanup
 cargo run --bin process-authz-outbox
-# Unattended (OPS-001): deploy/authz-outbox/ — Compose/systemd/K8s artifacts;
-# see docs/RUNBOOK.md §2.2. Not production deployment proof by itself.
+# Unattended (OPS-001 local demo): root docker-compose service process-authz-outbox
+# (--loop, restart unless-stopped). See docs/RUNBOOK.md §2.2. Not production proof.
 cargo run --bin cleanup-storage-objects -- --dry-run
 cargo run --bin cleanup-storage-objects -- --delete-orphans --delete
 cargo run --bin cleanup-storage-objects -- --workspace-id <workspace_uuid> --delete
@@ -165,6 +171,9 @@ cargo run --bin report-identity-consistency
 
 # Phase 3B — Qdrant lifecycle / recovery
 cargo run --bin process-qdrant-outbox
+# Unattended (OPS-002 local demo): root docker-compose service process-qdrant-outbox
+# (--loop; multi-replica safe via SKIP LOCKED + lease). See docs/RUNBOOK.md §7.2b.
+# Not production proof.
 cargo run --bin process-storage-outbox
 cargo run --bin cleanup-qdrant-orphans -- --dry-run
 cargo run --bin cleanup-qdrant-orphans -- --delete
@@ -175,8 +184,8 @@ cargo run --bin backfill-graph-node-embeddings -- --dry-run
 cargo run --bin backfill-graph-node-embeddings -- --apply
 ```
 
-- **Qdrant outbox:** claim with `FOR UPDATE SKIP LOCKED` + lease, exponential backoff on `FAILED`, status `DEAD` for poison/exhausted retries. See `docs/RUNBOOK.md` §7 (env vars, DEAD inspection, dual-write caveat).
-- **Orphan cleanup (LIFE-006):** storage full list vs SQL (`cleanup-storage-objects`) and Qdrant outbox/audit/`--full-scan` (`cleanup-qdrant-orphans`). Default dry-run; mutations need explicit `--delete` (storage also `--delete-orphans`). Idempotent re-run. Unattended schedule = OPS-002/OPS-003, not automatic.
+- **Qdrant outbox:** claim with `FOR UPDATE SKIP LOCKED` + lease, exponential backoff on `FAILED`, status `DEAD` for poison/exhausted retries. Unattended local-demo drain: root Compose `process-qdrant-outbox` (OPS-002). See `docs/RUNBOOK.md` §7 / §7.2b (env vars, DEAD inspection, dual-write caveat).
+- **Orphan cleanup (LIFE-006):** storage full list vs SQL (`cleanup-storage-objects`) and Qdrant outbox/audit/`--full-scan` (`cleanup-qdrant-orphans`). Default dry-run; mutations need explicit `--delete` (storage also `--delete-orphans`). Idempotent re-run. Local-demo Qdrant outbox drain = root Compose (OPS-002); storage schedule remains OPS-003.
 - Graph node embedding backfill fills legacy `graph_nodes.embedding IS NULL` only (manual; default dry-run). See `docs/RUNBOOK.md` §10. HNSW apply notes: §9.
 
 ## Test Commands

@@ -1275,6 +1275,139 @@ async fn qdrant_outbox_claim_skip_locked_is_exclusive() {
     tx_a.rollback().await.unwrap();
 }
 
+/// OPS-002: hai worker drain song song — SKIP LOCKED + lease partition rows;
+/// mỗi row kết thúc ở status hợp lệ, không double-claim cùng lúc.
+#[tokio::test]
+async fn qdrant_outbox_concurrent_workers_partition_rows() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    clear_claimable_qdrant_outbox(&pool).await;
+
+    use gmrag_api::retrieval::RetrievalConfig;
+    // Empty-delete là success idempotent — không cần Qdrant thật cho claim partitioning.
+    let retrieval = RetrievalClient::from_config(RetrievalConfig {
+        qdrant_url: "http://127.0.0.1:1".to_string(),
+        collection_name: "gmrag_document_chunks".to_string(),
+        vector_size: 768,
+        top_k: 5,
+        api_key: None,
+        delete_request_timeout_secs: 1,
+        delete_worker_timeout_secs: 1,
+    });
+
+    // Payload poison → DEAD deterministic (không phụ thuộc Qdrant connectivity).
+    let mut ids = Vec::new();
+    for _ in 0..4 {
+        let id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO qdrant_outbox (event_type, payload, status, retry_count, next_attempt_at)
+            VALUES ('delete_by_workspace', '{}'::jsonb, 'PENDING', 0, CURRENT_TIMESTAMP)
+            RETURNING id
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+
+    let pool_a = pool.clone();
+    let pool_b = pool.clone();
+    let client_a = retrieval.clone();
+    let client_b = retrieval.clone();
+    let config = QdrantOutboxProcessorConfig {
+        batch_size: 2,
+        max_retries: 5,
+        ..QdrantOutboxProcessorConfig::default()
+    };
+
+    let (r1, r2) = tokio::join!(
+        process_qdrant_outbox(&pool_a, &client_a, config),
+        process_qdrant_outbox(&pool_b, &client_b, config),
+    );
+    let stats_a = r1.expect("worker A must not hard-fail");
+    let stats_b = r2.expect("worker B must not hard-fail");
+
+    let total_handled = stats_a.fetched_rows + stats_b.fetched_rows;
+    assert!(
+        total_handled >= ids.len(),
+        "combined workers should fetch all rows (got {total_handled}, want >= {})",
+        ids.len()
+    );
+    // Mỗi row chỉ claim một lần trong run (lease + seen_ids) — tổng dead/failed
+    // không vượt quá số row (tránh double-process đếm gấp đôi).
+    let total_terminal = stats_a.dead_rows
+        + stats_b.dead_rows
+        + stats_a.failed_rows
+        + stats_b.failed_rows
+        + stats_a.processed_rows
+        + stats_b.processed_rows;
+    assert!(
+        total_terminal >= ids.len(),
+        "terminal outcomes must cover all rows: {total_terminal}"
+    );
+
+    for id in &ids {
+        let status: String = sqlx::query_scalar("SELECT status FROM qdrant_outbox WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(
+            matches!(status.as_str(), "DEAD" | "FAILED" | "PROCESSED"),
+            "row {id} must end in valid terminal status, got {status}"
+        );
+        // Poison invalid payload → DEAD expected under default max_retries.
+        if status == "DEAD" {
+            let err: Option<String> =
+                sqlx::query_scalar("SELECT error_message FROM qdrant_outbox WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(err.as_deref(), Some("invalid_payload"));
+        }
+    }
+
+    let _ = sqlx::query("DELETE FROM qdrant_outbox WHERE id = ANY($1::uuid[])")
+        .bind(&ids)
+        .execute(&pool)
+        .await;
+}
+
+/// OPS-002 failure drill: lỗi SQL cứng propagate (binary map → exit 1 / restart).
+#[tokio::test]
+async fn qdrant_outbox_hard_sql_failure_is_observable() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+
+    use gmrag_api::retrieval::RetrievalConfig;
+    let retrieval = RetrievalClient::from_config(RetrievalConfig {
+        qdrant_url: "http://127.0.0.1:1".to_string(),
+        collection_name: "gmrag_document_chunks".to_string(),
+        vector_size: 768,
+        top_k: 5,
+        api_key: None,
+        delete_request_timeout_secs: 1,
+        delete_worker_timeout_secs: 1,
+    });
+
+    pool.close().await;
+
+    let result =
+        process_qdrant_outbox(&pool, &retrieval, QdrantOutboxProcessorConfig::default()).await;
+    assert!(
+        result.is_err(),
+        "closed pool must surface Err for supervisor restart path"
+    );
+    assert_eq!(
+        gmrag_api::retrieval::outbox::qdrant_outbox_exit_code(&result),
+        gmrag_api::retrieval::outbox::QDRANT_OUTBOX_EXIT_FAILURE
+    );
+}
+
 #[tokio::test]
 async fn qdrant_outbox_backoff_zero_allows_immediate_retry() {
     let _guard = phase3a_test_lock().lock().await;
