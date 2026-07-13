@@ -221,10 +221,11 @@ Identity E2E cleanup removes tracked SQL rows, Keycloak `e2e_` users, and OpenFG
 
 ## Local frontend role fixtures
 
-For local frontend demos only, seed five persistent Keycloak identities plus a
-single tenant/workspace fixture. The script preserves Keycloak as the login
-page and uses the existing authenticated API/operator flows; it does not add a
-backend password login or frontend role flags.
+For local frontend demos only, seed seven persistent Keycloak identities plus a
+two-tenant / three-workspace fixture that exercises cross-tenant and
+cross-workspace isolation. The script preserves Keycloak as the login page and
+uses the existing authenticated API/operator flows; it does not add a backend
+password login or frontend role flags.
 
 ```powershell
 $env:APP_ENV = "test"
@@ -234,10 +235,24 @@ $env:APP_ENV = "test"
 | Username | Password | Domain role |
 | --- | --- | --- |
 | `super.test` | `Test1234!` | Platform Admin |
-| `owner.test` | `Test1234!` | Tenant Owner |
-| `wsadmin.test` | `Test1234!` | Workspace Admin |
-| `member.test` | `Test1234!` | Workspace Member |
+| `owner.test` | `Test1234!` | Tenant A Owner |
+| `owner2.test` | `Test1234!` | Tenant B Owner |
+| `wsadmin.test` | `Test1234!` | Workspace A1 Admin |
+| `member.test` | `Test1234!` | Workspace A1 Member |
+| `member2.test` | `Test1234!` | Workspace A2 Member |
 | `outsider.test` | `Test1234!` | Authenticated outsider |
+
+Fixture topology:
+
+- **Tenant A** `GMRAG Test Tenant` (owner `owner.test`)
+  - **Workspace A1** `GMRAG Test Workspace` — `wsadmin.test` (admin), `member.test` (member)
+  - **Workspace A2** `GMRAG Test Workspace Beta` — `member2.test` (member)
+- **Tenant B** `GMRAG Test Tenant Bravo` (owner `owner2.test`)
+  - **Workspace B1** `GMRAG Test Workspace Bravo`
+
+The seed verifies cross-workspace isolation (A1 vs A2 in the same tenant),
+cross-tenant isolation (A vs B), and that a tenant owner sees every workspace in
+their own tenant but none in another tenant.
 
 Login continues to redirect to the Keycloak-hosted Authorization Code + PKCE
 page for the public `gmrag-frontend` client. These credentials are local test
