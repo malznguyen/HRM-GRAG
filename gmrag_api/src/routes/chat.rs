@@ -316,7 +316,7 @@ pub async fn workspace_chat(
                 Err(err) => {
                     tracing::error!(error = %err, "DeepSeek stream parse failed");
                     yield Ok::<Event, Infallible>(
-                        Event::default().event("error").data(err.to_string()),
+                        Event::default().event("error").data(err.client_message()),
                     );
                     break;
                 }
@@ -422,5 +422,14 @@ fn chat_pipeline_error_response(err: ChatPipelineError) -> axum::response::Respo
         }
     };
 
-    (status, err.to_string()).into_response()
+    let message = match &err {
+        ChatPipelineError::Generation(error) => error.client_message(),
+        ChatPipelineError::Embed(_) => "Embedding service unavailable",
+        ChatPipelineError::Retrieval(_) => "Retrieval service unavailable",
+        ChatPipelineError::Database(_) | ChatPipelineError::AccessControl(_) => {
+            "Chat service unavailable"
+        }
+    };
+
+    (status, message).into_response()
 }

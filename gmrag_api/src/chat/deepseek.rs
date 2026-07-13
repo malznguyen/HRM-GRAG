@@ -86,8 +86,13 @@ pub async fn stream_chat_completion(
     }
 
     let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    Err(DeepseekStreamError::UpstreamStatus { status, body })
+    let body_len = response.text().await.map(|body| body.len()).unwrap_or(0);
+    tracing::warn!(
+        %status,
+        upstream_body_len = body_len,
+        "DeepSeek returned a non-success status"
+    );
+    Err(DeepseekStreamError::UpstreamStatus { status })
 }
 
 pub struct DeepseekTokenParser {
@@ -216,28 +221,18 @@ pub enum DeepseekStreamError {
     RequestTimeout { timeout_secs: u64 },
     StreamIdleTimeout { timeout_secs: u64 },
     Http(reqwest::Error),
-    UpstreamStatus { status: StatusCode, body: String },
+    UpstreamStatus { status: StatusCode },
+}
+
+impl DeepseekStreamError {
+    pub fn client_message(&self) -> &'static str {
+        "Generation service unavailable"
+    }
 }
 
 impl std::fmt::Display for DeepseekStreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DeepseekStreamError::MissingApiKey => write!(f, "DEEPSEEK_API_KEY is not set"),
-            DeepseekStreamError::RequestTimeout { timeout_secs } => {
-                write!(f, "deepseek request timed out after {timeout_secs}s")
-            }
-            DeepseekStreamError::StreamIdleTimeout { timeout_secs } => {
-                write!(f, "deepseek stream idle timeout after {timeout_secs}s")
-            }
-            DeepseekStreamError::Http(err) => write!(f, "deepseek chat request failed: {err}"),
-            DeepseekStreamError::UpstreamStatus { status, body } => {
-                if body.trim().is_empty() {
-                    write!(f, "deepseek returned status {status}")
-                } else {
-                    write!(f, "deepseek returned status {status}: {body}")
-                }
-            }
-        }
+        write!(f, "{}", self.client_message())
     }
 }
 
@@ -375,6 +370,37 @@ mod tests {
             .expect("disconnect signal should resolve successfully");
     }
 
+    #[tokio::test]
+    async fn upstream_error_body_is_not_exposed_in_client_message() {
+        let _guard = deepseek_test_lock().lock().await;
+        let base_url = spawn_error_response_server("provider detail api_key=fake-secret").await;
+
+        unsafe {
+            std::env::set_var("DEEPSEEK_API_KEY", "test-api-key");
+            std::env::set_var("DEEPSEEK_API_URL", &base_url);
+        }
+
+        let result = stream_chat_completion(
+            &Client::new(),
+            "system",
+            &[ChatMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+            }],
+        )
+        .await;
+
+        let error = result.expect_err("non-success upstream response should fail");
+        assert!(matches!(
+            &error,
+            DeepseekStreamError::UpstreamStatus {
+                status: StatusCode::BAD_GATEWAY
+            }
+        ));
+        assert_eq!(error.client_message(), "Generation service unavailable");
+        assert!(!error.to_string().contains("fake-secret"));
+    }
+
     async fn spawn_hanging_http_peer() -> String {
         use tokio::net::TcpListener;
 
@@ -478,5 +504,30 @@ mod tests {
         });
 
         (format!("http://{addr}"), disconnect_rx)
+    }
+
+    async fn spawn_error_response_server(body: &'static str) -> String {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind error response server");
+        let addr = listener.local_addr().expect("error response server addr");
+
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+
+            let mut request_buf = [0_u8; 2048];
+            let _ = socket.read(&mut request_buf).await;
+            let response = format!(
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        format!("http://{addr}")
     }
 }
