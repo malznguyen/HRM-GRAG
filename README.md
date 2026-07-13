@@ -84,11 +84,13 @@ Copy `gmrag_api/.env.example` to `gmrag_api/.env` and fill in the values for:
 - database connection
 - Keycloak JWT: `JWT_ISSUER`, `JWT_AUDIENCE`, `JWT_JWKS_URL`
 - OpenFGA: `OPENFGA_API_URL`, `OPENFGA_STORE_ID`, `OPENFGA_MODEL_ID`
+- OpenFGA client timeouts (authz hot path, fail-closed): `OPENFGA_CONNECT_TIMEOUT_SECS` (default `2`), `OPENFGA_REQUEST_TIMEOUT_SECS` (default `3`)
 - Authz outbox worker: `AUTHZ_OUTBOX_BATCH_SIZE`, `AUTHZ_OUTBOX_MAX_RETRIES`
 - Qdrant: `QDRANT_URL`, `QDRANT_COLLECTION`, `QDRANT_VECTOR_SIZE`, optional `QDRANT_API_KEY`
 - Qdrant delete timeouts: `QDRANT_DELETE_REQUEST_TIMEOUT_SECS` (HTTP path), `QDRANT_DELETE_WORKER_TIMEOUT_SECS` (outbox/cleanup)
 - Qdrant outbox worker: `QDRANT_OUTBOX_BATCH_SIZE`, `QDRANT_OUTBOX_MAX_RETRIES`, `QDRANT_OUTBOX_BASE_BACKOFF_SECS`, `QDRANT_OUTBOX_MAX_BACKOFF_SECS`, `QDRANT_OUTBOX_CLAIM_LEASE_SECS`
 - Keycloak admin lookup: `KEYCLOAK_ADMIN_URL`, `KEYCLOAK_REALM`, `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET`
+- Auth-layer client timeouts (request-blocking, fail-closed): Keycloak admin `KEYCLOAK_CONNECT_TIMEOUT_SECS` / `KEYCLOAK_REQUEST_TIMEOUT_SECS` (defaults `3`/`5`); JWKS fetch `JWT_JWKS_CONNECT_TIMEOUT_SECS` / `JWT_JWKS_REQUEST_TIMEOUT_SECS` (defaults `3`/`5`)
 - S3/MinIO: `S3_ENDPOINT_URL`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_FORCE_PATH_STYLE`, `S3_PRESIGN_EXPIRY_SECS`
 - DeepSeek and Ollama settings for chat, graph extraction, and embeddings (`OLLAMA_EMBED_MODEL=AITeamVN/Vietnamese_Embedding` recommended)
 
