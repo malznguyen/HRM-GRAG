@@ -20,6 +20,7 @@ Use these files as the source of truth:
 - `docs/CURRENT_ARCHITECTURE.md`
 - `docs/CURRENT_DATABASE_SCHEMA.md`
 - `docs/CURRENT_API_CONTRACT.md`
+- `docs/CURRENT_FRONTEND.md`
 - `docs/RUNBOOK.md`
 
 Historical v1 audit snapshots are archived under `docs/archive/v1/`.
@@ -171,6 +172,11 @@ cargo run --bin cleanup-invite-placeholders -- --dry-run
 cargo run --bin cleanup-invite-placeholders -- --delete
 cargo run --bin backfill-document-workspace-tuples
 cargo run --bin report-identity-consistency
+cargo run --locked --bin delete-tenant -- --tenant-id <tenant_uuid> --dry-run
+cargo run --locked --bin delete-tenant -- --tenant-id <tenant_uuid> --delete --yes
+cargo run --locked --bin report-authz-orphans -- --dry-run
+cargo run --locked --bin cleanup-authz-orphans -- --dry-run
+cargo run --locked --bin cleanup-authz-orphans -- --delete --yes
 
 # Phase 3B — Qdrant lifecycle / recovery
 cargo run --bin process-qdrant-outbox
@@ -188,7 +194,7 @@ cargo run --bin backfill-graph-node-embeddings -- --apply
 ```
 
 - **Qdrant outbox:** claim with `FOR UPDATE SKIP LOCKED` + lease, exponential backoff on `FAILED`, status `DEAD` for poison/exhausted retries. Unattended local-demo drain: root Compose `process-qdrant-outbox` (OPS-002). See `docs/RUNBOOK.md` §7 / §7.2b (env vars, DEAD inspection, dual-write caveat).
-- **Orphan cleanup (LIFE-006):** storage full list vs SQL (`cleanup-storage-objects`) and Qdrant outbox/audit/`--full-scan` (`cleanup-qdrant-orphans`). Default dry-run; mutations need explicit `--delete` (storage also `--delete-orphans`). Idempotent re-run. Local-demo Qdrant outbox drain = root Compose (OPS-002); storage schedule remains OPS-003.
+- **Orphan cleanup (LIFE-006):** storage full list vs SQL (`cleanup-storage-objects`), Qdrant outbox/audit/`--full-scan` (`cleanup-qdrant-orphans`), and OpenFGA tuple-to-SQL report/cleanup tools. Default dry-run; mutations require explicit confirmation flags. Local-demo Qdrant outbox drain = root Compose (OPS-002); OPS-003 schedules only the dry-run storage scanner, not `process-storage-outbox`.
 - Graph node embedding backfill fills legacy `graph_nodes.embedding IS NULL` only (manual; default dry-run). See `docs/RUNBOOK.md` §10. HNSW apply notes: §9.
 
 ## Test Commands
@@ -264,10 +270,10 @@ data only and must not be used outside local/test environments. See
 ## Current Implementation Notes
 
 - Original PDFs live in MinIO/S3; they are no longer stored on local disk as the source of truth.
-- Document delete performs SQL cleanup + `storage_outbox` / `qdrant_outbox` insert in one transaction, then best-effort storage/Qdrant cleanup after commit (LIFE-001 / LIFE-003).
-- Workspace delete performs SQL cleanup + `storage_outbox` (`delete_prefix`) / `qdrant_outbox` insert in one transaction, then best-effort Qdrant/authz after commit — no request-path S3 prefix call (LIFE-001 / LIFE-004).
+- Document delete revokes OpenFGA first, then commits SQL cleanup + `storage_outbox` / `qdrant_outbox` in one transaction; storage/Qdrant cleanup is best-effort after commit (LIFE-001 / LIFE-003).
+- Workspace delete revokes its OpenFGA subtree first, then commits SQL cleanup + `storage_outbox` (`delete_prefix`) / `qdrant_outbox`; Qdrant cleanup is best-effort and there is no request-path S3 prefix call (LIFE-001 / LIFE-004).
 - Retry reads the original object from storage and returns `DOCUMENT_OBJECT_MISSING` when the object is gone.
 - Document-level ACL enforcement, restricted-document behavior, and Qdrant retrieval are fully implemented and verified.
-- Document/workspace delete is SQL-first with transactional outbox rows then **best-effort** S3/Qdrant cleanup (not a distributed transaction). Recovery: `process-storage-outbox` / `process-qdrant-outbox` / `cleanup-qdrant-orphans` — see `docs/RUNBOOK.md` §3 and §7. Scheduled storage outbox is OPS-003; tenant cascade is LIFE-005.
+- Delete/revoke/downgrade is FGA-first; grant/promote must commit SQL before FGA or provide compensation. External cleanup is not a distributed transaction. Recovery: `process-storage-outbox` / `process-qdrant-outbox` / orphan cleanup tools — see `docs/RUNBOOK.md` §3 and §7. OPS-003 schedules the dry-run scanner; LIFE-005 ships an operator tenant cascade but no public DELETE route.
 - Operator runbook for Phase 2/3A/3B (including Ollama, HNSW, graph node embedding backfill, and Qdrant outbox) is in `docs/RUNBOOK.md`.
 - HTTP application failures use the shared JSON envelope `{ "error": { "code", "message", "details"? } }`; successful `204` responses intentionally remain bodyless. `recover-workspace-admin` is an operator-only CLI, never an HTTP bypass.

@@ -94,7 +94,9 @@ not use this envelope.
 
 - Upload stores original PDFs in MinIO/S3 through the storage module.
 - Retry reads from MinIO/S3 and does not depend on local-file existence.
-- Delete performs SQL cleanup first, then best-effort object deletion.
+- Delete revokes the captured OpenFGA subtree first, then commits SQL cleanup
+  and durable cleanup outboxes; object/Qdrant cleanup remains best-effort after
+  commit.
 - Public API responses do not expose raw storage object keys.
 
 ## Endpoint Inventory
@@ -110,6 +112,7 @@ every application failure.
 | `GET` | `/metrics` | public |
 | `GET` | `/users/me` | authenticated user |
 | `POST` | `/users/sync` | authenticated user |
+| `GET` | `/tenants` | `admin` on `platform:system` |
 | `POST` | `/tenants` | `admin` on `platform:system` |
 | `POST` | `/tenants/{tenant_id}/owners` | `admin` on `platform:system` |
 | `POST` | `/tenants/{tenant_id}/workspaces` | `owner` on `tenant:{tenant_id}` |
@@ -191,6 +194,22 @@ every application failure.
 
 ## Tenant And Workspace Lifecycle
 
+The merged router exposes **30 method/path combinations**. The inventory above
+counts methods separately when a path supports more than one method.
+
+### `GET /tenants`
+
+- Auth: bearer JWT.
+- Authorization: `admin` on `platform:system`.
+- Query: optional `q`, `limit` (default `20`, range `0..=100`), and `offset`
+  (default `0`, non-negative).
+- Success: `200` with `{ tenants, total, limit, offset }`; each tenant contains
+  `{ id, name, created_at, owners: [{ id, email }] }`.
+- Errors: `400 INVALID_REQUEST`; authz `403`; `500 INTERNAL_ERROR`, all JSON envelopes.
+- Side effects: none; reads the SQL tenant/owner directory.
+- Evidence: `gmrag_api/src/lib.rs:267`, `gmrag_api/src/routes/workspaces.rs:63-91`,
+  `gmrag_api/src/tenant_directory.rs:8-28`.
+
 ### `POST /tenants`
 
 - Auth: bearer JWT.
@@ -231,20 +250,18 @@ every application failure.
 - Side effects: none.
 - Security notes: SQL membership is a read-model candidate list only. Stale SQL rows without an OpenFGA relation are omitted. Platform Admin without a business relation is not listed.
 
-### Tenant delete and Qdrant orphans
+### Tenant deletion (operator only)
 
-There is no `DELETE /tenants/{tenant_id}` route. If a tenant is removed via SQL
-cascade (or any path that does not go through `DELETE /workspaces/{id}` per
-workspace), Qdrant vectors are not cleaned automatically.
+There is no `DELETE /tenants/{tenant_id}` HTTP route. `delete-tenant` is the
+active operator lifecycle: it captures the tenant subtree and writes a recovery
+file, revokes matching OpenFGA tuples first, then commits the SQL cascade,
+audit event, `qdrant_outbox` and `storage_outbox` in one PostgreSQL transaction.
+Post-commit S3/Qdrant cleanup is best-effort; durable outboxes remain retryable.
+If SQL fails after FGA revoke, the command exits `3` and identifies the recovery
+file so the operator can retry deletion or restore tuples. See RUNBOOK §3.4.
 
-Remediation (library / ops, not HTTP):
-
-- `RetrievalClient::delete_points_by_tenant(pool, tenant_id)` while workspaces still exist
-- `RetrievalClient::delete_points_by_workspaces(&[...])` with ids captured before cascade
-- Operator: `cleanup-qdrant-orphans --tenant-id ...` or outbox replay via `process-qdrant-outbox`
-
-Payload limitation: points do not carry `tenant_id` (workspace list only). See
-`docs/CURRENT_ARCHITECTURE.md` and `docs/RUNBOOK.md` §7.
+Evidence: `gmrag_api/src/tenant_cleanup.rs:373-428,649-706` and
+`gmrag_api/src/bin/delete-tenant.rs:109-158`.
 
 ### `DELETE /workspaces/{workspace_id}`
 
@@ -252,9 +269,17 @@ Payload limitation: points do not carry `tenant_id` (workspace list only). See
 - Authorization: `can_assign_role` on `workspace:{workspace_id}`.
 - Request body: none.
 - Success: `204` empty body.
-- Errors: authz `403`; `404 RESOURCE_NOT_FOUND`; `500 INTERNAL_ERROR`, all JSON envelopes.
-- Side effects: deletes the workspace row and cascades workspace data in the same PostgreSQL transaction as inserting `qdrant_outbox` (`delete_by_workspace`) and `storage_outbox` (`delete_prefix` with canonical `tenants/{tenant_id}/workspaces/{workspace_id}/` prefix, SQL-trusted tenant/workspace IDs, and configured storage bucket — not client-supplied). Then best-effort deletes the `tenant -> workspace` tuple from OpenFGA and best-effort deletes Qdrant points filtered by `workspace_id` (`wait=true` + short request timeout `QDRANT_DELETE_REQUEST_TIMEOUT_SECS`). Qdrant failure/timeout does not fail HTTP once SQL has committed; worker recovery uses longer `QDRANT_DELETE_WORKER_TIMEOUT_SECS`. **No** S3 prefix delete runs on the HTTP request path; prefix recovery is via `process-storage-outbox` (unattended scheduling: OPS-003).
-- Security notes: Qdrant cleanup runs after SQL commit; failures are logged and reflected in audit metadata (`qdrant_workspace_delete_succeeded`) and do not fail the HTTP delete once SQL has committed. Storage prefix cleanup is durable via `storage_outbox` after SQL commit (LIFE-004); missing workspace leaves no outbox row. Tenant-wide cascade strategy remains LIFE-005.
+- Errors: authz `403`; `404 RESOURCE_NOT_FOUND`; `500 AUTHZ_REVOKE_FAILED`
+  when subtree revoke fails before SQL mutation; `500 INTERNAL_ERROR`, all JSON envelopes.
+- Side effects: captures the workspace subtree, revokes its OpenFGA tuples first,
+  then deletes the workspace row and inserts `qdrant_outbox`
+  (`delete_by_workspace`), `storage_outbox` (`delete_prefix`), and audit metadata
+  in one PostgreSQL transaction. After commit it best-effort deletes Qdrant
+  points; no S3 prefix delete runs on the request path.
+- Security notes: OpenFGA failure stops before SQL. If SQL fails after successful
+  revoke, access remains denied (fail closed) and operator recovery may be
+  required. S3/Qdrant failures after commit do not change the `204`; outbox rows
+  provide durable recovery. Evidence: `gmrag_api/src/routes/workspaces.rs:493-548`.
 
 ## Workspace Members
 
@@ -353,9 +378,17 @@ Payload limitation: points do not carry `tenant_id` (workspace list only). See
 - Authorization: `admin` on `workspace:{workspace_id}`.
 - Request body: none.
 - Success: `204` empty body.
-- Errors: authz `403`; `404 RESOURCE_NOT_FOUND`; or `500 INTERNAL_ERROR`, all JSON envelopes.
-- Side effects: removes graph provenance, the document row, and inserts `qdrant_outbox` (`delete_by_document`) plus `storage_outbox` (`delete_object` with SQL-captured `object_key`/`bucket`) in one SQL transaction, then best-effort deletes the storage object and Qdrant points for that `document_id` (filtered with `workspace_id` + `document_id`). HTTP remains `204` on storage/Qdrant failure after commit.
-- Security notes: storage and Qdrant deletes happen after SQL commit; Qdrant uses `wait=true` + short request timeout (`QDRANT_DELETE_REQUEST_TIMEOUT_SECS`). Qdrant recovery row is committed with the SQL delete (LIFE-001); storage recovery row is also committed with the SQL delete (LIFE-003). Worker retries: `process-qdrant-outbox` / `process-storage-outbox`. Cleanup failures are logged and reflected in audit metadata (`storage_delete_succeeded`, `qdrant_delete_succeeded`) for later remediation. They do not fail the HTTP delete once SQL has committed. Object keys are not exposed to the client.
+- Errors: authz `403`; `404 RESOURCE_NOT_FOUND`; `500 AUTHZ_REVOKE_FAILED`
+  when document tuple revoke fails before SQL mutation; or `500 INTERNAL_ERROR`,
+  all JSON envelopes.
+- Side effects: captures document tuples and object metadata, revokes OpenFGA
+  first, then removes graph provenance/document SQL and inserts audit,
+  `qdrant_outbox` (`delete_by_document`) and `storage_outbox` (`delete_object`)
+  in one SQL transaction. Storage and Qdrant cleanup are best-effort after commit;
+  HTTP remains `204` if either external cleanup fails.
+- Security notes: FGA revoke failure leaves SQL untouched. Cleanup recovery rows
+  commit atomically with SQL deletion; object keys remain internal. Evidence:
+  `gmrag_api/src/routes/documents.rs:725-765,825-848`.
 
 ### `POST /workspaces/{workspace_id}/documents/{document_id}/retry`
 
