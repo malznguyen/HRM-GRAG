@@ -66,7 +66,7 @@ async fn tenant_directory_enforces_authz_and_returns_filtered_pages_with_owners(
     let owner_result = client
         .get(format!("{address}/tenants"))
         .bearer_auth(&admin_id)
-        .query(&[("q", format!("{} alpha", prefix).to_uppercase())])
+        .query(&[("q", "DIRECTORY-OWNER@TEST.LOCAL")])
         .send()
         .await
         .expect("owner search response");
@@ -78,6 +78,19 @@ async fn tenant_directory_enforces_authz_and_returns_filtered_pages_with_owners(
         owner_result["tenants"][0]["owners"][0]["email"],
         "directory-owner@test.local"
     );
+
+    let id_query = tenant_ids[2].to_string()[..8].to_uppercase();
+    let id_result = client
+        .get(format!("{address}/tenants"))
+        .bearer_auth(&admin_id)
+        .query(&[("q", id_query.as_str())])
+        .send()
+        .await
+        .expect("tenant id search response");
+    assert_eq!(id_result.status(), StatusCode::OK);
+    let id_result: Value = id_result.json().await.expect("tenant id search JSON");
+    assert_eq!(id_result["total"], 1);
+    assert_eq!(id_result["tenants"][0]["id"], tenant_ids[2].to_string());
 
     let zero_owner = client
         .get(format!("{address}/tenants"))

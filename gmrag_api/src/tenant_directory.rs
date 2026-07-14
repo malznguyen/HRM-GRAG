@@ -27,6 +27,14 @@ pub struct TenantDirectoryPage {
     pub offset: i64,
 }
 
+#[derive(Serialize, FromRow)]
+/// Tenant tối giản dùng cho danh sách tenant mà caller sở hữu.
+pub struct OwnedTenant {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: NaiveDateTime,
+}
+
 #[derive(FromRow)]
 struct TenantRow {
     id: Uuid,
@@ -51,8 +59,18 @@ pub async fn list_tenants(
     let total = sqlx::query_scalar::<_, i64>(
         r#"
         SELECT COUNT(*)::bigint
-        FROM tenants
-        WHERE $1::text IS NULL OR name ILIKE '%' || $1 || '%'
+        FROM tenants t
+        WHERE $1::text IS NULL
+           OR t.name ILIKE '%' || $1 || '%'
+           OR t.id::text ILIKE '%' || $1 || '%'
+           OR EXISTS (
+                SELECT 1
+                FROM tenant_members tm
+                JOIN users u ON u.id = tm.user_id
+                WHERE tm.tenant_id = t.id
+                  AND tm.role = 'OWNER'
+                  AND u.email ILIKE '%' || $1 || '%'
+           )
         "#,
     )
     .bind(query)
@@ -62,8 +80,18 @@ pub async fn list_tenants(
     let rows = sqlx::query_as::<_, TenantRow>(
         r#"
         SELECT id, name, created_at
-        FROM tenants
-        WHERE $1::text IS NULL OR name ILIKE '%' || $1 || '%'
+        FROM tenants t
+        WHERE $1::text IS NULL
+           OR t.name ILIKE '%' || $1 || '%'
+           OR t.id::text ILIKE '%' || $1 || '%'
+           OR EXISTS (
+                SELECT 1
+                FROM tenant_members tm
+                JOIN users u ON u.id = tm.user_id
+                WHERE tm.tenant_id = t.id
+                  AND tm.role = 'OWNER'
+                  AND u.email ILIKE '%' || $1 || '%'
+           )
         ORDER BY created_at DESC, id DESC
         LIMIT $2 OFFSET $3
         "#,
@@ -118,4 +146,24 @@ pub async fn list_tenants(
         limit,
         offset,
     })
+}
+
+/// Đọc các tenant mà SQL read model ghi nhận người dùng là owner.
+pub async fn list_owned_tenant_candidates(
+    pool: &PgPool,
+    user_id: &str,
+) -> Result<Vec<OwnedTenant>, sqlx::Error> {
+    sqlx::query_as::<_, OwnedTenant>(
+        r#"
+        SELECT t.id, t.name, t.created_at
+        FROM tenants t
+        JOIN tenant_members tm ON tm.tenant_id = t.id
+        WHERE tm.user_id = $1 AND tm.role = 'OWNER'
+        GROUP BY t.id, t.name, t.created_at
+        ORDER BY t.created_at DESC, t.id DESC
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
 }

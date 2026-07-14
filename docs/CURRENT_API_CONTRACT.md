@@ -112,6 +112,7 @@ every application failure.
 | `GET` | `/metrics` | public |
 | `GET` | `/users/me` | authenticated user |
 | `POST` | `/users/sync` | authenticated user |
+| `GET` | `/me/tenants` | authenticated user; SQL owner candidates intersected with OpenFGA `owner` |
 | `GET` | `/tenants` | `admin` on `platform:system` |
 | `POST` | `/tenants` | `admin` on `platform:system` |
 | `POST` | `/tenants/{tenant_id}/owners` | `admin` on `platform:system` |
@@ -192,23 +193,30 @@ every application failure.
 - Errors: `400 IDENTITY_EMAIL_REQUIRED` or `IDENTITY_EMAIL_UNVERIFIED`; `409 IDENTITY_EMAIL_CONFLICT`; `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: upserts the SQL `users` row for verified JWT `sub` + verified `email` claim. It never accepts an email from the request body and never reconciles identities.
 
+### `GET /me/tenants`
+
+- Auth: bearer JWT.
+- Authorization: any authenticated user; each SQL candidate from `tenant_members` with the caller's verified JWT `sub` and role `OWNER` is checked for OpenFGA `owner` on `tenant:{id}`.
+- Request body: none.
+- Success: `200` with an array of `{ id, name, created_at }` that pass both the SQL owner read model and OpenFGA owner check, ordered by `created_at DESC` with duplicates removed.
+- Errors: `500 INTERNAL_ERROR` on SQL failure or `500 AUTHZ_ERROR` when an OpenFGA check fails; both use the shared JSON envelope.
+- Side effects: none.
+- Security notes: SQL is only a candidate source. Stale SQL owner rows without the matching OpenFGA relation are omitted, and an OpenFGA dependency failure is fail-closed without returning SQL-only data.
+
 ## Tenant And Workspace Lifecycle
 
-The merged router exposes **30 method/path combinations**. The inventory above
+The merged router exposes **31 method/path combinations**. The inventory above
 counts methods separately when a path supports more than one method.
-
 ### `GET /tenants`
 
 - Auth: bearer JWT.
 - Authorization: `admin` on `platform:system`.
-- Query: optional `q`, `limit` (default `20`, range `0..=100`), and `offset`
-  (default `0`, non-negative).
-- Success: `200` with `{ tenants, total, limit, offset }`; each tenant contains
-  `{ id, name, created_at, owners: [{ id, email }] }`.
-- Errors: `400 INVALID_REQUEST`; authz `403`; `500 INTERNAL_ERROR`, all JSON envelopes.
-- Side effects: none; reads the SQL tenant/owner directory.
-- Evidence: `gmrag_api/src/lib.rs:267`, `gmrag_api/src/routes/workspaces.rs:63-91`,
-  `gmrag_api/src/tenant_directory.rs:8-28`.
+- Query parameters: optional `limit` (default `20`, range `0-100`), optional non-negative `offset` (default `0`), and optional trimmed `q`.
+- Search: `q` is a case-insensitive partial match across tenant `name`, tenant UUID text, and owner email. Search is applied before `total`, ordering, and pagination are calculated.
+- Success: `200` with `{ tenants, total, limit, offset }`. Each tenant is `{ id, name, created_at, owners }`; `owners` is an email-ordered array of `{ id, email }`. Tenants are ordered by `created_at DESC, id DESC`.
+- Errors: `400 INVALID_REQUEST` for invalid pagination; authz `403`; `500 INTERNAL_ERROR`, all JSON envelopes.
+- Side effects: none.
+- Security notes: the endpoint is a Platform Admin directory read. Owner lookup uses the SQL read model and does not grant tenant access.
 
 ### `POST /tenants`
 

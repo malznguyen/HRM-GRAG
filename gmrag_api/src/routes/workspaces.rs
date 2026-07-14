@@ -19,7 +19,9 @@ use crate::retrieval::outbox::enqueue_delete_by_workspace_tx;
 use crate::state::AppState;
 use crate::storage::cleanup::build_workspace_prefix;
 use crate::storage::outbox::enqueue_delete_prefix_tx;
-use crate::tenant_directory::{TenantDirectoryPage, list_tenants as read_tenants};
+use crate::tenant_directory::{
+    OwnedTenant, TenantDirectoryPage, list_owned_tenant_candidates, list_tenants as read_tenants,
+};
 
 const DEFAULT_TENANT_PAGE_LIMIT: i64 = 20;
 const MAX_TENANT_PAGE_LIMIT: i64 = 100;
@@ -89,6 +91,45 @@ pub async fn list_tenants(
         })?;
 
     Ok(Json(page))
+}
+
+/// Liệt kê tenant mà caller là owner theo giao của SQL read model và OpenFGA.
+pub async fn list_my_tenants(
+    State(state): State<AppState>,
+    authz: Authz,
+) -> Result<Json<Vec<OwnedTenant>>, crate::api_error::ApiError> {
+    let candidates = list_owned_tenant_candidates(&state.pool, &authz.user_id)
+        .await
+        .map_err(|err| {
+            error!(error = %err, user_id = %authz.user_id, "Failed to list owned tenant candidates");
+            crate::api_error::ApiError::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+        })?;
+
+    let mut tenants = Vec::with_capacity(candidates.len());
+    for tenant in candidates {
+        let allowed = authz
+            .check(Relation::Owner, &Object::Tenant(tenant.id))
+            .await
+            .map_err(|err| {
+                error!(
+                    error = %err,
+                    user_id = %authz.user_id,
+                    tenant_id = %tenant.id,
+                    "OpenFGA tenant owner check failed; refusing SQL-only fallback"
+                );
+                crate::api_error::ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "AUTHZ_ERROR",
+                    "Authorization service unavailable",
+                )
+            })?;
+
+        if allowed {
+            tenants.push(tenant);
+        }
+    }
+
+    Ok(Json(tenants))
 }
 
 /// POST /tenants

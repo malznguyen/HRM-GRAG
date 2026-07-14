@@ -908,6 +908,138 @@ async fn acl005_workspace_list_intersects_fga() {
 }
 
 #[tokio::test]
+async fn me_tenants_intersects_sql_candidates_with_fga_owner() {
+    let _guard = phase0b_lock().await.lock().await;
+    init_test_env();
+    let authz = AuthzClient::from_env().unwrap();
+    let fx = Fixture::bootstrap(authz.clone()).await;
+    let client = Client::new();
+
+    let tenant_b = Uuid::new_v4();
+    let owner_b = format!("phase0b-owner-b-{}", Uuid::new_v4());
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(tenant_b)
+        .bind(format!("Phase0B Tenant B {tenant_b}"))
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
+        .bind(&owner_b)
+        .bind(format!("{owner_b}@test.local"))
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO tenant_members (tenant_id, user_id, role) VALUES ($1, $2, 'OWNER')")
+        .bind(tenant_b)
+        .bind(&owner_b)
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    authz
+        .write_tuple(
+            &format!("user:{owner_b}"),
+            Relation::Owner,
+            &Object::Tenant(tenant_b),
+        )
+        .await
+        .unwrap();
+
+    let owner_response = client
+        .get(format!("{}/me/tenants", fx.addr))
+        .bearer_auth(&fx.owner_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(owner_response.status(), reqwest::StatusCode::OK);
+    let owner_tenants: Vec<serde_json::Value> = owner_response.json().await.unwrap();
+    assert_eq!(owner_tenants.len(), 1);
+    assert_eq!(owner_tenants[0]["id"], fx.tenant_id.to_string());
+    assert!(owner_tenants[0]["name"].is_string());
+    assert!(owner_tenants[0]["created_at"].is_string());
+    assert_eq!(owner_tenants[0].as_object().unwrap().len(), 3);
+
+    let owner_b_response = client
+        .get(format!("{}/me/tenants", fx.addr))
+        .bearer_auth(&owner_b)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(owner_b_response.status(), reqwest::StatusCode::OK);
+    let owner_b_tenants: Vec<serde_json::Value> = owner_b_response.json().await.unwrap();
+    assert_eq!(owner_b_tenants.len(), 1);
+    assert_eq!(owner_b_tenants[0]["id"], tenant_b.to_string());
+
+    let non_owner_response = client
+        .get(format!("{}/me/tenants", fx.addr))
+        .bearer_auth(&fx.member_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(non_owner_response.status(), reqwest::StatusCode::OK);
+    let non_owner_tenants: Vec<serde_json::Value> = non_owner_response.json().await.unwrap();
+    assert!(non_owner_tenants.is_empty());
+
+    authz
+        .delete_tuple(
+            &format!("user:{}", fx.owner_id),
+            Relation::Owner,
+            &Object::Tenant(fx.tenant_id),
+        )
+        .await
+        .unwrap();
+    let stale_owner_response = client
+        .get(format!("{}/me/tenants", fx.addr))
+        .bearer_auth(&fx.owner_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale_owner_response.status(), reqwest::StatusCode::OK);
+    let stale_owner_tenants: Vec<serde_json::Value> = stale_owner_response.json().await.unwrap();
+    assert!(stale_owner_tenants.is_empty());
+
+    let broken_authz = AuthzClient::new(
+        spawn_authz_mock(AuthzMockMode::CheckFail).await,
+        "test-store".to_string(),
+        None,
+    );
+    let broken_fx = Fixture::bootstrap_sql_only(broken_authz).await;
+    let failed_response = client
+        .get(format!("{}/me/tenants", broken_fx.addr))
+        .bearer_auth(&broken_fx.owner_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        failed_response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let failed_body: serde_json::Value = failed_response.json().await.unwrap();
+    assert_eq!(failed_body["error"]["code"], "AUTHZ_ERROR");
+
+    broken_fx.cleanup().await;
+    let _ = authz
+        .delete_tuple(
+            &format!("user:{owner_b}"),
+            Relation::Owner,
+            &Object::Tenant(tenant_b),
+        )
+        .await;
+    let _ = sqlx::query("DELETE FROM tenant_members WHERE tenant_id = $1")
+        .bind(tenant_b)
+        .execute(&fx.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(tenant_b)
+        .execute(&fx.pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&owner_b)
+        .execute(&fx.pool)
+        .await;
+    fx.cleanup().await;
+}
+
+#[tokio::test]
 async fn acl006_share_target_requires_sql_and_fga() {
     let _guard = phase0b_lock().await.lock().await;
     init_test_env();

@@ -42,8 +42,8 @@ use routes::members::{
 };
 use routes::users::{get_current_user, sync_current_user};
 use routes::workspaces::{
-    add_tenant_owner, create_tenant, create_workspace, delete_workspace, list_tenants,
-    list_workspaces,
+    add_tenant_owner, create_tenant, create_workspace, delete_workspace, list_my_tenants,
+    list_tenants, list_workspaces,
 };
 use serde::Serialize;
 use state::AppState;
@@ -264,6 +264,7 @@ pub fn app_router(state: AppState) -> Router {
         .route("/metrics", get(metrics))
         .route("/users/me", get(get_current_user))
         .route("/users/sync", post(sync_current_user))
+        .route("/me/tenants", get(list_my_tenants))
         .route("/tenants", get(list_tenants).post(create_tenant))
         .route("/tenants/{tenant_id}/owners", post(add_tenant_owner))
         .route("/tenants/{tenant_id}/workspaces", post(create_workspace))
