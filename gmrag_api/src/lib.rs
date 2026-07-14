@@ -3,6 +3,7 @@ pub mod audit;
 pub mod auth;
 pub mod authz_orphan_report;
 pub mod chat;
+pub mod document_directory;
 pub mod identity_report;
 pub mod ingestion;
 pub mod invite;
@@ -35,9 +36,9 @@ use routes::chat::{
     list_workspace_chat_sessions, workspace_chat, workspace_chat_history,
 };
 use routes::documents::{
-    delete_document, get_document_chunk, get_document_preview, list_documents,
-    patch_document_access_mode, retry_document_ingestion, revoke_document_share, share_document,
-    upload_document,
+    delete_document, get_document_chunk, get_document_preview, get_document_shares, list_documents,
+    patch_document_access_mode, put_document_permissions, retry_document_ingestion,
+    revoke_document_share, share_document, upload_document,
 };
 use routes::graph::get_workspace_graph;
 use routes::members::{
@@ -294,6 +295,14 @@ pub fn app_router(state: AppState) -> Router {
         .route(
             "/workspaces/{workspace_id}/documents/{document_id}/shares/{user_id}",
             post(share_document).delete(revoke_document_share),
+        )
+        .route(
+            "/workspaces/{workspace_id}/documents/{document_id}/shares",
+            get(get_document_shares),
+        )
+        .route(
+            "/workspaces/{workspace_id}/documents/{document_id}/permissions",
+            axum::routing::put(put_document_permissions),
         )
         .route(
             "/workspaces/{workspace_id}/documents/{document_id}/preview",

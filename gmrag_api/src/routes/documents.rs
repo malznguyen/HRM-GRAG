@@ -1,10 +1,9 @@
 use axum::{
     Json,
-    extract::{Multipart, Path, State},
+    extract::{Multipart, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
 };
-use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -15,11 +14,15 @@ use uuid::Uuid;
 use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event, insert_audit_event_tx};
 use crate::auth::authz::{ApiError, Authz, Object, Relation, delete_tuples_fga_first};
 use crate::auth::document_acl::{
-    DocumentAccessMode, DocumentAclRow, can_user_view_document, collect_viewable_document_ids,
-    ensure_document_workspace_relation, grant_document_explicit_viewer,
-    revoke_document_explicit_viewer, set_document_access_mode,
+    DocumentAccessMode, DocumentAclError, DocumentPermissionsUpdateError, can_user_view_document,
+    collect_viewable_restricted_document_ids, ensure_document_workspace_relation,
+    grant_document_explicit_viewer, replace_document_permissions, revoke_document_explicit_viewer,
+    set_document_access_mode,
 };
 use crate::auth::resource_cleanup::capture_document_delete_plan;
+use crate::document_directory::{
+    get_document_permissions, list_documents as list_document_directory,
+};
 use crate::ingestion::jobs::{IngestionWorkerConfig, enqueue_job_tx, retry_failed_document};
 use crate::retrieval::outbox::enqueue_delete_by_document_tx;
 use crate::state::AppState;
@@ -31,6 +34,21 @@ pub struct SetDocumentAccessModeRequest {
     pub access_mode: String,
 }
 
+#[derive(Deserialize)]
+pub struct ListDocumentsQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+    q: Option<String>,
+    status: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ReplaceDocumentPermissionsRequest {
+    pub access_mode: String,
+    #[serde(default)]
+    pub authorized_user_ids: Vec<String>,
+}
+
 #[derive(Serialize)]
 pub struct UploadedDocumentItem {
     pub document_id: Uuid,
@@ -40,29 +58,6 @@ pub struct UploadedDocumentItem {
 #[derive(Serialize)]
 pub struct UploadDocumentsResponse {
     pub documents: Vec<UploadedDocumentItem>,
-}
-
-#[derive(Serialize, sqlx::FromRow)]
-pub struct DocumentResponse {
-    pub id: Uuid,
-    pub filename: String,
-    pub status: String,
-    pub processing_stage: String,
-    pub failure_code: Option<String>,
-    pub failure_message: Option<String>,
-    pub created_at: NaiveDateTime,
-}
-
-#[derive(sqlx::FromRow)]
-struct DocumentListRow {
-    id: Uuid,
-    filename: String,
-    status: String,
-    processing_stage: String,
-    failure_code: Option<String>,
-    failure_message: Option<String>,
-    created_at: NaiveDateTime,
-    access_mode: String,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -330,6 +325,7 @@ pub async fn list_documents(
     State(state): State<AppState>,
     authz: Authz,
     Path(workspace_id): Path<Uuid>,
+    Query(params): Query<ListDocumentsQuery>,
 ) -> impl IntoResponse {
     if let Err(err) = authz
         .require_relation(Relation::Member, &Object::Workspace(workspace_id))
@@ -338,75 +334,198 @@ pub async fn list_documents(
         return err.into_response();
     }
 
-    match fetch_workspace_documents(&state.pool, workspace_id).await {
-        Ok(rows) => {
-            let acl_rows = match rows
-                .iter()
-                .map(|row| {
-                    let access_mode =
-                        DocumentAccessMode::parse(&row.access_mode).ok_or_else(|| {
-                            format!(
-                                "invalid access_mode '{}' for document {}",
-                                row.access_mode, row.id
-                            )
-                        })?;
-                    Ok(DocumentAclRow {
-                        document_id: row.id,
-                        access_mode,
-                    })
-                })
-                .collect::<Result<Vec<DocumentAclRow>, String>>()
-            {
-                Ok(parsed) => parsed,
-                Err(err) => {
-                    error!(
-                        error = %err,
-                        user_id = %authz.user_id,
-                        workspace_id = %workspace_id,
-                        "Failed to parse document access_mode while listing"
-                    );
-                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                }
-            };
+    let limit = params.limit.unwrap_or(20);
+    let offset = params.offset.unwrap_or(0);
+    if !(0..=100).contains(&limit) || offset < 0 {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "limit must be between 0 and 100 and offset must be non-negative",
+        )
+        .into_response();
+    }
 
-            let visible_ids =
-                match collect_viewable_document_ids(&state.authz_client, &authz.user_id, &acl_rows)
-                    .await
-                {
-                    Ok(ids) => ids,
-                    Err(err) => {
-                        error!(
-                            error = %err,
-                            user_id = %authz.user_id,
-                            workspace_id = %workspace_id,
-                            "Failed to apply document ACL while listing"
-                        );
-                        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-                    }
-                };
-
-            let documents: Vec<DocumentResponse> = rows
-                .into_iter()
-                .filter(|row| visible_ids.contains(&row.id))
-                .map(|row| DocumentResponse {
-                    id: row.id,
-                    filename: row.filename,
-                    status: row.status,
-                    processing_stage: row.processing_stage,
-                    failure_code: row.failure_code,
-                    failure_message: row.failure_message,
-                    created_at: row.created_at,
-                })
-                .collect();
-
-            Json(documents).into_response()
+    let query = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
+    let status = match params.status.as_deref() {
+        None => None,
+        Some("PROCESSING") => Some("PROCESSING"),
+        Some("COMPLETED") => Some("COMPLETED"),
+        Some("FAILED") => Some("FAILED"),
+        Some(_) => {
+            return ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_REQUEST",
+                "status must be PROCESSING, COMPLETED, or FAILED",
+            )
+            .into_response();
         }
+    };
+
+    let visible_restricted_ids =
+        match collect_viewable_restricted_document_ids(&state.authz_client, &authz.user_id).await {
+            Ok(ids) => ids.into_iter().collect::<Vec<_>>(),
+            Err(err) => {
+                error!(
+                    error = %err,
+                    user_id = %authz.user_id,
+                    workspace_id = %workspace_id,
+                    "Failed to apply document ACL while listing"
+                );
+                return match err {
+                    DocumentAclError::Authz(_) => ApiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "AUTHZ_ERROR",
+                        "Authorization service unavailable",
+                    )
+                    .into_response(),
+                    _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                };
+            }
+        };
+
+    match list_document_directory(
+        &state.pool,
+        workspace_id,
+        &visible_restricted_ids,
+        limit,
+        offset,
+        query,
+        status,
+    )
+    .await
+    {
+        Ok(page) => Json(page).into_response(),
         Err(err) => {
             error!(
                 error = %err,
                 user_id = %authz.user_id,
                 workspace_id = %workspace_id,
                 "Failed to list documents"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn get_document_shares(
+    State(state): State<AppState>,
+    authz: Authz,
+    Path((workspace_id, document_id)): Path<(Uuid, Uuid)>,
+) -> impl IntoResponse {
+    if let Err(err) = authz
+        .require_relation(Relation::Admin, &Object::Workspace(workspace_id))
+        .await
+    {
+        return err.into_response();
+    }
+
+    match get_document_permissions(&state.pool, workspace_id, document_id).await {
+        Ok(Some(view)) => Json(view).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to list document shares"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+pub async fn put_document_permissions(
+    State(state): State<AppState>,
+    authz: Authz,
+    Path((workspace_id, document_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<ReplaceDocumentPermissionsRequest>,
+) -> impl IntoResponse {
+    if let Err(err) = authz
+        .require_relation(Relation::Admin, &Object::Workspace(workspace_id))
+        .await
+    {
+        return err.into_response();
+    }
+
+    let access_mode = match DocumentAccessMode::parse(&body.access_mode) {
+        Some(mode) => mode,
+        None => {
+            return ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_REQUEST",
+                "access_mode must be workspace_default or restricted",
+            )
+            .into_response();
+        }
+    };
+    if !access_mode.is_restricted() && !body.authorized_user_ids.is_empty() {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "authorized_user_ids must be empty for workspace_default",
+        )
+        .into_response();
+    }
+
+    match replace_document_permissions(
+        &state.pool,
+        &state.authz_client,
+        document_id,
+        workspace_id,
+        access_mode,
+        &body.authorized_user_ids,
+        &authz.user_id,
+    )
+    .await
+    {
+        Ok(Some(())) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(DocumentPermissionsUpdateError::UserNotWorkspaceMember { user_id }) => {
+            return ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "USER_NOT_WORKSPACE_MEMBER",
+                "Target user is not a member of this workspace",
+            )
+            .into_response_with_details(json!({ "user_id": user_id }));
+        }
+        Err(DocumentPermissionsUpdateError::Authz(err)) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Authorization operation failed while replacing document permissions"
+            );
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "AUTHZ_ERROR",
+                "Authorization service unavailable",
+            )
+            .into_response();
+        }
+        Err(DocumentPermissionsUpdateError::Database(err)) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Database operation failed while replacing document permissions"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
+    match get_document_permissions(&state.pool, workspace_id, document_id).await {
+        Ok(Some(view)) => Json(view).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to read document permissions after update"
             );
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
@@ -1006,23 +1125,6 @@ pub async fn retry_document_ingestion(
     }
 
     StatusCode::ACCEPTED.into_response()
-}
-
-async fn fetch_workspace_documents(
-    pool: &PgPool,
-    workspace_id: Uuid,
-) -> Result<Vec<DocumentListRow>, sqlx::Error> {
-    sqlx::query_as(
-        r#"
-        SELECT id, filename, status, processing_stage, failure_code, failure_message, created_at, access_mode
-        FROM documents
-        WHERE workspace_id = $1
-        ORDER BY created_at DESC
-        "#,
-    )
-    .bind(workspace_id)
-    .fetch_all(pool)
-    .await
 }
 
 async fn fetch_document_preview(

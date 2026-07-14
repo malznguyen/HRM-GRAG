@@ -16,6 +16,7 @@ pub enum AuditEventType {
     DocumentAccessModeChanged,
     DocumentShared,
     DocumentShareRevoked,
+    DocumentPermissionsUpdated,
     DocumentDeleted,
     DocumentRetryStarted,
     BackfillDocumentWorkspaceTuplesStarted,
@@ -68,6 +69,7 @@ impl AuditEventType {
             AuditEventType::DocumentAccessModeChanged => "document_access_mode_changed",
             AuditEventType::DocumentShared => "document_shared",
             AuditEventType::DocumentShareRevoked => "document_share_revoked",
+            AuditEventType::DocumentPermissionsUpdated => "permissions_updated",
             AuditEventType::DocumentDeleted => "document_deleted",
             AuditEventType::DocumentRetryStarted => "document_retry_started",
             AuditEventType::BackfillDocumentWorkspaceTuplesStarted => {

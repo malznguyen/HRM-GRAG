@@ -2,9 +2,12 @@ use std::collections::HashSet;
 
 use serde_json::json;
 use sqlx::PgPool;
+use tracing::error;
 use uuid::Uuid;
 
 use super::authz::{AuthzClient, AuthzError, Object, Relation, TupleKey, delete_tuples_fga_first};
+use super::outbox::enqueue_tuple_write;
+use crate::audit::insert_audit_event;
 use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event_tx};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +57,39 @@ pub enum DocumentAclError {
     InvalidAccessMode { document_id: Uuid, raw_mode: String },
     InvalidObjectFormat { raw_object: String },
     InvalidObjectId { raw_object: String },
+}
+
+#[derive(Debug)]
+pub enum DocumentPermissionsUpdateError {
+    Database(sqlx::Error),
+    Authz(AuthzError),
+    UserNotWorkspaceMember { user_id: String },
+}
+
+impl std::fmt::Display for DocumentPermissionsUpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(err) => write!(f, "database error: {err}"),
+            Self::Authz(err) => write!(f, "authz error: {err}"),
+            Self::UserNotWorkspaceMember { user_id } => {
+                write!(f, "user is not a workspace member: {user_id}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DocumentPermissionsUpdateError {}
+
+impl From<sqlx::Error> for DocumentPermissionsUpdateError {
+    fn from(value: sqlx::Error) -> Self {
+        Self::Database(value)
+    }
+}
+
+impl From<AuthzError> for DocumentPermissionsUpdateError {
+    fn from(value: AuthzError) -> Self {
+        Self::Authz(value)
+    }
 }
 
 impl std::fmt::Display for DocumentAclError {
@@ -190,19 +226,28 @@ pub async fn collect_viewable_document_ids(
         return Ok(visible_ids);
     }
 
-    let explicit_ids =
-        list_document_relation_ids(authz_client, user_id, Relation::ExplicitViewer).await?;
-    let bypass_ids =
-        list_document_relation_ids(authz_client, user_id, Relation::BypassViewer).await?;
+    let restricted_visible_ids =
+        collect_viewable_restricted_document_ids(authz_client, user_id).await?;
 
-    for doc_id in explicit_ids
+    for doc_id in restricted_visible_ids
         .into_iter()
-        .chain(bypass_ids.into_iter())
         .filter(|doc_id| restricted_ids.contains(doc_id))
     {
         visible_ids.insert(doc_id);
     }
 
+    Ok(visible_ids)
+}
+
+/// Trả tập document restricted mà OpenFGA cho phép qua explicit hoặc bypass viewer.
+pub async fn collect_viewable_restricted_document_ids(
+    authz_client: &AuthzClient,
+    user_id: &str,
+) -> Result<HashSet<Uuid>, DocumentAclError> {
+    let mut visible_ids =
+        list_document_relation_ids(authz_client, user_id, Relation::ExplicitViewer).await?;
+    visible_ids
+        .extend(list_document_relation_ids(authz_client, user_id, Relation::BypassViewer).await?);
     Ok(visible_ids)
 }
 
@@ -467,6 +512,383 @@ pub async fn revoke_document_explicit_viewer(
     .await?;
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct DocumentPermissionsAudit {
+    previous_mode: DocumentAccessMode,
+    requested_mode: DocumentAccessMode,
+    applied_mode: DocumentAccessMode,
+    granted_requested: usize,
+    granted_applied: usize,
+    revoked_requested: usize,
+    revoked_applied: usize,
+    completed: bool,
+    failed_stage: Option<&'static str>,
+}
+
+#[derive(Debug)]
+struct GrantPlan {
+    user_id: String,
+    insert_sql_row: bool,
+}
+
+/// Thay toàn bộ permissions của document theo trạng thái đích đã khai báo.
+/// Trả `None` nếu document không thuộc workspace.
+pub async fn replace_document_permissions(
+    pool: &PgPool,
+    authz_client: &AuthzClient,
+    document_id: Uuid,
+    workspace_id: Uuid,
+    requested_mode: DocumentAccessMode,
+    authorized_user_ids: &[String],
+    actor_user_id: &str,
+) -> Result<Option<()>, DocumentPermissionsUpdateError> {
+    let target_user_ids = unique_user_ids(authorized_user_ids);
+    let target_user_id_set: HashSet<&str> = target_user_ids.iter().map(String::as_str).collect();
+
+    let mut tx = pool.begin().await?;
+    let current_raw: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT access_mode
+        FROM documents
+        WHERE id = $1 AND workspace_id = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(document_id)
+    .bind(workspace_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(current_raw) = current_raw else {
+        return Ok(None);
+    };
+    let previous_mode = DocumentAccessMode::parse(&current_raw).ok_or_else(|| {
+        sqlx::Error::Protocol(format!(
+            "invalid access_mode '{current_raw}' for document {document_id}"
+        ))
+    })?;
+
+    let current_user_ids: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT user_id
+        FROM document_shares
+        WHERE document_id = $1
+        ORDER BY user_id ASC
+        "#,
+    )
+    .bind(document_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let current_user_id_set: HashSet<&str> = current_user_ids.iter().map(String::as_str).collect();
+
+    let to_revoke: Vec<String> = current_user_ids
+        .iter()
+        .filter(|user_id| !target_user_id_set.contains(user_id.as_str()))
+        .cloned()
+        .collect();
+
+    let mut to_grant = Vec::new();
+    if requested_mode.is_restricted() {
+        for user_id in &target_user_ids {
+            if !current_user_id_set.contains(user_id.as_str()) {
+                to_grant.push(GrantPlan {
+                    user_id: user_id.clone(),
+                    insert_sql_row: true,
+                });
+                continue;
+            }
+
+            let has_explicit_viewer = authz_client
+                .check_fga(
+                    &format_user(user_id),
+                    Relation::ExplicitViewer,
+                    &Object::Document(document_id),
+                )
+                .await?;
+            if !has_explicit_viewer {
+                to_grant.push(GrantPlan {
+                    user_id: user_id.clone(),
+                    insert_sql_row: false,
+                });
+            }
+        }
+    }
+
+    validate_grant_targets(&mut tx, authz_client, workspace_id, &to_grant).await?;
+
+    let mode_changed = previous_mode != requested_mode;
+    if !mode_changed && to_revoke.is_empty() && to_grant.is_empty() {
+        return Ok(Some(()));
+    }
+
+    let mut audit = DocumentPermissionsAudit {
+        previous_mode,
+        requested_mode,
+        applied_mode: previous_mode,
+        granted_requested: to_grant.len(),
+        granted_applied: 0,
+        revoked_requested: to_revoke.len(),
+        revoked_applied: 0,
+        completed: false,
+        failed_stage: None,
+    };
+    let mut mutated = false;
+
+    if mode_changed {
+        if let Err(err) = sqlx::query(
+            r#"
+            UPDATE documents
+            SET access_mode = $1
+            WHERE id = $2 AND workspace_id = $3
+            "#,
+        )
+        .bind(requested_mode.as_str())
+        .bind(document_id)
+        .bind(workspace_id)
+        .execute(&mut *tx)
+        .await
+        {
+            return Err(DocumentPermissionsUpdateError::Database(err));
+        }
+    }
+
+    if let Err(err) = tx.commit().await {
+        return Err(DocumentPermissionsUpdateError::Database(err));
+    }
+    if mode_changed {
+        audit.applied_mode = requested_mode;
+        mutated = true;
+    }
+
+    for user_id in to_revoke {
+        let tuple = explicit_viewer_tuple(document_id, &user_id);
+        if let Err(err) = delete_tuples_fga_first(authz_client, std::slice::from_ref(&tuple)).await
+        {
+            audit.failed_stage = Some("revoke");
+            write_permissions_audit_if_mutated(
+                pool,
+                workspace_id,
+                document_id,
+                actor_user_id,
+                &audit,
+                mutated,
+            )
+            .await;
+            return Err(DocumentPermissionsUpdateError::Authz(err));
+        }
+        mutated = true;
+
+        if let Err(err) = sqlx::query(
+            r#"
+            DELETE FROM document_shares
+            WHERE document_id = $1 AND user_id = $2
+            "#,
+        )
+        .bind(document_id)
+        .bind(&user_id)
+        .execute(pool)
+        .await
+        {
+            audit.failed_stage = Some("revoke");
+            write_permissions_audit_if_mutated(
+                pool,
+                workspace_id,
+                document_id,
+                actor_user_id,
+                &audit,
+                mutated,
+            )
+            .await;
+            return Err(DocumentPermissionsUpdateError::Database(err));
+        }
+        audit.revoked_applied += 1;
+    }
+
+    for grant in to_grant {
+        if grant.insert_sql_row {
+            match sqlx::query(
+                r#"
+                INSERT INTO document_shares (document_id, user_id)
+                VALUES ($1, $2)
+                ON CONFLICT (document_id, user_id) DO NOTHING
+                "#,
+            )
+            .bind(document_id)
+            .bind(&grant.user_id)
+            .execute(pool)
+            .await
+            {
+                Ok(result) => {
+                    mutated |= result.rows_affected() > 0;
+                }
+                Err(err) => {
+                    audit.failed_stage = Some("grant");
+                    write_permissions_audit_if_mutated(
+                        pool,
+                        workspace_id,
+                        document_id,
+                        actor_user_id,
+                        &audit,
+                        mutated,
+                    )
+                    .await;
+                    return Err(DocumentPermissionsUpdateError::Database(err));
+                }
+            }
+        }
+
+        let tuple = explicit_viewer_tuple(document_id, &grant.user_id);
+        if let Err(err) = authz_client
+            .write_tuple(
+                &tuple.user,
+                Relation::ExplicitViewer,
+                &Object::Document(document_id),
+            )
+            .await
+        {
+            if let Err(outbox_err) = enqueue_tuple_write(pool, &tuple).await {
+                error!(
+                    error = %outbox_err,
+                    workspace_id = %workspace_id,
+                    document_id = %document_id,
+                    target_user_id = %grant.user_id,
+                    "Không thể enqueue authz recovery sau khi grant OpenFGA thất bại"
+                );
+            }
+            audit.failed_stage = Some("grant");
+            write_permissions_audit_if_mutated(
+                pool,
+                workspace_id,
+                document_id,
+                actor_user_id,
+                &audit,
+                mutated,
+            )
+            .await;
+            return Err(DocumentPermissionsUpdateError::Authz(err));
+        }
+        mutated = true;
+        audit.granted_applied += 1;
+    }
+
+    audit.completed = true;
+    write_permissions_audit_if_mutated(
+        pool,
+        workspace_id,
+        document_id,
+        actor_user_id,
+        &audit,
+        mutated,
+    )
+    .await;
+
+    Ok(Some(()))
+}
+
+fn unique_user_ids(user_ids: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    user_ids
+        .iter()
+        .filter(|user_id| seen.insert((*user_id).clone()))
+        .cloned()
+        .collect()
+}
+
+async fn validate_grant_targets(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    authz_client: &AuthzClient,
+    workspace_id: Uuid,
+    grants: &[GrantPlan],
+) -> Result<(), DocumentPermissionsUpdateError> {
+    if grants.is_empty() {
+        return Ok(());
+    }
+
+    let grant_user_ids: Vec<String> = grants.iter().map(|grant| grant.user_id.clone()).collect();
+    let sql_member_ids: HashSet<String> = sqlx::query_scalar(
+        r#"
+        SELECT user_id
+        FROM workspace_members
+        WHERE workspace_id = $1 AND user_id = ANY($2::text[])
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(&grant_user_ids)
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .collect();
+
+    for grant in grants {
+        if !sql_member_ids.contains(&grant.user_id) {
+            return Err(DocumentPermissionsUpdateError::UserNotWorkspaceMember {
+                user_id: grant.user_id.clone(),
+            });
+        }
+        if !authz_client
+            .check_workspace_member(&grant.user_id, workspace_id)
+            .await?
+        {
+            return Err(DocumentPermissionsUpdateError::UserNotWorkspaceMember {
+                user_id: grant.user_id.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn explicit_viewer_tuple(document_id: Uuid, user_id: &str) -> TupleKey {
+    TupleKey {
+        user: format_user(user_id),
+        relation: Relation::ExplicitViewer.as_str().to_string(),
+        object: Object::Document(document_id).to_string(),
+    }
+}
+
+async fn write_permissions_audit_if_mutated(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    document_id: Uuid,
+    actor_user_id: &str,
+    audit: &DocumentPermissionsAudit,
+    mutated: bool,
+) {
+    if !mutated {
+        return;
+    }
+
+    let result = insert_audit_event(
+        pool,
+        AuditEventRecord::new(AuditEventType::DocumentPermissionsUpdated)
+            .with_actor_user_id(actor_user_id.to_string())
+            .with_workspace_id(workspace_id)
+            .with_document_id(document_id)
+            .with_target("document", document_id.to_string())
+            .with_metadata(json!({
+                "prev_mode": audit.previous_mode.as_str(),
+                "new_mode_requested": audit.requested_mode.as_str(),
+                "mode_applied": audit.applied_mode.as_str(),
+                "granted_requested": audit.granted_requested,
+                "granted_applied": audit.granted_applied,
+                "revoked_requested": audit.revoked_requested,
+                "revoked_applied": audit.revoked_applied,
+                "completed": audit.completed,
+                "failed_stage": audit.failed_stage,
+            })),
+    )
+    .await;
+
+    if let Err(err) = result {
+        error!(
+            error = %err,
+            workspace_id = %workspace_id,
+            document_id = %document_id,
+            "Không thể ghi audit permissions_updated"
+        );
+    }
 }
 
 fn format_user(user_id: &str) -> String {

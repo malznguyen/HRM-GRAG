@@ -124,8 +124,10 @@ every application failure.
 | `DELETE` | `/workspaces/{workspace_id}/documents/{document_id}` | `admin` on `workspace:{workspace_id}` |
 | `POST` | `/workspaces/{workspace_id}/documents/{document_id}/retry` | `admin` on `workspace:{workspace_id}` |
 | `PATCH` | `/workspaces/{workspace_id}/documents/{document_id}/access-mode` | `admin` on `workspace:{workspace_id}` |
+| `GET` | `/workspaces/{workspace_id}/documents/{document_id}/shares` | `admin` on `workspace:{workspace_id}` |
 | `POST` | `/workspaces/{workspace_id}/documents/{document_id}/shares/{user_id}` | `admin` on `workspace:{workspace_id}` |
 | `DELETE` | `/workspaces/{workspace_id}/documents/{document_id}/shares/{user_id}` | `admin` on `workspace:{workspace_id}` |
+| `PUT` | `/workspaces/{workspace_id}/documents/{document_id}/permissions` | `admin` on `workspace:{workspace_id}` |
 | `GET` | `/workspaces/{workspace_id}/documents/{document_id}/preview` | `member` on `workspace:{workspace_id}` |
 | `GET` | `/workspaces/{workspace_id}/chunks/{chunk_id}` | `member` on `workspace:{workspace_id}` |
 | `POST` | `/workspaces/{workspace_id}/chat` | `member` on `workspace:{workspace_id}` plus chat-session ownership |
@@ -205,7 +207,7 @@ every application failure.
 
 ## Tenant And Workspace Lifecycle
 
-The merged router exposes **31 method/path combinations**. The inventory above
+The merged router exposes **33 method/path combinations**. The inventory above
 counts methods separately when a path supports more than one method.
 ### `GET /tenants`
 
@@ -364,11 +366,13 @@ Evidence: `gmrag_api/src/tenant_cleanup.rs:373-428,649-706` and
 
 - Auth: bearer JWT.
 - Authorization: `member` on `workspace:{workspace_id}`.
+- Query parameters: optional `limit` (default `20`, range `0-100`), optional non-negative `offset` (default `0`), optional trimmed `q`, and optional exact `status` (`PROCESSING` | `COMPLETED` | `FAILED`).
 - Request body: none.
-- Success: `200` with document rows containing `id`, `filename`, `status`, `processing_stage`, optional `failure_code`/`failure_message`, and `created_at`.
-- Errors: authz `403` or `500 INTERNAL_ERROR`, both JSON envelopes.
+- Search and pagination: `q` is a case-insensitive partial match on `filename`. Processing order is ACL visibility, then `q`/`status`, then `total`, then `created_at DESC, id DESC`, then `limit`/`offset`.
+- Success: `200` with `{ documents, total, limit, offset }`. Each document contains `id`, `filename`, `status`, `processing_stage`, optional `failure_code`/`failure_message`, `created_at`, nullable `size_bytes`, `access_mode`, `uploaded_by`, nullable `uploaded_by_email`, and nullable `content_type`.
+- Errors: `400 INVALID_REQUEST` for invalid pagination or status; authz `403`; `500 AUTHZ_ERROR` when OpenFGA visibility lookup fails; or `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: none.
-- Security notes: visibility is ACL-scoped; users only see documents they have explicit or bypass viewer access to.
+- Security notes: `workspace_default` documents are visible to workspace members; `restricted` documents require explicit or bypass viewer access. OpenFGA supplies the restricted-document candidate set before SQL search/count/pagination, so `total` never reveals hidden restricted documents. Authz dependency failures are fail-closed. Storage internals (`object_key`, `bucket`, `checksum_sha256`, `storage_etag`) are not exposed.
 
 ### `POST /workspaces/{workspace_id}/documents/upload`
 
@@ -452,6 +456,27 @@ write metadata-only audit rows. See `docs/RUNBOOK.md` (OCR-004 section).
 - Errors: `400 INVALID_ACCESS_MODE`; authz `403`; `404 RESOURCE_NOT_FOUND`; or `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: updates `documents.access_mode`; when the target mode is `workspace_default`, deletes all `document_shares` rows for the document and removes the corresponding `explicit_viewer` OpenFGA tuples (OpenFGA first, then SQL); writes a metadata-only `audit_events` row recording the previous mode, new mode, and `shares_cleaned` count.
 - Security notes: mode is updated before share cleanup so a mid-cleanup failure cannot leave the document `restricted` without its prior explicit viewers. Cleanup also runs on re-apply of `workspace_default` so a partial previous cleanup can be retried safely. Setting `restricted` does not create shares.
+
+### `GET /workspaces/{workspace_id}/documents/{document_id}/shares`
+
+- Auth: bearer JWT.
+- Authorization: `admin` on `workspace:{workspace_id}`.
+- Request body: none.
+- Success: `200` with `{ document_id, access_mode, shares: [{ user_id, email, shared_at }] }`; shares are ordered by `email ASC`, then `user_id ASC` for deterministic ties.
+- Errors: authz `403`; `404 RESOURCE_NOT_FOUND` when the document does not belong to the workspace; `500 AUTHZ_ERROR` on an authorization dependency failure; or `500 INTERNAL_ERROR`, all JSON envelopes.
+- Side effects: none.
+
+### `PUT /workspaces/{workspace_id}/documents/{document_id}/permissions`
+
+- Auth: bearer JWT.
+- Authorization: `admin` on `workspace:{workspace_id}`.
+- Request body: declarative target state `{ "access_mode": "workspace_default" | "restricted", "authorized_user_ids": ["<keycloak_sub>", ...] }`; `authorized_user_ids` defaults to `[]`.
+- Validation: `workspace_default` requires an empty user list. For `restricted`, every new or recovery grant target must exist in both SQL `workspace_members` and OpenFGA `member` before any mutation. A bad target returns `400 USER_NOT_WORKSPACE_MEMBER` with `error.details.user_id`; other invalid bodies return `400 INVALID_REQUEST`.
+- Success: `200` with `{ document_id, access_mode, shares: [{ user_id, email, shared_at }] }`, using the same ordering and shape as `GET .../shares`.
+- Errors: authz `403`; `404 RESOURCE_NOT_FOUND` when the document does not belong to the workspace; `500 AUTHZ_ERROR` for OpenFGA check/write failure; or `500 INTERNAL_ERROR`, all JSON envelopes.
+- Apply order: update `access_mode` first when needed; revoke `explicit_viewer` in OpenFGA before deleting its SQL share; insert each SQL share before granting its OpenFGA tuple. A failed OpenFGA grant enqueues authz-outbox recovery best-effort.
+- Idempotency and recovery: duplicate target ids are collapsed. A fully converged re-PUT is a no-op. If an operation stops after a partial apply, the client can safely re-PUT the same target; missing OpenFGA grants behind existing SQL rows are treated as recovery work. A successful recovery writes a new completed event with the actual remaining counts for that request.
+- Audit: each non-no-op attempt that mutates state writes one best-effort `permissions_updated` event, including partial applies. Metadata is `{ prev_mode, new_mode_requested, mode_applied, granted_requested, granted_applied, revoked_requested, revoked_applied, completed, failed_stage }`; `failed_stage` is `"mode"`, `"revoke"`, or `"grant"` for an incomplete apply and `null` when `completed` is `true`. Requested fields describe planned work for that attempt; applied fields describe confirmed work. Audit failure never masks the operation error or changes its status code. A no-op writes no audit event.
 
 ### `POST /workspaces/{workspace_id}/documents/{document_id}/shares/{user_id}`
 

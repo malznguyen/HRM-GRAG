@@ -326,7 +326,7 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         .unwrap();
     assert_eq!(member_docs.status(), reqwest::StatusCode::OK);
     let member_docs_json: Value = member_docs.json().await.unwrap();
-    let member_doc_ids: Vec<String> = member_docs_json
+    let member_doc_ids: Vec<String> = member_docs_json["documents"]
         .as_array()
         .unwrap()
         .iter()
@@ -369,7 +369,7 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         .unwrap();
     assert_eq!(viewer_docs.status(), reqwest::StatusCode::OK);
     let viewer_docs_json: Value = viewer_docs.json().await.unwrap();
-    let viewer_doc_ids: Vec<String> = viewer_docs_json
+    let viewer_doc_ids: Vec<String> = viewer_docs_json["documents"]
         .as_array()
         .unwrap()
         .iter()
@@ -388,7 +388,7 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         .unwrap();
     assert_eq!(owner_docs.status(), reqwest::StatusCode::OK);
     let owner_docs_json: Value = owner_docs.json().await.unwrap();
-    let owner_doc_ids: Vec<String> = owner_docs_json
+    let owner_doc_ids: Vec<String> = owner_docs_json["documents"]
         .as_array()
         .unwrap()
         .iter()
@@ -1194,6 +1194,900 @@ async fn phase2_access_mode_and_share_endpoints_allow_and_deny() {
         member_preview_after_unrestrict.status(),
         reqwest::StatusCode::OK
     );
+}
+
+#[tokio::test]
+async fn documents_list_fields_search_pagination_and_acl_total() {
+    let _guard = phase2_test_lock().lock().await;
+    let server = TestServer::bootstrap().await;
+
+    let tenant_id = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
+    let admin = format!("documents-list-admin-{}", Uuid::new_v4());
+    let member = format!("documents-list-member-{}", Uuid::new_v4());
+    let viewer = format!("documents-list-viewer-{}", Uuid::new_v4());
+
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(tenant_id)
+        .bind(format!("Documents List Tenant {tenant_id}"))
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO workspaces (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(workspace_id)
+        .bind(tenant_id)
+        .bind(format!("Documents List Workspace {workspace_id}"))
+        .execute(&server.pool)
+        .await
+        .unwrap();
+
+    for user in [&admin, &member, &viewer] {
+        sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
+            .bind(user)
+            .bind(format!("{user}@test.local"))
+            .execute(&server.pool)
+            .await
+            .unwrap();
+    }
+    for (user, role) in [(&admin, "ADMIN"), (&member, "MEMBER"), (&viewer, "MEMBER")] {
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)",
+        )
+        .bind(workspace_id)
+        .bind(user)
+        .bind(role)
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    }
+
+    server
+        .state
+        .authz_client
+        .write_tuple(
+            &format!("user:{admin}"),
+            Relation::Admin,
+            &Object::Workspace(workspace_id),
+        )
+        .await
+        .unwrap();
+    for user in [&member, &viewer] {
+        server
+            .state
+            .authz_client
+            .write_tuple(
+                &format!("user:{user}"),
+                Relation::Member,
+                &Object::Workspace(workspace_id),
+            )
+            .await
+            .unwrap();
+    }
+
+    let public_alpha = Uuid::new_v4();
+    let public_failed = Uuid::new_v4();
+    let restricted_alpha = Uuid::new_v4();
+    let restricted_hidden = Uuid::new_v4();
+    insert_document(
+        &server.pool,
+        workspace_id,
+        public_alpha,
+        &admin,
+        "Alpha Public.pdf",
+        "workspace_default",
+    )
+    .await;
+    insert_document(
+        &server.pool,
+        workspace_id,
+        public_failed,
+        &admin,
+        "Beta Failed.pdf",
+        "workspace_default",
+    )
+    .await;
+    insert_document(
+        &server.pool,
+        workspace_id,
+        restricted_alpha,
+        &admin,
+        "Alpha Restricted.pdf",
+        "restricted",
+    )
+    .await;
+    insert_document(
+        &server.pool,
+        workspace_id,
+        restricted_hidden,
+        &admin,
+        "Hidden Processing.pdf",
+        "restricted",
+    )
+    .await;
+
+    sqlx::query(
+        "UPDATE documents SET status = 'FAILED', processing_stage = 'FAILED', uploaded_by = $2, created_at = CURRENT_TIMESTAMP - INTERVAL '2 minutes' WHERE id = $1",
+    )
+    .bind(public_failed)
+    .bind(format!("missing-uploader-{}", Uuid::new_v4()))
+    .execute(&server.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE documents SET status = 'PROCESSING', processing_stage = 'QUEUED', created_at = CURRENT_TIMESTAMP - INTERVAL '3 minutes' WHERE id = $1",
+    )
+    .bind(restricted_hidden)
+    .execute(&server.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE documents SET created_at = CURRENT_TIMESTAMP - INTERVAL '1 minute' WHERE id = $1",
+    )
+    .bind(restricted_alpha)
+    .execute(&server.pool)
+    .await
+    .unwrap();
+
+    server
+        .state
+        .authz_client
+        .write_tuple(
+            &format!("user:{viewer}"),
+            Relation::ExplicitViewer,
+            &Object::Document(restricted_alpha),
+        )
+        .await
+        .unwrap();
+
+    let client = Client::new();
+    let member_response = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents",
+            server.addr
+        ))
+        .bearer_auth(&member)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(member_response.status(), reqwest::StatusCode::OK);
+    let member_body: Value = member_response.json().await.unwrap();
+    assert_eq!(member_body["total"], json!(2));
+    assert_eq!(member_body["limit"], json!(20));
+    assert_eq!(member_body["offset"], json!(0));
+    assert_eq!(member_body["documents"].as_array().unwrap().len(), 2);
+    let public_row = member_body["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == public_alpha.to_string())
+        .unwrap();
+    assert_eq!(public_row["size_bytes"], json!(123));
+    assert_eq!(public_row["access_mode"], json!("workspace_default"));
+    assert_eq!(public_row["uploaded_by"], json!(admin));
+    assert_eq!(
+        public_row["uploaded_by_email"],
+        json!(format!("{admin}@test.local"))
+    );
+    assert_eq!(public_row["content_type"], json!("application/pdf"));
+    assert!(public_row.get("object_key").is_none());
+    assert!(public_row.get("bucket").is_none());
+    let failed_row = member_body["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == public_failed.to_string())
+        .unwrap();
+    assert!(failed_row["uploaded_by_email"].is_null());
+
+    let viewer_response = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents?q=alpha&status=COMPLETED&limit=1&offset=0",
+            server.addr
+        ))
+        .bearer_auth(&viewer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(viewer_response.status(), reqwest::StatusCode::OK);
+    let viewer_body: Value = viewer_response.json().await.unwrap();
+    assert_eq!(viewer_body["total"], json!(2));
+    assert_eq!(viewer_body["documents"].as_array().unwrap().len(), 1);
+
+    let member_filtered = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents?q=ALPHA&status=COMPLETED&limit=0&offset=0",
+            server.addr
+        ))
+        .bearer_auth(&member)
+        .send()
+        .await
+        .unwrap();
+    let member_filtered_body: Value = member_filtered.json().await.unwrap();
+    assert_eq!(member_filtered_body["total"], json!(1));
+    assert_eq!(member_filtered_body["documents"], json!([]));
+
+    for query in ["limit=-1", "limit=101", "offset=-1", "status=UNKNOWN"] {
+        let response = client
+            .get(format!(
+                "{}/workspaces/{workspace_id}/documents?{query}",
+                server.addr
+            ))
+            .bearer_auth(&member)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], json!("INVALID_REQUEST"));
+    }
+}
+
+#[tokio::test]
+async fn document_shares_and_declarative_permissions_contract() {
+    let _guard = phase2_test_lock().lock().await;
+    let server = TestServer::bootstrap().await;
+
+    let tenant_id = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
+    let other_workspace_id = Uuid::new_v4();
+    let admin = format!("permissions-admin-{}", Uuid::new_v4());
+    let member = format!("permissions-member-{}", Uuid::new_v4());
+    let old_viewer = format!("permissions-old-{}", Uuid::new_v4());
+    let new_viewer = format!("permissions-new-{}", Uuid::new_v4());
+    let outsider = format!("permissions-outsider-{}", Uuid::new_v4());
+
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(tenant_id)
+        .bind(format!("Permissions Tenant {tenant_id}"))
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    for (id, name) in [
+        (workspace_id, "Permissions Workspace"),
+        (other_workspace_id, "Other Workspace"),
+    ] {
+        sqlx::query("INSERT INTO workspaces (id, tenant_id, name) VALUES ($1, $2, $3)")
+            .bind(id)
+            .bind(tenant_id)
+            .bind(format!("{name} {id}"))
+            .execute(&server.pool)
+            .await
+            .unwrap();
+    }
+    for user in [&admin, &member, &old_viewer, &new_viewer, &outsider] {
+        sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
+            .bind(user)
+            .bind(format!("{user}@test.local"))
+            .execute(&server.pool)
+            .await
+            .unwrap();
+    }
+    for (user, role) in [
+        (&admin, "ADMIN"),
+        (&member, "MEMBER"),
+        (&old_viewer, "MEMBER"),
+        (&new_viewer, "MEMBER"),
+    ] {
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)",
+        )
+        .bind(workspace_id)
+        .bind(user)
+        .bind(role)
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    }
+
+    server
+        .state
+        .authz_client
+        .write_tuple(
+            &format!("user:{admin}"),
+            Relation::Admin,
+            &Object::Workspace(workspace_id),
+        )
+        .await
+        .unwrap();
+    for user in [&member, &old_viewer, &new_viewer] {
+        server
+            .state
+            .authz_client
+            .write_tuple(
+                &format!("user:{user}"),
+                Relation::Member,
+                &Object::Workspace(workspace_id),
+            )
+            .await
+            .unwrap();
+    }
+
+    let document_id = Uuid::new_v4();
+    let other_document_id = Uuid::new_v4();
+    insert_document(
+        &server.pool,
+        workspace_id,
+        document_id,
+        &admin,
+        "permissions.pdf",
+        "workspace_default",
+    )
+    .await;
+    insert_document(
+        &server.pool,
+        other_workspace_id,
+        other_document_id,
+        &admin,
+        "other.pdf",
+        "workspace_default",
+    )
+    .await;
+    sqlx::query("INSERT INTO document_shares (document_id, user_id) VALUES ($1, $2)")
+        .bind(document_id)
+        .bind(&old_viewer)
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    server
+        .state
+        .authz_client
+        .write_tuple(
+            &format!("user:{old_viewer}"),
+            Relation::ExplicitViewer,
+            &Object::Document(document_id),
+        )
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO document_shares (document_id, user_id) VALUES ($1, $2)")
+        .bind(document_id)
+        .bind(&member)
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    server
+        .state
+        .authz_client
+        .write_tuple(
+            &format!("user:{member}"),
+            Relation::ExplicitViewer,
+            &Object::Document(document_id),
+        )
+        .await
+        .unwrap();
+
+    let client = Client::new();
+    let shares = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/shares",
+            server.addr
+        ))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(shares.status(), reqwest::StatusCode::OK);
+    let shares_body: Value = shares.json().await.unwrap();
+    assert_eq!(shares_body["document_id"], json!(document_id));
+    assert_eq!(shares_body["access_mode"], json!("workspace_default"));
+    assert_eq!(shares_body["shares"].as_array().unwrap().len(), 2);
+    assert_eq!(shares_body["shares"][0]["user_id"], json!(member));
+    assert_eq!(shares_body["shares"][1]["user_id"], json!(old_viewer));
+    assert!(shares_body["shares"][0]["email"].is_string());
+    assert!(shares_body["shares"][0]["shared_at"].is_string());
+
+    server
+        .state
+        .authz_client
+        .delete_tuple(
+            &format!("user:{member}"),
+            Relation::ExplicitViewer,
+            &Object::Document(document_id),
+        )
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM document_shares WHERE document_id = $1 AND user_id = $2")
+        .bind(document_id)
+        .bind(&member)
+        .execute(&server.pool)
+        .await
+        .unwrap();
+
+    let denied_shares = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/shares",
+            server.addr
+        ))
+        .bearer_auth(&member)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied_shares.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let wrong_workspace = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents/{other_document_id}/shares",
+            server.addr
+        ))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_workspace.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let invalid_target = client
+        .put(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/permissions",
+            server.addr
+        ))
+        .bearer_auth(&admin)
+        .json(&json!({
+            "access_mode": "restricted",
+            "authorized_user_ids": [new_viewer, outsider]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_target.status(), reqwest::StatusCode::BAD_REQUEST);
+    let invalid_target_body: Value = invalid_target.json().await.unwrap();
+    assert_eq!(
+        invalid_target_body["error"]["code"],
+        json!("USER_NOT_WORKSPACE_MEMBER")
+    );
+    assert_eq!(
+        invalid_target_body["error"]["details"]["user_id"],
+        json!(outsider)
+    );
+    let unchanged_mode: String =
+        sqlx::query_scalar("SELECT access_mode FROM documents WHERE id = $1")
+            .bind(document_id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert_eq!(unchanged_mode, "workspace_default");
+    let unchanged_old_share: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM document_shares WHERE document_id = $1 AND user_id = $2",
+    )
+    .bind(document_id)
+    .bind(&old_viewer)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(unchanged_old_share, 1);
+
+    let updated = client
+        .put(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/permissions",
+            server.addr
+        ))
+        .bearer_auth(&admin)
+        .json(&json!({
+            "access_mode": "restricted",
+            "authorized_user_ids": [new_viewer]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), reqwest::StatusCode::OK);
+    let updated_body: Value = updated.json().await.unwrap();
+    assert_eq!(updated_body["access_mode"], json!("restricted"));
+    assert_eq!(updated_body["shares"].as_array().unwrap().len(), 1);
+    assert_eq!(updated_body["shares"][0]["user_id"], json!(new_viewer));
+
+    let old_allowed = server
+        .state
+        .authz_client
+        .check_fga(
+            &format!("user:{old_viewer}"),
+            Relation::ExplicitViewer,
+            &Object::Document(document_id),
+        )
+        .await
+        .unwrap();
+    let new_allowed = server
+        .state
+        .authz_client
+        .check_fga(
+            &format!("user:{new_viewer}"),
+            Relation::ExplicitViewer,
+            &Object::Document(document_id),
+        )
+        .await
+        .unwrap();
+    assert!(!old_allowed);
+    assert!(new_allowed);
+
+    let audit_count_after_update: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_events WHERE document_id = $1 AND event_type = 'permissions_updated'",
+    )
+    .bind(document_id)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(audit_count_after_update, 1);
+    let audit_metadata: Value = sqlx::query_scalar(
+        "SELECT metadata FROM audit_events WHERE document_id = $1 AND event_type = 'permissions_updated' ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(document_id)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(audit_metadata["prev_mode"], json!("workspace_default"));
+    assert_eq!(audit_metadata["new_mode_requested"], json!("restricted"));
+    assert_eq!(audit_metadata["mode_applied"], json!("restricted"));
+    assert_eq!(audit_metadata["granted_requested"], json!(1));
+    assert_eq!(audit_metadata["granted_applied"], json!(1));
+    assert_eq!(audit_metadata["revoked_requested"], json!(1));
+    assert_eq!(audit_metadata["revoked_applied"], json!(1));
+    assert_eq!(audit_metadata["completed"], json!(true));
+    assert!(audit_metadata["failed_stage"].is_null());
+
+    let repeated = client
+        .put(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/permissions",
+            server.addr
+        ))
+        .bearer_auth(&admin)
+        .json(&json!({
+            "access_mode": "restricted",
+            "authorized_user_ids": [new_viewer]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(repeated.status(), reqwest::StatusCode::OK);
+    let audit_count_after_noop: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_events WHERE document_id = $1 AND event_type = 'permissions_updated'",
+    )
+    .bind(document_id)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(audit_count_after_noop, audit_count_after_update);
+
+    let invalid_default = client
+        .put(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/permissions",
+            server.addr
+        ))
+        .bearer_auth(&admin)
+        .json(&json!({
+            "access_mode": "workspace_default",
+            "authorized_user_ids": [new_viewer]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid_default.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let reset = client
+        .put(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/permissions",
+            server.addr
+        ))
+        .bearer_auth(&admin)
+        .json(&json!({
+            "access_mode": "workspace_default",
+            "authorized_user_ids": []
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), reqwest::StatusCode::OK);
+    let reset_body: Value = reset.json().await.unwrap();
+    assert_eq!(reset_body["access_mode"], json!("workspace_default"));
+    assert_eq!(reset_body["shares"], json!([]));
+    let new_allowed_after_reset = server
+        .state
+        .authz_client
+        .check_fga(
+            &format!("user:{new_viewer}"),
+            Relation::ExplicitViewer,
+            &Object::Document(document_id),
+        )
+        .await
+        .unwrap();
+    assert!(!new_allowed_after_reset);
+}
+
+#[tokio::test]
+async fn permissions_cross_store_ordering_and_partial_audit() {
+    let _guard = phase2_test_lock().lock().await;
+    let server = TestServer::bootstrap().await;
+
+    let tenant_id = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
+    let admin = format!("ordering-admin-{}", Uuid::new_v4());
+    let target = format!("ordering-target-{}", Uuid::new_v4());
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(tenant_id)
+        .bind(format!("Ordering Tenant {tenant_id}"))
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO workspaces (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(workspace_id)
+        .bind(tenant_id)
+        .bind(format!("Ordering Workspace {workspace_id}"))
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    for user in [&admin, &target] {
+        sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
+            .bind(user)
+            .bind(format!("{user}@test.local"))
+            .execute(&server.pool)
+            .await
+            .unwrap();
+    }
+    for (user, role) in [(&admin, "ADMIN"), (&target, "MEMBER")] {
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)",
+        )
+        .bind(workspace_id)
+        .bind(user)
+        .bind(role)
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    }
+    server
+        .state
+        .authz_client
+        .write_tuple(
+            &format!("user:{admin}"),
+            Relation::Admin,
+            &Object::Workspace(workspace_id),
+        )
+        .await
+        .unwrap();
+    server
+        .state
+        .authz_client
+        .write_tuple(
+            &format!("user:{target}"),
+            Relation::Member,
+            &Object::Workspace(workspace_id),
+        )
+        .await
+        .unwrap();
+
+    let document_id = Uuid::new_v4();
+    insert_document(
+        &server.pool,
+        workspace_id,
+        document_id,
+        &admin,
+        "ordering.pdf",
+        "restricted",
+    )
+    .await;
+    let client = Client::new();
+
+    sqlx::query(
+        r#"
+        CREATE OR REPLACE FUNCTION test_reject_document_share_insert()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            RAISE EXCEPTION 'injected document_shares insert failure';
+        END;
+        $$
+        "#,
+    )
+    .execute(&server.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER test_reject_document_share_insert BEFORE INSERT ON document_shares FOR EACH ROW EXECUTE FUNCTION test_reject_document_share_insert()",
+    )
+    .execute(&server.pool)
+    .await
+    .unwrap();
+
+    let failed_grant = client
+        .put(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/permissions",
+            server.addr
+        ))
+        .bearer_auth(&admin)
+        .json(&json!({
+            "access_mode": "restricted",
+            "authorized_user_ids": [target]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        failed_grant.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let target_allowed_after_failed_sql: bool = server
+        .state
+        .authz_client
+        .check_fga(
+            &format!("user:{target}"),
+            Relation::ExplicitViewer,
+            &Object::Document(document_id),
+        )
+        .await
+        .unwrap();
+    assert!(!target_allowed_after_failed_sql);
+    sqlx::query("DROP TRIGGER test_reject_document_share_insert ON document_shares")
+        .execute(&server.pool)
+        .await
+        .unwrap();
+
+    sqlx::query("INSERT INTO document_shares (document_id, user_id) VALUES ($1, $2)")
+        .bind(document_id)
+        .bind(&target)
+        .execute(&server.pool)
+        .await
+        .unwrap();
+
+    let recovered_grant = client
+        .put(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/permissions",
+            server.addr
+        ))
+        .bearer_auth(&admin)
+        .json(&json!({
+            "access_mode": "restricted",
+            "authorized_user_ids": [target]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(recovered_grant.status(), reqwest::StatusCode::OK);
+    let grant_recovery_metadata: Value = sqlx::query_scalar(
+        "SELECT metadata FROM audit_events WHERE document_id = $1 AND event_type = 'permissions_updated' ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(document_id)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(grant_recovery_metadata["completed"], json!(true));
+    assert_eq!(grant_recovery_metadata["granted_requested"], json!(1));
+    assert_eq!(grant_recovery_metadata["granted_applied"], json!(1));
+
+    sqlx::query(
+        r#"
+        CREATE OR REPLACE FUNCTION test_reject_document_share_delete()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            RAISE EXCEPTION 'injected document_shares delete failure';
+        END;
+        $$
+        "#,
+    )
+    .execute(&server.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER test_reject_document_share_delete BEFORE DELETE ON document_shares FOR EACH ROW EXECUTE FUNCTION test_reject_document_share_delete()",
+    )
+    .execute(&server.pool)
+    .await
+    .unwrap();
+
+    let failed_revoke = client
+        .put(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/permissions",
+            server.addr
+        ))
+        .bearer_auth(&admin)
+        .json(&json!({
+            "access_mode": "restricted",
+            "authorized_user_ids": []
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        failed_revoke.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let target_allowed_after_failed_revoke = server
+        .state
+        .authz_client
+        .check_fga(
+            &format!("user:{target}"),
+            Relation::ExplicitViewer,
+            &Object::Document(document_id),
+        )
+        .await
+        .unwrap();
+    assert!(!target_allowed_after_failed_revoke);
+    let residual_share: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM document_shares WHERE document_id = $1 AND user_id = $2",
+    )
+    .bind(document_id)
+    .bind(&target)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(residual_share, 1);
+    let partial_metadata: Value = sqlx::query_scalar(
+        "SELECT metadata FROM audit_events WHERE document_id = $1 AND event_type = 'permissions_updated' AND metadata->>'completed' = 'false' ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(document_id)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(partial_metadata["completed"], json!(false));
+    assert_eq!(partial_metadata["failed_stage"], json!("revoke"));
+    assert_eq!(partial_metadata["revoked_requested"], json!(1));
+    assert_eq!(partial_metadata["revoked_applied"], json!(0));
+    sqlx::query("DROP TRIGGER test_reject_document_share_delete ON document_shares")
+        .execute(&server.pool)
+        .await
+        .unwrap();
+
+    let recovered = client
+        .put(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/permissions",
+            server.addr
+        ))
+        .bearer_auth(&admin)
+        .json(&json!({
+            "access_mode": "restricted",
+            "authorized_user_ids": []
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(recovered.status(), reqwest::StatusCode::OK);
+    let recovery_metadata: Value = sqlx::query_scalar(
+        "SELECT metadata FROM audit_events WHERE document_id = $1 AND event_type = 'permissions_updated' ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(document_id)
+    .fetch_one(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(recovery_metadata["completed"], json!(true));
+    assert!(recovery_metadata["failed_stage"].is_null());
+    assert_eq!(recovery_metadata["revoked_requested"], json!(1));
+    assert_eq!(recovery_metadata["revoked_applied"], json!(1));
+
+    sqlx::query(
+        r#"
+        CREATE OR REPLACE FUNCTION test_reject_permissions_audit()
+        RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            RAISE EXCEPTION 'injected permissions audit failure';
+        END;
+        $$
+        "#,
+    )
+    .execute(&server.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER test_reject_permissions_audit BEFORE INSERT ON audit_events FOR EACH ROW WHEN (NEW.event_type = 'permissions_updated') EXECUTE FUNCTION test_reject_permissions_audit()",
+    )
+    .execute(&server.pool)
+    .await
+    .unwrap();
+
+    let audit_failure_does_not_fail_operation = client
+        .put(format!(
+            "{}/workspaces/{workspace_id}/documents/{document_id}/permissions",
+            server.addr
+        ))
+        .bearer_auth(&admin)
+        .json(&json!({
+            "access_mode": "restricted",
+            "authorized_user_ids": [target]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        audit_failure_does_not_fail_operation.status(),
+        reqwest::StatusCode::OK
+    );
+    sqlx::query("DROP TRIGGER test_reject_permissions_audit ON audit_events")
+        .execute(&server.pool)
+        .await
+        .unwrap();
 }
 
 async fn insert_document(

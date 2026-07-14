@@ -65,6 +65,20 @@ impl ApiError {
         };
         Self::new(status, code, message)
     }
+
+    pub fn into_response_with_details(self, details: Value) -> Response {
+        (
+            self.status,
+            Json(ApiErrorResponse {
+                error: ApiErrorPayload {
+                    code: self.code,
+                    message: self.message,
+                    details: Some(details),
+                },
+            }),
+        )
+            .into_response()
+    }
 }
 
 impl IntoResponse for ApiError {
