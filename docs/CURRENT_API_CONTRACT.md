@@ -92,7 +92,7 @@ not use this envelope.
 
 ### Current Storage Contract
 
-- Upload stores original PDFs in MinIO/S3 through the storage module.
+- Upload stores original PDF, DOCX, TXT, and MD files in MinIO/S3 through the storage module.
 - Retry reads from MinIO/S3 and does not depend on local-file existence.
 - Delete revokes the captured OpenFGA subtree first, then commits SQL cleanup
   and durable cleanup outboxes; object/Qdrant cleanup remains best-effort after
@@ -378,11 +378,12 @@ Evidence: `gmrag_api/src/tenant_cleanup.rs:373-428,649-706` and
 
 - Auth: bearer JWT.
 - Authorization: `admin` on `workspace:{workspace_id}`.
-- Request body: `multipart/form-data` with one or more `file` parts, and an optional text field `access_mode` (`workspace_default` | `restricted`). When omitted, `access_mode` defaults to `workspace_default`. The same `access_mode` applies to every accepted file in the request.
+- Request body: `multipart/form-data` with one or more `file` parts, and an optional text field `access_mode` (`workspace_default` | `restricted`). Supported files are PDF, DOCX, TXT, and MD. When omitted, `access_mode` defaults to `workspace_default`. The same `access_mode` applies to every accepted file in the request.
 - Success: `202` with `{ documents: [{ document_id, filename }] }` for the accepted files.
-- Errors: `400 INVALID_REQUEST` when no acceptable PDF is accepted; `400 INVALID_ACCESS_MODE`; authz `403`; `404 RESOURCE_NOT_FOUND`; or `500 INTERNAL_ERROR`, all JSON envelopes.
+- Errors: `400 INVALID_REQUEST` when no acceptable file is accepted; `400 INVALID_ACCESS_MODE`; authz `403`; `404 RESOURCE_NOT_FOUND`; or `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: uploads original bytes to MinIO/S3, then atomically inserts `documents` metadata (including `access_mode`) and one durable `ingestion_jobs` row. Processing is performed by the separate ingestion worker after commit.
-- Security notes: filename and client MIME type are stored as metadata only. Acceptance requires a `%PDF-` signature and successful structural validation (`lopdf`) of the submitted bytes before object-key generation or S3/MinIO upload; a filename suffix alone is never enough. Responses do not expose raw object keys. Uploading as `restricted` does not auto-create `document_shares` or `explicit_viewer` tuples for the uploader; visibility follows the same restricted-document rules as after `PATCH .../access-mode`.
+- Validation: PDF requires a `%PDF-` signature plus successful `lopdf` structural parsing. DOCX requires the ZIP local-file signature, a readable archive, `[Content_Types].xml`, and `word/document.xml`. TXT/MD require non-empty valid UTF-8 bytes with no NUL; because their content validators are identical, only the sanitized `.txt`/`.md` extension selects which server MIME is stored. `DOCUMENT_MAX_UPLOAD_BYTES` limits each file and the multipart request body (default `52428800`, 50 MiB).
+- Security notes: client MIME is ignored for acceptance and persistence. `documents.content_type` is always one of the server-validated values `application/pdf`, `application/vnd.openxmlformats-officedocument.wordprocessingml.document`, `text/plain`, or `text/markdown`. Filename suffix does not establish PDF/DOCX identity and is used only to disambiguate valid TXT from MD. Responses do not expose raw object keys. Uploading as `restricted` does not auto-create `document_shares` or `explicit_viewer` tuples for the uploader; visibility follows the same restricted-document rules as after `PATCH .../access-mode`.
 
 ### `DELETE /workspaces/{workspace_id}/documents/{document_id}`
 
@@ -426,6 +427,8 @@ Stable document `failure_code` values currently emitted by the worker include:
 | `DOCUMENT_OBJECT_MISSING` | Original object absent in storage | No |
 | `NEEDS_OCR` | Page(s) need OCR and no usable OCR result is available (no production provider yet) | No |
 | `PDF_PARSE_FAILED` | PDF could not be parsed or chunked | No |
+| `DOCX_PARSE_FAILED` | DOCX archive/XML could not be parsed or produced no usable text | No |
+| `TEXT_DECODE_FAILED` | TXT/MD could not be decoded, or stored `content_type` is missing/unsupported | No |
 | `EMBEDDING_PROVIDER_UNAVAILABLE` | Embeddings failed | Yes (until max attempts) |
 | `GRAPH_EXTRACTION_FAILED` | Graph extraction failed | Yes (until max attempts) |
 | `QDRANT_INDEX_FAILED` | Vector index failed | Yes (until max attempts) |
@@ -433,7 +436,7 @@ Stable document `failure_code` values currently emitted by the worker include:
 | `INTERNAL_INGESTION_ERROR` | Other internal ingestion error | Yes (until max attempts) |
 | `INGESTION_MAX_ATTEMPTS_EXCEEDED` | Retryable failure exhausted `max_attempts` | No (terminal after retries) |
 
-`NEEDS_OCR` is non-retryable for the worker while no OCR provider is configured,
+`NEEDS_OCR` applies only to PDF and is non-retryable for the worker while no OCR provider is configured,
 avoiding futile claim loops. After a future OCR provider/configuration change
 (OCR-003+), operators may re-queue via `POST .../documents/{document_id}/retry`
 (document must be terminal `FAILED`, object must still exist).

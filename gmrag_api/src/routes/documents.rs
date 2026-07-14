@@ -23,6 +23,7 @@ use crate::auth::resource_cleanup::capture_document_delete_plan;
 use crate::document_directory::{
     get_document_permissions, list_documents as list_document_directory,
 };
+use crate::document_format::{DocumentFormat, document_max_upload_bytes};
 use crate::ingestion::jobs::{IngestionWorkerConfig, enqueue_job_tx, retry_failed_document};
 use crate::retrieval::outbox::enqueue_delete_by_document_tx;
 use crate::state::AppState;
@@ -1226,19 +1227,20 @@ pub async fn upload_document(
                     .file_name()
                     .map(sanitize_filename)
                     .unwrap_or_else(|| "upload.pdf".to_string());
-                let content_type = field.content_type().map(|value| value.to_string());
-                let pdf_bytes = match field.bytes().await {
+                let bytes = match field.bytes().await {
                     Ok(bytes) => bytes.to_vec(),
                     Err(_) => continue,
                 };
-                // Filename/MIME chỉ là metadata — chấp nhận theo chữ ký + parse cấu trúc PDF
-                if pdf_bytes.is_empty() || !is_parseable_pdf(&pdf_bytes) {
+                if bytes.len() > document_max_upload_bytes() {
                     continue;
                 }
+                let Some(format) = DocumentFormat::detect_upload(&filename, &bytes) else {
+                    continue;
+                };
                 pending_files.push(PendingUploadFile {
                     filename,
-                    content_type,
-                    pdf_bytes,
+                    format,
+                    bytes,
                 });
             }
             _ => continue,
@@ -1249,17 +1251,17 @@ pub async fn upload_document(
 
     for file in pending_files {
         let filename = file.filename;
-        let content_type = file.content_type;
-        let pdf_bytes = file.pdf_bytes;
+        let content_type = file.format.content_type();
+        let bytes = file.bytes;
 
         let document_id = Uuid::new_v4();
         let object_key = build_original_document_object_key(tenant_id, workspace_id, document_id);
-        let checksum_sha256 = checksum_sha256_hex(&pdf_bytes);
-        let size_bytes = i64::try_from(pdf_bytes.len()).unwrap_or(i64::MAX);
+        let checksum_sha256 = checksum_sha256_hex(&bytes);
+        let size_bytes = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
 
         let storage_etag = match state
             .storage
-            .put_original_document(&object_key, &pdf_bytes, content_type.as_deref())
+            .put_original_document(&object_key, &bytes, Some(content_type))
             .await
         {
             Ok(result) => result.etag,
@@ -1313,7 +1315,7 @@ pub async fn upload_document(
         .bind(access_mode.as_str())
         .bind(&object_key)
         .bind(state.storage.bucket())
-        .bind(content_type.as_deref())
+        .bind(content_type)
         .bind(size_bytes)
         .bind(&checksum_sha256)
         .bind(storage_etag.as_deref())
@@ -1419,7 +1421,7 @@ pub async fn upload_document(
                 .with_metadata(json!({
                     "filename": filename.clone(),
                     "size_bytes": size_bytes,
-                    "content_type": content_type.clone(),
+                    "content_type": content_type,
                     "access_mode": access_mode.as_str(),
                 })),
         )
@@ -1442,7 +1444,12 @@ pub async fn upload_document(
     }
 
     if uploaded.is_empty() {
-        return StatusCode::BAD_REQUEST.into_response();
+        return ApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: "INVALID_REQUEST",
+            message: "Request did not contain an acceptable file".to_string(),
+        }
+        .into_response();
     }
 
     (
@@ -1456,8 +1463,8 @@ pub async fn upload_document(
 
 struct PendingUploadFile {
     filename: String,
-    content_type: Option<String>,
-    pdf_bytes: Vec<u8>,
+    format: DocumentFormat,
+    bytes: Vec<u8>,
 }
 
 fn sanitize_filename(name: &str) -> String {
@@ -1477,82 +1484,9 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
-/// Chấp nhận upload khi bytes có chữ ký `%PDF-` và `lopdf` parse cấu trúc được.
-/// Tên file / Content-Type client gửi không quyết định acceptance (chỉ lưu metadata).
-fn is_parseable_pdf(data: &[u8]) -> bool {
-    if !data.starts_with(b"%PDF-") {
-        return false;
-    }
-    lopdf::Document::load_mem(data).is_ok()
-}
-
 fn checksum_sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("{:x}", digest)
-}
-
-#[cfg(test)]
-mod pdf_upload_validation_tests {
-    use super::is_parseable_pdf;
-    use lopdf::{Document, Object, dictionary};
-
-    fn minimal_valid_pdf_bytes() -> Vec<u8> {
-        let mut doc = Document::with_version("1.4");
-        let pages_id = doc.new_object_id();
-        let page_id = doc.add_object(dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-        });
-        doc.objects.insert(
-            pages_id,
-            Object::Dictionary(dictionary! {
-                "Type" => "Pages",
-                "Kids" => vec![Object::Reference(page_id)],
-                "Count" => 1,
-            }),
-        );
-        let catalog_id = doc.add_object(dictionary! {
-            "Type" => "Catalog",
-            "Pages" => pages_id,
-        });
-        doc.trailer.set("Root", catalog_id);
-
-        let mut bytes = Vec::new();
-        doc.save_to(&mut bytes)
-            .expect("synthetic PDF fixture must serialize");
-        bytes
-    }
-
-    #[test]
-    fn pdf_upload_validation_accepts_minimal_valid_pdf() {
-        let bytes = minimal_valid_pdf_bytes();
-        assert!(
-            is_parseable_pdf(&bytes),
-            "minimal in-memory PDF fixture must be accepted"
-        );
-    }
-
-    #[test]
-    fn pdf_upload_validation_rejects_arbitrary_bytes_named_pdf() {
-        // Tên file .pdf không đủ — arbitrary bytes phải bị từ chối
-        let bytes = b"this is not a pdf at all";
-        assert!(!is_parseable_pdf(bytes));
-    }
-
-    #[test]
-    fn pdf_upload_validation_rejects_malformed_pdf_prefix() {
-        // Có chữ ký %PDF- nhưng không parse được cấu trúc
-        let bytes = b"%PDF-1.4\nthis is truncated garbage without xref or trailer\n%%EOF";
-        assert!(!is_parseable_pdf(bytes));
-    }
-
-    #[test]
-    fn pdf_upload_validation_accepts_valid_bytes_without_pdf_extension() {
-        // Bytes là authoritative — không cần suffix .pdf trên filename
-        let bytes = minimal_valid_pdf_bytes();
-        assert!(is_parseable_pdf(&bytes));
-    }
 }
 
 async fn fetch_workspace_tenant_id(

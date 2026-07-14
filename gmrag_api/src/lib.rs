@@ -4,6 +4,7 @@ pub mod auth;
 pub mod authz_orphan_report;
 pub mod chat;
 pub mod document_directory;
+pub mod document_format;
 pub mod identity_report;
 pub mod ingestion;
 pub mod invite;
@@ -258,7 +259,6 @@ async fn check_dependency(
 }
 
 pub fn app_router(state: AppState) -> Router {
-    const MAX_UPLOAD_BYTES: usize = 50 * 1024 * 1024;
     let cors = cors_layer();
     let rate_limit_layer = axum::middleware::from_fn(rate_limit::enforce_rate_limits);
     telemetry::init_metrics_recorder();
@@ -347,7 +347,9 @@ pub fn app_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(
             api_error::normalize_error_responses,
         ))
-        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
+        .layer(DefaultBodyLimit::max(
+            document_format::document_max_upload_bytes(),
+        ))
         .layer(cors)
         .with_state(state)
 }

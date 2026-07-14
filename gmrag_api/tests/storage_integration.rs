@@ -4,9 +4,13 @@ use reqwest::Client;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
-use std::sync::{Arc, OnceLock};
+use std::{
+    io::{Cursor, Write},
+    sync::{Arc, OnceLock},
+};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
+use zip::{ZipWriter, write::SimpleFileOptions};
 
 use gmrag_api::auth::authz::{Object, Relation};
 use gmrag_api::retrieval::{ChunkPoint, RetrievalClient, RetrievalConfig};
@@ -178,10 +182,27 @@ impl TestServer {
         seed: &WorkspaceSeed,
         create_object: bool,
     ) -> SeededDocument {
+        self.insert_failed_document_with_format(
+            seed,
+            "seeded.pdf",
+            "application/pdf",
+            sample_pdf_bytes(),
+            create_object,
+        )
+        .await
+    }
+
+    async fn insert_failed_document_with_format(
+        &self,
+        seed: &WorkspaceSeed,
+        filename: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+        create_object: bool,
+    ) -> SeededDocument {
         let document_id = Uuid::new_v4();
         let object_key =
             build_original_document_object_key(seed.tenant_id, seed.workspace_id, document_id);
-        let bytes = sample_pdf_bytes();
         let checksum_sha256 = hex_sha256(&bytes);
 
         if create_object {
@@ -215,10 +236,10 @@ impl TestServer {
         .bind(document_id)
         .bind(seed.workspace_id)
         .bind(&seed.admin_user_id)
-        .bind("seeded.pdf")
+        .bind(filename)
         .bind(&object_key)
         .bind(self.state.storage.bucket())
-        .bind("application/pdf")
+        .bind(content_type)
         .bind(i64::try_from(bytes.len()).unwrap_or(i64::MAX))
         .bind(&checksum_sha256)
         .bind(Option::<&str>::None)
@@ -299,6 +320,138 @@ async fn upload_pdf_persists_object_and_metadata() {
 
     let exists = server.state.storage.object_exists(&row.0).await.unwrap();
     assert!(exists);
+}
+
+#[tokio::test]
+async fn upload_supported_formats_persists_server_validated_content_types() {
+    let server = TestServer::bootstrap().await;
+    let seed = server.seed_workspace_admin().await;
+
+    let form = reqwest::multipart::Form::new()
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(sample_pdf_bytes())
+                .file_name("server-pdf.bin")
+                .mime_str("application/octet-stream")
+                .unwrap(),
+        )
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(sample_docx_bytes("Nội dung DOCX"))
+                .file_name("server-docx.bin")
+                .mime_str("text/plain")
+                .unwrap(),
+        )
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes("Nội dung TXT".as_bytes().to_vec())
+                .file_name("notes.txt")
+                .mime_str("application/pdf")
+                .unwrap(),
+        )
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"# Raw markdown".to_vec())
+                .file_name("guide.md")
+                .mime_str("application/octet-stream")
+                .unwrap(),
+        );
+
+    let response = Client::new()
+        .post(format!(
+            "{}/workspaces/{}/documents/upload",
+            server.addr, seed.workspace_id
+        ))
+        .bearer_auth(&seed.admin_user_id)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["documents"].as_array().unwrap().len(), 4);
+
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT filename, content_type FROM documents WHERE workspace_id = $1 ORDER BY filename",
+    )
+    .bind(seed.workspace_id)
+    .fetch_all(&server.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("guide.md".to_string(), Some("text/markdown".to_string())),
+            ("notes.txt".to_string(), Some("text/plain".to_string())),
+            (
+                "server-docx.bin".to_string(),
+                Some(
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        .to_string()
+                )
+            ),
+            (
+                "server-pdf.bin".to_string(),
+                Some("application/pdf".to_string())
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn upload_rejects_invalid_payloads_for_every_supported_extension() {
+    let server = TestServer::bootstrap().await;
+    let seed = server.seed_workspace_admin().await;
+
+    let form = reqwest::multipart::Form::new()
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"not OOXML".to_vec()).file_name("fake.docx"),
+        )
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(vec![0xff, 0xfe]).file_name("invalid.txt"),
+        )
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"contains\0nul".to_vec()).file_name("nul.md"),
+        )
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"%PDF-truncated".to_vec()).file_name("broken.pdf"),
+        )
+        .part(
+            "file",
+            reqwest::multipart::Part::bytes(b"garbage".to_vec()).file_name("unknown.bin"),
+        );
+
+    let response = Client::new()
+        .post(format!(
+            "{}/workspaces/{}/documents/upload",
+            server.addr, seed.workspace_id
+        ))
+        .bearer_auth(&seed.admin_user_id)
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "INVALID_REQUEST");
+    assert_eq!(
+        body["error"]["message"],
+        "Request did not contain an acceptable file"
+    );
+
+    let document_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM documents WHERE workspace_id = $1")
+            .bind(seed.workspace_id)
+            .fetch_one(&server.pool)
+            .await
+            .unwrap();
+    assert_eq!(document_count, 0);
 }
 
 #[tokio::test]
@@ -1018,6 +1171,73 @@ fn sample_pdf_bytes() -> Vec<u8> {
         111, 98, 106, 10, 10, 115, 116, 97, 114, 116, 120, 114, 101, 102, 10, 49, 55, 54, 10, 37,
         37, 69, 79, 70,
     ]
+}
+
+#[tokio::test]
+async fn retry_document_preserves_semantics_for_new_formats() {
+    let server = TestServer::bootstrap().await;
+    let seed = server.seed_workspace_admin().await;
+    let fixtures = [
+        (
+            "retry.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            sample_docx_bytes("Retry DOCX"),
+        ),
+        ("retry.txt", "text/plain", b"Retry TXT".to_vec()),
+        ("retry.md", "text/markdown", b"# Retry MD".to_vec()),
+    ];
+
+    for (filename, content_type, bytes) in fixtures {
+        let document = server
+            .insert_failed_document_with_format(&seed, filename, content_type, bytes, true)
+            .await;
+        let response = Client::new()
+            .post(format!(
+                "{}/workspaces/{}/documents/{}/retry",
+                server.addr, seed.workspace_id, document.document_id
+            ))
+            .bearer_auth(&seed.admin_user_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+
+        let state: (String, String, i64) = sqlx::query_as(
+            r#"
+            SELECT d.status, d.processing_stage, COUNT(j.id)::bigint
+            FROM documents d
+            LEFT JOIN ingestion_jobs j
+              ON j.document_id = d.id AND j.status IN ('QUEUED', 'PROCESSING')
+            WHERE d.id = $1
+            GROUP BY d.status, d.processing_stage
+            "#,
+        )
+        .bind(document.document_id)
+        .fetch_one(&server.pool)
+        .await
+        .unwrap();
+        assert_eq!(state, ("PROCESSING".into(), "QUEUED".into(), 1));
+    }
+}
+
+fn sample_docx_bytes(text: &str) -> Vec<u8> {
+    let document_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body>
+</w:document>"#
+    );
+    let mut output = Cursor::new(Vec::new());
+    {
+        let mut writer = ZipWriter::new(&mut output);
+        let options = SimpleFileOptions::default();
+        writer.start_file("[Content_Types].xml", options).unwrap();
+        writer.write_all(b"<Types/>").unwrap();
+        writer.start_file("word/document.xml", options).unwrap();
+        writer.write_all(document_xml.as_bytes()).unwrap();
+        writer.finish().unwrap();
+    }
+    output.into_inner()
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {

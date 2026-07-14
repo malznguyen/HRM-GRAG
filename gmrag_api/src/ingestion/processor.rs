@@ -17,6 +17,9 @@ use super::graph::{
 };
 use super::ocr::vision_ocr_fallback;
 use super::pdf_parser::{PageExtract, PdfParseError, extract_pdf_from_bytes};
+use crate::document_format::{
+    DocumentFormat, DocxParseError, TextDecodeError, decode_text, extract_docx_text,
+};
 use crate::ingestion::jobs::{
     ClaimedJob, STAGE_EMBEDDING, STAGE_GRAPH_EXTRACTION, STAGE_INDEXING, STAGE_PARSING,
     STAGE_SAVING, complete_job_and_document, set_stage_for_owner,
@@ -86,7 +89,7 @@ async fn process_document(
         .await?
         .ok_or(ProcessError::DocumentNotFound { document_id })?;
 
-    let pdf_bytes = storage
+    let document_bytes = storage
         .get_original_document(&storage_metadata.object_key)
         .await
         .map_err(|err| match err {
@@ -96,57 +99,88 @@ async fn process_document(
             _ => ProcessError::Storage(err),
         })?;
 
+    let document_format = storage_metadata
+        .content_type
+        .as_deref()
+        .and_then(DocumentFormat::from_content_type)
+        .ok_or_else(|| ProcessError::UnsupportedContentType {
+            content_type: storage_metadata.content_type.clone(),
+        })?;
     let parse_started = Instant::now();
     let parse_timeout = Duration::from_secs(pdf_parse_timeout_secs());
 
     tracing::info!(
         %workspace_id,
         %document_id,
+        content_type = document_format.content_type(),
         timeout_secs = parse_timeout.as_secs(),
-        "PDF parse started"
+        "Document text extraction started"
     );
 
-    let extracted = timeout(
-        parse_timeout,
-        tokio::task::spawn_blocking(move || extract_pdf_from_bytes(&pdf_bytes)),
-    )
-    .await
-    .map_err(|_| ProcessError::ParseTimeout {
-        timeout_secs: parse_timeout.as_secs(),
-    })?
-    .map_err(|_| ProcessError::Join)?
-    .map_err(ProcessError::Parse)?;
+    let page_texts = match document_format {
+        DocumentFormat::Pdf => {
+            let extracted = timeout(
+                parse_timeout,
+                tokio::task::spawn_blocking(move || extract_pdf_from_bytes(&document_bytes)),
+            )
+            .await
+            .map_err(|_| ProcessError::PdfParseTimeout {
+                timeout_secs: parse_timeout.as_secs(),
+            })?
+            .map_err(|_| ProcessError::Join)?
+            .map_err(ProcessError::PdfParse)?;
+
+            for page in &extracted.pages {
+                if page.needs_ocr {
+                    tracing::warn!(
+                        %workspace_id,
+                        %document_id,
+                        page = page.page_number,
+                        char_count = page.text.chars().count(),
+                        "Page text below threshold; OCR required"
+                    );
+                }
+            }
+            resolve_pages_for_chunking(extracted.pages).await?
+        }
+        DocumentFormat::Docx => {
+            let text = timeout(
+                parse_timeout,
+                tokio::task::spawn_blocking(move || extract_docx_text(&document_bytes)),
+            )
+            .await
+            .map_err(|_| ProcessError::DocxParseTimeout {
+                timeout_secs: parse_timeout.as_secs(),
+            })?
+            .map_err(|_| ProcessError::Join)?
+            .map_err(ProcessError::DocxParse)?;
+            vec![text]
+        }
+        DocumentFormat::Text | DocumentFormat::Markdown => {
+            // Markdown được giữ nguyên markup; chunking nhận trực tiếp raw UTF-8 text.
+            vec![decode_text(&document_bytes).map_err(ProcessError::TextDecode)?]
+        }
+    };
 
     tracing::info!(
         %workspace_id,
         %document_id,
-        pages = extracted.pages.len(),
+        content_type = document_format.content_type(),
         elapsed_ms = parse_started.elapsed().as_millis(),
-        "PDF parse completed"
+        "Document text extraction completed"
     );
 
-    for page in &extracted.pages {
-        if page.needs_ocr {
-            tracing::warn!(
-                %workspace_id,
-                %document_id,
-                page = page.page_number,
-                char_count = page.text.chars().count(),
-                "Page text below threshold; OCR required"
-            );
-        }
-    }
-
-    let page_texts = resolve_pages_for_chunking(extracted.pages).await?;
-
     let chunk_started = Instant::now();
-    let chunks = chunk_page_texts(&page_texts).map_err(ProcessError::Chunk)?;
+    let chunks = chunk_page_texts(&page_texts).map_err(|source| ProcessError::Chunk {
+        format: document_format,
+        source,
+    })?;
     tracing::info!(
         %workspace_id,
         %document_id,
         chunks = chunks.len(),
         elapsed_ms = chunk_started.elapsed().as_millis(),
-        "PDF chunking completed"
+        "Document chunking completed"
     );
     if chunks.is_empty() {
         tracing::warn!(
@@ -722,6 +756,7 @@ async fn build_chunk_points_for_retrieval(
 #[derive(sqlx::FromRow)]
 struct DocumentStorageMetadata {
     object_key: String,
+    content_type: Option<String>,
 }
 
 async fn document_still_exists(
@@ -1054,7 +1089,7 @@ async fn fetch_document_storage_metadata(
 ) -> Result<Option<DocumentStorageMetadata>, ProcessError> {
     sqlx::query_as(
         r#"
-        SELECT object_key
+        SELECT object_key, content_type
         FROM documents
         WHERE id = $1 AND workspace_id = $2
         "#,
@@ -1220,11 +1255,22 @@ pub enum ProcessError {
     /// Cần OCR nhưng chưa có kết quả usable (chưa có provider production).
     NeedsOcr,
     Storage(StorageError),
-    Parse(PdfParseError),
-    ParseTimeout {
+    PdfParse(PdfParseError),
+    PdfParseTimeout {
         timeout_secs: u64,
     },
-    Chunk(ChunkError),
+    DocxParse(DocxParseError),
+    DocxParseTimeout {
+        timeout_secs: u64,
+    },
+    TextDecode(TextDecodeError),
+    UnsupportedContentType {
+        content_type: Option<String>,
+    },
+    Chunk {
+        format: DocumentFormat,
+        source: ChunkError,
+    },
     Embed(EmbedError),
     EmbedTimeout {
         timeout_secs: u64,
@@ -1258,11 +1304,21 @@ impl std::fmt::Display for ProcessError {
                 )
             }
             ProcessError::Storage(err) => write!(f, "storage error: {err}"),
-            ProcessError::Parse(e) => write!(f, "{e}"),
-            ProcessError::ParseTimeout { timeout_secs } => {
+            ProcessError::PdfParse(e) => write!(f, "{e}"),
+            ProcessError::PdfParseTimeout { timeout_secs } => {
                 write!(f, "PDF parsing timed out after {timeout_secs}s")
             }
-            ProcessError::Chunk(e) => write!(f, "{e}"),
+            ProcessError::DocxParse(e) => write!(f, "{e}"),
+            ProcessError::DocxParseTimeout { timeout_secs } => {
+                write!(f, "DOCX parsing timed out after {timeout_secs}s")
+            }
+            ProcessError::TextDecode(e) => write!(f, "{e}"),
+            ProcessError::UnsupportedContentType { content_type } => write!(
+                f,
+                "unsupported server-validated document content type: {}",
+                content_type.as_deref().unwrap_or("<missing>")
+            ),
+            ProcessError::Chunk { source, .. } => write!(f, "{source}"),
             ProcessError::Embed(e) => write!(f, "{e}"),
             ProcessError::EmbedTimeout { timeout_secs } => {
                 write!(
@@ -1303,9 +1359,32 @@ impl ProcessError {
                 "Document requires OCR and no OCR provider is available",
                 false,
             ),
-            Self::Parse(_) | Self::ParseTimeout { .. } | Self::Chunk(_) => {
-                ("PDF_PARSE_FAILED", "The PDF could not be parsed", false)
-            }
+            Self::PdfParse(_)
+            | Self::PdfParseTimeout { .. }
+            | Self::Chunk {
+                format: DocumentFormat::Pdf,
+                ..
+            } => ("PDF_PARSE_FAILED", "The PDF could not be parsed", false),
+            Self::DocxParse(_)
+            | Self::DocxParseTimeout { .. }
+            | Self::Chunk {
+                format: DocumentFormat::Docx,
+                ..
+            } => (
+                "DOCX_PARSE_FAILED",
+                "The DOCX document could not be parsed",
+                false,
+            ),
+            Self::TextDecode(_)
+            | Self::UnsupportedContentType { .. }
+            | Self::Chunk {
+                format: DocumentFormat::Text | DocumentFormat::Markdown,
+                ..
+            } => (
+                "TEXT_DECODE_FAILED",
+                "The text document could not be decoded",
+                false,
+            ),
             Self::Embed(_) | Self::EmbedTimeout { .. } | Self::MissingEmbedding { .. } => (
                 "EMBEDDING_PROVIDER_UNAVAILABLE",
                 "Embeddings could not be generated",
@@ -1363,6 +1442,28 @@ mod needs_ocr_tests {
         );
         assert!(!retryable);
         assert!(message.chars().count() <= 240);
+    }
+
+    #[test]
+    fn multi_format_parse_failures_are_stable_and_non_retryable() {
+        let (docx_code, docx_message, docx_retryable) =
+            ProcessError::DocxParse(DocxParseError).failure_kind();
+        assert_eq!(docx_code, "DOCX_PARSE_FAILED");
+        assert_eq!(docx_message, "The DOCX document could not be parsed");
+        assert!(!docx_retryable);
+
+        let (text_code, text_message, text_retryable) =
+            ProcessError::TextDecode(TextDecodeError).failure_kind();
+        assert_eq!(text_code, "TEXT_DECODE_FAILED");
+        assert_eq!(text_message, "The text document could not be decoded");
+        assert!(!text_retryable);
+
+        let (unknown_code, _, unknown_retryable) = ProcessError::UnsupportedContentType {
+            content_type: Some("application/octet-stream".to_string()),
+        }
+        .failure_kind();
+        assert_eq!(unknown_code, "TEXT_DECODE_FAILED");
+        assert!(!unknown_retryable);
     }
 
     #[test]
