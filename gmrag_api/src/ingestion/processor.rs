@@ -756,10 +756,7 @@ mod race_guard_tests {
     #[tokio::test]
     async fn document_still_exists_false_after_delete() {
         dotenvy::dotenv().ok();
-        let Ok(database_url) = std::env::var("DATABASE_URL") else {
-            eprintln!("skip: DATABASE_URL not set");
-            return;
-        };
+        let database_url = crate::test_isolation::database_url().expect("DATABASE_URL must be set");
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .connect(&database_url)
@@ -914,10 +911,7 @@ mod reingestion_idempotency_tests {
     #[tokio::test]
     async fn reprocessing_same_document_does_not_duplicate_outputs() {
         dotenvy::dotenv().ok();
-        let Ok(database_url) = std::env::var("DATABASE_URL") else {
-            eprintln!("skip: DATABASE_URL not set");
-            return;
-        };
+        let database_url = crate::test_isolation::database_url().expect("DATABASE_URL must be set");
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .connect(&database_url)

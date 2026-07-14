@@ -984,6 +984,19 @@ mod tests {
         }
     }
 
+    fn live_test_config() -> RetrievalConfig {
+        let environment = crate::test_isolation::require_external_test_environment();
+        RetrievalConfig {
+            qdrant_url: environment.qdrant_url.clone(),
+            collection_name: environment.qdrant_collection.clone(),
+            vector_size: crate::ingestion::embedding::EXPECTED_EMBEDDING_DIM,
+            top_k: 5,
+            api_key: None,
+            delete_request_timeout_secs: DEFAULT_DELETE_REQUEST_TIMEOUT_SECS,
+            delete_worker_timeout_secs: DEFAULT_DELETE_WORKER_TIMEOUT_SECS,
+        }
+    }
+
     #[tokio::test]
     async fn delete_points_by_document_fails_when_qdrant_unreachable() {
         // Port 1 thường không có listener — kiểm tra lỗi mạng không panic.
@@ -1127,9 +1140,7 @@ mod tests {
     #[tokio::test]
     async fn delete_points_by_document_is_idempotent_when_no_matching_points() {
         dotenvy::dotenv().ok();
-        let qdrant_url =
-            std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string());
-        let client = RetrievalClient::from_config(test_config(&qdrant_url));
+        let client = RetrievalClient::from_config(live_test_config());
 
         // Collection có thể chưa tồn tại: tạo qua upsert rỗng không được; dùng ensure qua upsert 1 point rồi xoá.
         let workspace_id = Uuid::new_v4();
@@ -1173,9 +1184,7 @@ mod tests {
     #[tokio::test]
     async fn delete_points_by_workspace_is_idempotent_and_removes_all_workspace_points() {
         dotenvy::dotenv().ok();
-        let qdrant_url =
-            std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string());
-        let client = RetrievalClient::from_config(test_config(&qdrant_url));
+        let client = RetrievalClient::from_config(live_test_config());
 
         let workspace_id = Uuid::new_v4();
         let other_workspace_id = Uuid::new_v4();
@@ -1248,9 +1257,7 @@ mod tests {
         // Mô phỏng tenant cleanup: xoá points của nhiều workspace thuộc cùng tenant
         // trong một filter `match.any`, không đụng workspace ngoài danh sách.
         dotenvy::dotenv().ok();
-        let qdrant_url =
-            std::env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string());
-        let client = RetrievalClient::from_config(test_config(&qdrant_url));
+        let client = RetrievalClient::from_config(live_test_config());
 
         let workspace_a = Uuid::new_v4();
         let workspace_b = Uuid::new_v4();

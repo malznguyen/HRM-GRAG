@@ -4,13 +4,15 @@
 //! 1. Sau commit lifecycle TX, recovery row đã tồn tại (crash-after-commit an toàn).
 //! 2. Rollback lifecycle TX không để lại outbox row mồ côi.
 
+mod support;
+
 use gmrag_api::retrieval::outbox::{enqueue_delete_by_document_tx, enqueue_delete_by_workspace_tx};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use uuid::Uuid;
 
 async fn pool_or_skip() -> Option<PgPool> {
     dotenvy::dotenv().ok();
-    let database_url = std::env::var("DATABASE_URL").ok()?;
+    let database_url = support::database_url().ok()?;
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)

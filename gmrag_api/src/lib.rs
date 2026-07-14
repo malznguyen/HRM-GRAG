@@ -18,6 +18,10 @@ pub mod tenant_cleanup;
 pub mod tenant_directory;
 pub mod workspace_admin_recovery;
 
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_isolation;
+
 use auth::authz::{Object, Relation};
 use axum::{
     Router,

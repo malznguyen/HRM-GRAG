@@ -2,6 +2,8 @@
 //!
 //! Embedder is injected (no live Ollama required). Database requires DATABASE_URL.
 
+mod support;
+
 use std::sync::OnceLock;
 
 use serde_json::json;
@@ -31,7 +33,7 @@ fn init_test_env() {
 
 async fn setup_pool() -> sqlx::PgPool {
     dotenvy::dotenv().ok();
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let database_url = support::database_url().expect("DATABASE_URL must be set");
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)

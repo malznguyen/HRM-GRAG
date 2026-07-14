@@ -1,3 +1,5 @@
+mod support;
+
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -78,7 +80,9 @@ fn init_test_env() {
         std::env::set_var("APP_RUNTIME_ROLE", "api");
         std::env::set_var("S3_ENDPOINT_URL", "http://localhost:9000");
         std::env::set_var("S3_REGION", "us-east-1");
-        std::env::set_var("S3_BUCKET", "gmrag-documents");
+        if std::env::var_os("S3_BUCKET").is_none() {
+            std::env::set_var("S3_BUCKET", "gmrag-documents");
+        }
         std::env::set_var("S3_ACCESS_KEY_ID", "minioadmin");
         std::env::set_var("S3_SECRET_ACCESS_KEY", "minioadmin");
         std::env::set_var("S3_FORCE_PATH_STYLE", "true");
@@ -89,7 +93,7 @@ fn init_test_env() {
 async fn setup_pool() -> sqlx::PgPool {
     dotenvy::dotenv().ok();
 
-    let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+    let database_url = support::database_url().expect("DATABASE_URL must be set");
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)

@@ -2,6 +2,8 @@
 //! bounded selection, idempotent requeue, refuse apply when OCR unavailable.
 //! Không dùng production corpus; skip nếu DATABASE_URL không sẵn.
 
+mod support;
+
 use gmrag_api::ingestion::jobs::{
     JOB_QUEUED, RequeueEligibility, enqueue_job_tx, requeue_document_for_reingest,
 };
@@ -25,7 +27,7 @@ fn test_lock() -> &'static Mutex<()> {
 
 async fn pool_or_skip() -> Option<PgPool> {
     dotenvy::dotenv().ok();
-    let database_url = std::env::var("DATABASE_URL").ok()?;
+    let database_url = support::database_url().ok()?;
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)

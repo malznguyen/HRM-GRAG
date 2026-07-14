@@ -1,3 +1,5 @@
+mod support;
+
 use axum::{Json, Router, http::StatusCode, routing::post};
 use gmrag_api::{
     auth::{
@@ -298,7 +300,7 @@ fn init_test_env() {
 async fn setup_pool() -> sqlx::PgPool {
     let pool = PgPoolOptions::new()
         .max_connections(4)
-        .connect(&std::env::var("DATABASE_URL").expect("DATABASE_URL"))
+        .connect(&support::database_url().expect("DATABASE_URL"))
         .await
         .expect("PostgreSQL");
     match sqlx::migrate!("./migrations").run(&pool).await {

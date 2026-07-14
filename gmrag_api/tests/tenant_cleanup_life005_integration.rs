@@ -12,6 +12,8 @@
 //!
 //! Không gọi public API. Workers outbox vẫn manual (OPS-003).
 
+mod support;
+
 use gmrag_api::storage::cleanup::build_tenant_prefix;
 use gmrag_api::tenant_cleanup::{
     TenantCleanupError, capture_tenant_delete_plan, commit_tenant_delete_lifecycle,
@@ -36,7 +38,7 @@ fn init_test_env() {
 
 async fn pool_or_skip() -> Option<PgPool> {
     init_test_env();
-    let database_url = std::env::var("DATABASE_URL").ok()?;
+    let database_url = support::database_url().ok()?;
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)

@@ -1,3 +1,5 @@
+mod support;
+
 use std::sync::OnceLock;
 
 use gmrag_api::auth::outbox_health::{
@@ -15,7 +17,7 @@ fn test_lock() -> &'static Mutex<()> {
 
 async fn pool_or_skip() -> Option<PgPool> {
     dotenvy::dotenv().ok();
-    let database_url = std::env::var("DATABASE_URL").ok()?;
+    let database_url = support::database_url().ok()?;
     let pool = PgPoolOptions::new()
         .max_connections(2)
         .connect(&database_url)

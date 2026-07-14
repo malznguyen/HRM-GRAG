@@ -9,6 +9,8 @@
 //! Scheduling unattended (`process-storage-outbox` định kỳ) = OPS-003.
 //! Tenant cascade strategy = LIFE-005 (không trong scope file này).
 
+mod support;
+
 use gmrag_api::retrieval::outbox::enqueue_delete_by_workspace_tx;
 use gmrag_api::storage::cleanup::build_workspace_prefix;
 use gmrag_api::storage::outbox::{
@@ -50,7 +52,7 @@ fn init_test_env() {
 
 async fn pool_or_skip() -> Option<PgPool> {
     init_test_env();
-    let database_url = std::env::var("DATABASE_URL").ok()?;
+    let database_url = support::database_url().ok()?;
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)

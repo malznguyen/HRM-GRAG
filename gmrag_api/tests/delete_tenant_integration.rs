@@ -1,3 +1,5 @@
+mod support;
+
 use std::{fs, process::Command, sync::OnceLock};
 
 use gmrag_api::{
@@ -28,7 +30,7 @@ fn init_test_env() {
 
 async fn pool_or_skip() -> Option<PgPool> {
     init_test_env();
-    let database_url = std::env::var("DATABASE_URL").ok()?;
+    let database_url = support::database_url().ok()?;
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)
@@ -291,7 +293,9 @@ async fn delete_commits_outboxes_audit_and_removes_tenant_subtree_tuples() {
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(qdrant_ids, seed.workspace_ids);
+    let mut expected_qdrant_ids = seed.workspace_ids.clone();
+    expected_qdrant_ids.sort_unstable();
+    assert_eq!(qdrant_ids, expected_qdrant_ids);
     let storage_prefix: String =
         sqlx::query_scalar("SELECT payload->>'prefix' FROM storage_outbox WHERE id = $1")
             .bind(storage_outbox_id)

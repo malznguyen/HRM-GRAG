@@ -11,6 +11,8 @@
 //! Không claim scheduled/unattended execution (OPS-002 / OPS-003). Live-resource
 //! guards và tenant empty-list hard-fail đã cover ở phase3a; không lặp lại ở đây.
 
+mod support;
+
 use gmrag_api::ingestion::embedding::EXPECTED_EMBEDDING_DIM;
 use gmrag_api::retrieval::cleanup::{QdrantCleanupOptions, cleanup_qdrant_orphans};
 use gmrag_api::retrieval::{ChunkPoint, RetrievalClient};
@@ -60,7 +62,7 @@ fn init_test_env() {
 
 async fn pool_or_skip() -> Option<PgPool> {
     init_test_env();
-    let database_url = std::env::var("DATABASE_URL").ok()?;
+    let database_url = support::database_url().ok()?;
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&database_url)

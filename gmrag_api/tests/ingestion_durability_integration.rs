@@ -1,3 +1,5 @@
+mod support;
+
 use std::{collections::HashMap, sync::Arc};
 
 use futures::future::join_all;
@@ -15,7 +17,7 @@ use uuid::Uuid;
 
 async fn pool_or_skip() -> Option<PgPool> {
     dotenvy::dotenv().ok();
-    let database_url = std::env::var("DATABASE_URL").ok()?;
+    let database_url = support::database_url().ok()?;
     let pool = PgPoolOptions::new()
         .max_connections(12)
         .connect(&database_url)

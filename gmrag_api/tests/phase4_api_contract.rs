@@ -249,7 +249,9 @@ fn init_test_env() {
         std::env::set_var("TEST_BYPASS_KEYCLOAK", "1");
         std::env::set_var("S3_ENDPOINT_URL", "http://127.0.0.1:9000");
         std::env::set_var("S3_REGION", "us-east-1");
-        std::env::set_var("S3_BUCKET", "gmrag-documents");
+        if std::env::var_os("S3_BUCKET").is_none() {
+            std::env::set_var("S3_BUCKET", "gmrag-documents");
+        }
         std::env::set_var("S3_ACCESS_KEY_ID", "minioadmin");
         std::env::set_var("S3_SECRET_ACCESS_KEY", "minioadmin");
         std::env::set_var("S3_FORCE_PATH_STYLE", "true");

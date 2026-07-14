@@ -1,3 +1,5 @@
+mod support;
+
 use std::sync::{Arc, OnceLock};
 
 use axum::{
@@ -82,6 +84,7 @@ struct TestServer {
 impl TestServer {
     async fn bootstrap() -> Self {
         dotenvy::dotenv().ok();
+        support::require_external_test_environment();
 
         let qdrant_mock = QdrantMockState::default();
         let deepseek_mock = DeepseekMockState::default();
@@ -92,7 +95,7 @@ impl TestServer {
 
         init_test_env(&qdrant_addr, &ollama_addr, &deepseek_addr);
 
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
+        let database_url = support::database_url().expect("DATABASE_URL must be set");
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .connect(&database_url)
@@ -1475,7 +1478,9 @@ fn init_test_env(qdrant_addr: &str, ollama_addr: &str, deepseek_addr: &str) {
         std::env::set_var("TEST_BYPASS_KEYCLOAK", "1");
         std::env::set_var("S3_ENDPOINT_URL", "http://localhost:9000");
         std::env::set_var("S3_REGION", "us-east-1");
-        std::env::set_var("S3_BUCKET", "gmrag-documents");
+        if std::env::var_os("S3_BUCKET").is_none() {
+            std::env::set_var("S3_BUCKET", "gmrag-documents");
+        }
         std::env::set_var("S3_ACCESS_KEY_ID", "minioadmin");
         std::env::set_var("S3_SECRET_ACCESS_KEY", "minioadmin");
         std::env::set_var("S3_FORCE_PATH_STYLE", "true");
@@ -1487,7 +1492,6 @@ fn init_test_env(qdrant_addr: &str, ollama_addr: &str, deepseek_addr: &str) {
         );
         std::env::set_var("DEEPSEEK_API_KEY", "test-key");
         std::env::set_var("QDRANT_URL", qdrant_addr);
-        std::env::set_var("QDRANT_COLLECTION", "gmrag_test_phase2_chunks");
         std::env::set_var("QDRANT_VECTOR_SIZE", EMBEDDING_DIM.to_string());
         std::env::set_var("QDRANT_TOP_K", "5");
         std::env::set_var("GMRAG_GRAPH_EXTRACTION_ENABLED", "false");
