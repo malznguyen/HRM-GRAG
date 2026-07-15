@@ -49,21 +49,26 @@ Historical v1 audit snapshots are archived under `docs/archive/v1/`.
 - MinIO
 - minio-init bucket creation
 - Qdrant (REST `6333`, gRPC `6334`)
+- Ollama (`11434`, provisioned with the ADR-21 q8_0 GGUF)
 - Keycloak (`8080`, `start-dev` + realm import for browser OIDC and Admin API)
 - `process-authz-outbox` (loop drain of `authz_outbox`; requires `OPENFGA_STORE_ID`)
 - `process-qdrant-outbox` (loop drain of `qdrant_outbox`; multi-replica claim-safe)
+- `ingestion-worker` (durable ingestion poller; no Keycloak/JWT dependency)
 
 **Local-demo only.** Docker Compose is the only supported orchestration. Workers are built from `docker/outbox-workers.Dockerfile` (existing Rust binaries). They are not staging/production readiness proof.
 
 **Worker bootstrap note:** create an OpenFGA store (and optional model), then set `OPENFGA_STORE_ID` (and optionally `OPENFGA_MODEL_ID`) in a root `.env` or the shell before/while compose runs. Until `OPENFGA_STORE_ID` is set, `process-authz-outbox` will exit and restart (`restart: unless-stopped`).
 
-**Ollama is not in Docker.** Install Ollama on the host and pull the ADR-21 embedding model before ingestion or chat retrieval:
+**Canonical local topology:** Compose owns the infrastructure and workers, including
+Ollama and `ingestion-worker`. `gmrag-api` and the Next.js frontend remain host-run
+and use the published localhost ports. There is intentionally no API image or
+`gmrag-api` Compose service.
 
-```bash
-ollama pull AITeamVN/Vietnamese_Embedding
-```
-
-This model is the default for chunk embedding (ingestion), graph node embedding (ingestion forward-path), and query embedding (chat). Runtime output is **768** dimensions (matches Postgres `vector(768)` and Qdrant). The HuggingFace model card lists 1024-d; the Ollama registry copy used here is verified at **768-d** — do not change schema solely because of the card (see `docs/RUNBOOK.md` §6). Override with `OLLAMA_EMBED_MODEL` only if you accept retrieval-quality risk and a full re-embed.
+The exact model name is `AITeamVN/Vietnamese_Embedding`. Local demo imports the
+named third-party `model-q8_0.gguf` through `docker/ollama/Modelfile`; it returns
+the model-native **1024** dimensions. `QDRANT_VECTOR_SIZE=1024` is shared by
+Postgres guards, Qdrant, ingestion, and query embedding. Review the artifact trust
+caveat and exact commands in `docs/RUNBOOK.md` §6 before provisioning it.
 
 **Keycloak scope in local compose:** Keycloak is the only login IdP, bearer-token issuer, and verified-user directory. The `gmrag-frontend` public client uses Authorization Code Flow with PKCE S256, `fullScopeAllowed=false`, and explicit default scopes (`basic`, `profile`, `email`, `roles` — `basic` required so access tokens include `sub`); `gmrag-api` is the required token audience. The backend validates `JWT_ISSUER`, `JWT_AUDIENCE`, and `JWT_JWKS_URL`. Required invariant: access-token `sub` must equal Keycloak Admin `user.id` and is the canonical id for SQL and OpenFGA. Workspace public API roles are only `member`|`admin` (Tenant Owner is not a workspace role).
 
@@ -97,19 +102,17 @@ Copy `gmrag_api/.env.example` to `gmrag_api/.env` and fill in the values for:
 
 ## Local Bootstrap
 
-1. Start local infrastructure:
+1. Provision the q8_0 GGUF, import the exact Ollama model name, remove the stale
+   768-d Qdrant collection, and apply the forward migration by following
+   `docs/RUNBOOK.md` §6 in order.
+
+2. Start the canonical Compose topology:
 
    ```bash
-   docker compose up -d
+   docker compose up -d --build
    ```
 
-2. Pull the embedding model on the host (Ollama is outside Docker):
-
-   ```bash
-   ollama pull AITeamVN/Vietnamese_Embedding
-   ```
-
-3. Configure backend environment and run the API:
+3. Configure backend environment and run the API on the host:
 
    ```bash
    cd gmrag_api
@@ -119,13 +122,8 @@ Copy `gmrag_api/.env.example` to `gmrag_api/.env` and fill in the values for:
    The default API bind is `127.0.0.1:8083` (`API_BIND_ADDR`), leaving local
    Keycloak on `127.0.0.1:8080`.
 
-   Run durable ingestion separately (a successful upload only enqueues work):
-
-   ```bash
-   cargo run --bin ingestion-worker
-   # one polling pass for development/ops
-   cargo run --bin ingestion-worker -- --once
-   ```
+   A successful upload only enqueues work. The Compose `ingestion-worker` owns
+   processing and waits for a healthy Ollama before its startup embedding probe.
 
 4. Bootstrap a platform admin tuple in OpenFGA for a real user id:
 
@@ -155,8 +153,7 @@ Copy `gmrag_api/.env.example` to `gmrag_api/.env` and fill in the values for:
 Run these from `gmrag_api/`:
 
 ```bash
-# Durable Phase 1 ingestion
-cargo run --bin ingestion-worker -- --worker-id local-worker
+# Durable Phase 1 ingestion is the root Compose `ingestion-worker` service
 cargo run --bin recover-stale-ingestion-jobs -- --dry-run
 cargo run --bin recover-stale-ingestion-jobs -- --apply
 

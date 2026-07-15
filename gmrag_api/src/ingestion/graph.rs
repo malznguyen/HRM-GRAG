@@ -237,7 +237,7 @@ impl GraphWriteBatch {
             .collect()
     }
 
-    /// Gắn vector embedding (768-d, ADR-21) vào từng node trước khi bulk upsert.
+    /// Gắn vector embedding 1024-d (ADR-21) vào từng node trước khi bulk upsert.
     ///
     /// `embeddings.len()` phải khớp `node_count()`; processor batch-embed rồi gọi hàm này.
     pub fn attach_node_embeddings(&mut self, embeddings: Vec<Vec<f32>>) -> Result<(), GraphError> {
@@ -273,7 +273,7 @@ struct NodeInput {
     name: String,
     entity_type: Option<String>,
     description: Option<String>,
-    /// Vector 768-d (ADR-21); None nếu chưa attach — SQL ghi NULL, không đè embedding cũ.
+    /// Vector 1024-d (ADR-21); None nếu chưa attach — SQL ghi NULL, không đè embedding cũ.
     embedding: Option<Vec<f32>>,
 }
 

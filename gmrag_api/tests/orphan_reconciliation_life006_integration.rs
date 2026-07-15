@@ -13,7 +13,7 @@
 
 mod support;
 
-use gmrag_api::ingestion::embedding::EXPECTED_EMBEDDING_DIM;
+use gmrag_api::ingestion::embedding::DEFAULT_EMBEDDING_DIM;
 use gmrag_api::retrieval::cleanup::{QdrantCleanupOptions, cleanup_qdrant_orphans};
 use gmrag_api::retrieval::{ChunkPoint, RetrievalClient};
 use gmrag_api::storage::cleanup::{StorageCleanupOptions, scan_documents_and_orphans};
@@ -88,7 +88,7 @@ async fn retrieval_or_skip() -> Option<RetrievalClient> {
     // Probe bằng upsert/delete nhỏ — skip nếu Qdrant không sẵn.
     let probe_ws = Uuid::new_v4();
     let probe_doc = Uuid::new_v4();
-    let dim = EXPECTED_EMBEDDING_DIM;
+    let dim = DEFAULT_EMBEDDING_DIM;
     let embedding = vec![0.001_f32; dim];
     match client
         .upsert_chunk_points(&[ChunkPoint {
@@ -209,7 +209,7 @@ async fn life006_qdrant_full_scan_orphan_dry_run_apply_idempotent() {
     let orphan_workspace_id = Uuid::new_v4();
     let orphan_document_id = Uuid::new_v4();
     let chunk_id = Uuid::new_v4();
-    let embedding = vec![0.003_f32; EXPECTED_EMBEDDING_DIM];
+    let embedding = vec![0.003_f32; DEFAULT_EMBEDDING_DIM];
 
     retrieval
         .upsert_chunk_points(&[ChunkPoint {

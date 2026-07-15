@@ -89,8 +89,25 @@ services:
   # Qdrant — vector store cho Phase 2 retrieval (local demo)
   qdrant:
     image: qdrant/qdrant:v1.18.2
+    ports:
+      - "6333:6333"
     volumes:
       - ./.docker_data/qdrant:/qdrant/storage
+
+  # Ollama local cho embedding ADR-21. Model được operator import từ GGUF q8_0.
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./.docker_data/ollama:/root/.ollama
+      - ./docker/ollama:/models:ro
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
 
   # Keycloak — IdP duy nhất cho frontend OIDC, bearer JWT và Admin API lookup.
   # Admin console (demo local): http://localhost:8080 — user/pass admin/admin
@@ -105,6 +122,55 @@ services:
     volumes:
       # File phải tên <realm>-realm.json theo convention import-at-startup của Keycloak
       - ./docker/keycloak/gmrag-realm.json:/opt/keycloak/data/import/gmrag-realm.json:ro
+
+  # Durable ingestion worker. API/frontend vẫn chạy trên host theo topology local-demo.
+  ingestion-worker:
+    build:
+      context: ./gmrag_api
+      dockerfile: ../docker/outbox-workers.Dockerfile
+    image: gmrag/outbox-workers:local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+      qdrant:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-gmrag_user}:${POSTGRES_PASSWORD:-change_me}@postgres:5432/${POSTGRES_DB:-gmrag}
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-gmrag-documents}
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      S3_PRESIGN_EXPIRY_SECS: ${S3_PRESIGN_EXPIRY_SECS:-900}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-gmrag_document_chunks}
+      QDRANT_VECTOR_SIZE: ${QDRANT_VECTOR_SIZE:-1024}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      OLLAMA_EMBED_URL: http://ollama:11434/api/embed
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-AITeamVN/Vietnamese_Embedding}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_API_URL: ${DEEPSEEK_API_URL:-https://api.deepseek.com/chat/completions}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-flash}
+      GMRAG_GRAPH_EXTRACTION_ENABLED: ${GMRAG_GRAPH_EXTRACTION_ENABLED:-true}
+      INGESTION_WORKER_POLL_INTERVAL_MS: ${INGESTION_WORKER_POLL_INTERVAL_MS:-1000}
+      INGESTION_JOB_LEASE_SECS: ${INGESTION_JOB_LEASE_SECS:-300}
+      INGESTION_JOB_MAX_ATTEMPTS: ${INGESTION_JOB_MAX_ATTEMPTS:-5}
+      INGESTION_JOB_BATCH_SIZE: ${INGESTION_JOB_BATCH_SIZE:-1}
+      INGESTION_JOB_BASE_BACKOFF_SECS: ${INGESTION_JOB_BASE_BACKOFF_SECS:-5}
+      INGESTION_JOB_MAX_BACKOFF_SECS: ${INGESTION_JOB_MAX_BACKOFF_SECS:-300}
+      GMRAG_EMBEDDING_BATCH_SIZE: ${GMRAG_EMBEDDING_BATCH_SIZE:-32}
+      GMRAG_EMBEDDING_CONCURRENCY: ${GMRAG_EMBEDDING_CONCURRENCY:-2}
+      GMRAG_EMBEDDING_TIMEOUT_SECS: ${GMRAG_EMBEDDING_TIMEOUT_SECS:-120}
+      GMRAG_EMBEDDING_RETRIES: ${GMRAG_EMBEDDING_RETRIES:-1}
+      RUST_LOG: ${RUST_LOG:-info}
+    command: ["/usr/local/bin/ingestion-worker"]
+    stop_grace_period: 30s
 
   # Authz outbox worker (local demo). Single replica — không scale; không có SKIP LOCKED lease.
   # OPENFGA_STORE_ID do operator tạo store rồi inject (root .env / shell); worker crash-loop tới khi có.

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use gmrag_api::{
     auth::{authz::AuthzClient, jwt::JwtValidator, keycloak::KeycloakClient},
-    ingestion::embedding::EXPECTED_EMBEDDING_DIM,
+    ingestion::embedding::DEFAULT_EMBEDDING_DIM,
     retrieval::{RetrievalClient, RetrievalConfig},
     state::AppState,
     storage::{StorageClient, StorageConfig},
@@ -279,7 +279,7 @@ async fn spawn_api() -> String {
         retrieval: RetrievalClient::from_config(RetrievalConfig {
             qdrant_url: "http://127.0.0.1:6333".to_string(),
             collection_name: "gmrag_document_chunks".to_string(),
-            vector_size: EXPECTED_EMBEDDING_DIM,
+            vector_size: DEFAULT_EMBEDDING_DIM,
             top_k: 5,
             api_key: None,
             delete_request_timeout_secs: 5,

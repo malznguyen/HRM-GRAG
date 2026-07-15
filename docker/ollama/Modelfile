@@ -1,0 +1,2 @@
+FROM ./model-q8_0.gguf
+PARAMETER num_ctx 2048

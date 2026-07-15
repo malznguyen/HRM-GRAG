@@ -8,6 +8,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY migrations ./migrations
 COPY src ./src
 RUN cargo build --release \
+    --bin ingestion-worker \
     --bin process-authz-outbox \
     --bin process-qdrant-outbox \
     --bin cleanup-qdrant-orphans \
@@ -19,6 +20,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --create-home --uid 10001 gmrag
 COPY --from=builder /src/target/release/process-authz-outbox /usr/local/bin/process-authz-outbox
+COPY --from=builder /src/target/release/ingestion-worker /usr/local/bin/ingestion-worker
 COPY --from=builder /src/target/release/process-qdrant-outbox /usr/local/bin/process-qdrant-outbox
 COPY --from=builder /src/target/release/cleanup-qdrant-orphans /usr/local/bin/cleanup-qdrant-orphans
 COPY --from=builder /src/target/release/cleanup-storage-objects /usr/local/bin/cleanup-storage-objects

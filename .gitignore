@@ -23,6 +23,7 @@ credentials/
 .docker_data/
 **/data/
 **/uploads/
+docker/ollama/*.gguf
 
 # Dependencies and build outputs
 node_modules/

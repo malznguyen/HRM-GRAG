@@ -17,10 +17,11 @@ use uuid::Uuid;
 
 use gmrag_api::auth::authz::{Object, Relation};
 use gmrag_api::auth::document_acl::backfill_document_workspace_relations;
+use gmrag_api::ingestion::embedding::DEFAULT_EMBEDDING_DIM;
 use gmrag_api::ingestion::graph::{GraphElement, GraphWriteBatch, bulk_upsert_graph};
 use gmrag_api::state::AppState;
 
-const EMBEDDING_DIM: usize = 768;
+const EMBEDDING_DIM: usize = DEFAULT_EMBEDDING_DIM;
 static PHASE2_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn phase2_test_lock() -> &'static Mutex<()> {

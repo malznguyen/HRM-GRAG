@@ -5,6 +5,7 @@ use std::{collections::HashMap, sync::Arc};
 use futures::future::join_all;
 use gmrag_api::auth::document_acl::fetch_completed_workspace_document_acl_rows;
 use gmrag_api::chat::retrieval::fetch_chunks_by_ids;
+use gmrag_api::ingestion::embedding::DEFAULT_EMBEDDING_DIM;
 use gmrag_api::ingestion::jobs::{
     IngestionWorkerConfig, JobFailure, STAGE_PARSING, claim_document_job, enqueue_job_tx,
     finish_job_failure, retry_failed_document, set_stage_for_owner,
@@ -231,7 +232,7 @@ fn test_worker_config(max_attempts: i32) -> IngestionWorkerConfig {
 }
 
 async fn seed_points(pool: &PgPool, workspace_id: Uuid, document_id: Uuid) -> Vec<ChunkPoint> {
-    let embedding = vec![0.01_f32; 768];
+    let embedding = vec![0.01_f32; DEFAULT_EMBEDDING_DIM];
     let embedding_literal = format!(
         "[{}]",
         embedding

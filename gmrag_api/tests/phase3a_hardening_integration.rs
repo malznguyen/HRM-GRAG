@@ -13,6 +13,7 @@ use gmrag_api::auth::authz::{AuthzClient, Object, Relation, TupleKey};
 use gmrag_api::auth::outbox::{
     AuthzOutboxProcessorConfig, enqueue_tuple_delete, enqueue_tuple_write, process_authz_outbox,
 };
+use gmrag_api::ingestion::embedding::DEFAULT_EMBEDDING_DIM;
 use gmrag_api::invite_cleanup::{
     InvitePlaceholderCleanupOptions, cleanup_invite_placeholders, find_invite_placeholders,
 };
@@ -783,40 +784,60 @@ async fn invite_placeholder_cleanup_dry_run_does_not_delete() {
         .await;
 }
 
-/// Migration `20260709000000_graph_nodes_hnsw_index` phải tạo HNSW L2 (khớp `ORDER BY embedding <->`).
+/// Migration 1024 phải giữ đúng chiều và ops class của từng đường retrieval.
 #[tokio::test]
-async fn graph_nodes_embedding_hnsw_index_exists_with_l2_ops() {
+async fn embedding_schema_uses_1024_and_matching_hnsw_ops() {
     let _guard = phase3a_test_lock().lock().await;
     init_test_env();
     let pool = setup_pool().await;
 
-    let indexdef: Option<String> = sqlx::query_scalar(
+    let column_types: Vec<(String, String)> = sqlx::query_as(
         r#"
-        SELECT indexdef
-        FROM pg_indexes
-        WHERE schemaname = 'public'
-          AND tablename = 'graph_nodes'
-          AND indexname = 'graph_nodes_embedding_hnsw_idx'
+        SELECT table_name, format_type(attribute.atttypid, attribute.atttypmod)
+        FROM information_schema.columns AS column_info
+        JOIN pg_class AS relation ON relation.relname = column_info.table_name
+        JOIN pg_attribute AS attribute
+          ON attribute.attrelid = relation.oid
+         AND attribute.attname = column_info.column_name
+        WHERE column_info.table_schema = 'public'
+          AND column_info.column_name = 'embedding'
+          AND column_info.table_name = ANY($1)
+        ORDER BY table_name
         "#,
     )
-    .fetch_optional(&pool)
+    .bind(&["document_chunks", "graph_node_sources", "graph_nodes"])
+    .fetch_all(&pool)
     .await
-    .expect("query pg_indexes");
+    .expect("query embedding column types");
+    assert_eq!(column_types.len(), 3);
+    assert!(
+        column_types
+            .iter()
+            .all(|(_, column_type)| column_type == "vector(1024)"),
+        "all embedding columns must be vector(1024): {column_types:?}"
+    );
 
-    let indexdef = indexdef.expect("graph_nodes_embedding_hnsw_idx must exist after migrations");
-    let lower = indexdef.to_lowercase();
-    assert!(
-        lower.contains("hnsw"),
-        "index must be HNSW, got: {indexdef}"
-    );
-    assert!(
-        lower.contains("vector_l2_ops"),
-        "index must use vector_l2_ops (retrieval uses <->), got: {indexdef}"
-    );
-    assert!(
-        !lower.contains("vector_cosine_ops"),
-        "must not use cosine ops class on graph_nodes.embedding, got: {indexdef}"
-    );
+    for (index_name, expected_ops) in [
+        ("document_chunks_embedding_idx", "vector_cosine_ops"),
+        ("graph_nodes_embedding_hnsw_idx", "vector_l2_ops"),
+        ("graph_node_sources_embedding_hnsw_idx", "vector_l2_ops"),
+    ] {
+        let indexdef: Option<String> = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1",
+        )
+        .bind(index_name)
+        .fetch_optional(&pool)
+        .await
+        .expect("query pg_indexes");
+        let indexdef =
+            indexdef.unwrap_or_else(|| panic!("{index_name} must exist after migrations"));
+        let lower = indexdef.to_lowercase();
+        assert!(lower.contains("hnsw"), "index must be HNSW: {indexdef}");
+        assert!(
+            lower.contains(expected_ops),
+            "{index_name} must use {expected_ops}: {indexdef}"
+        );
+    }
 }
 
 /// Xoá row outbox còn claimable — tránh test chậm / assert lẫn state leftover.
@@ -1051,7 +1072,7 @@ async fn qdrant_outbox_processor_marks_unreachable_as_failed() {
     let broken = RetrievalClient::from_config(RetrievalConfig {
         qdrant_url: "http://127.0.0.1:1".to_string(),
         collection_name: "gmrag_document_chunks".to_string(),
-        vector_size: 768,
+        vector_size: DEFAULT_EMBEDDING_DIM,
         top_k: 5,
         api_key: None,
         delete_request_timeout_secs: 2,
@@ -1121,7 +1142,7 @@ async fn qdrant_outbox_poison_invalid_payload_marked_dead() {
     let broken = RetrievalClient::from_config(RetrievalConfig {
         qdrant_url: "http://127.0.0.1:1".to_string(),
         collection_name: "gmrag_document_chunks".to_string(),
-        vector_size: 768,
+        vector_size: DEFAULT_EMBEDDING_DIM,
         top_k: 5,
         api_key: None,
         delete_request_timeout_secs: 2,
@@ -1175,7 +1196,7 @@ async fn qdrant_outbox_exhausted_retries_marked_dead() {
     let broken = RetrievalClient::from_config(RetrievalConfig {
         qdrant_url: "http://127.0.0.1:1".to_string(),
         collection_name: "gmrag_document_chunks".to_string(),
-        vector_size: 768,
+        vector_size: DEFAULT_EMBEDDING_DIM,
         top_k: 5,
         api_key: None,
         delete_request_timeout_secs: 2,
@@ -1291,7 +1312,7 @@ async fn qdrant_outbox_concurrent_workers_partition_rows() {
     let retrieval = RetrievalClient::from_config(RetrievalConfig {
         qdrant_url: "http://127.0.0.1:1".to_string(),
         collection_name: "gmrag_document_chunks".to_string(),
-        vector_size: 768,
+        vector_size: DEFAULT_EMBEDDING_DIM,
         top_k: 5,
         api_key: None,
         delete_request_timeout_secs: 1,
@@ -1389,7 +1410,7 @@ async fn qdrant_outbox_hard_sql_failure_is_observable() {
     let retrieval = RetrievalClient::from_config(RetrievalConfig {
         qdrant_url: "http://127.0.0.1:1".to_string(),
         collection_name: "gmrag_document_chunks".to_string(),
-        vector_size: 768,
+        vector_size: DEFAULT_EMBEDDING_DIM,
         top_k: 5,
         api_key: None,
         delete_request_timeout_secs: 1,
@@ -1422,7 +1443,7 @@ async fn qdrant_outbox_backoff_zero_allows_immediate_retry() {
     let broken = RetrievalClient::from_config(RetrievalConfig {
         qdrant_url: "http://127.0.0.1:1".to_string(),
         collection_name: "gmrag_document_chunks".to_string(),
-        vector_size: 768,
+        vector_size: DEFAULT_EMBEDDING_DIM,
         top_k: 5,
         api_key: None,
         delete_request_timeout_secs: 2,
@@ -1479,7 +1500,7 @@ async fn qdrant_cleanup_dry_run_reports_outbox_candidates_without_delete() {
     let broken = RetrievalClient::from_config(RetrievalConfig {
         qdrant_url: "http://127.0.0.1:1".to_string(),
         collection_name: "gmrag_document_chunks".to_string(),
-        vector_size: 768,
+        vector_size: DEFAULT_EMBEDDING_DIM,
         top_k: 5,
         api_key: None,
         delete_request_timeout_secs: 2,
@@ -1518,7 +1539,7 @@ fn broken_retrieval_client() -> RetrievalClient {
     RetrievalClient::from_config(RetrievalConfig {
         qdrant_url: "http://127.0.0.1:1".to_string(),
         collection_name: "gmrag_document_chunks".to_string(),
-        vector_size: 768,
+        vector_size: DEFAULT_EMBEDDING_DIM,
         top_k: 5,
         api_key: None,
         delete_request_timeout_secs: 2,

@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use gmrag_api::ingestion::embedding::{embed_text, log_embedding_config_on_startup};
 use gmrag_api::ingestion::jobs::{
     IngestionWorkerConfig, JobFailure, claim_jobs, extend_lease, finish_job_failure,
 };
@@ -10,6 +11,10 @@ use sqlx::postgres::PgPoolOptions;
 use tokio::time::{interval, sleep};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+const EMBEDDING_STARTUP_PROBE_ATTEMPTS: u32 = 12;
+const EMBEDDING_STARTUP_PROBE_RETRY_SECS: u64 = 5;
+const EMBEDDING_STARTUP_PROBE_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Default)]
 struct RunSummary {
@@ -47,6 +52,8 @@ async fn main() {
     )
     .await;
     let retrieval = RetrievalClient::from_env().expect("Failed to load retrieval configuration");
+    log_embedding_config_on_startup();
+    probe_embedding_provider().await;
 
     let poll_interval =
         Duration::from_millis(env_u64("INGESTION_WORKER_POLL_INTERVAL_MS", 1_000, 100));
@@ -102,6 +109,42 @@ async fn main() {
         dead = summary.dead,
         lease_conflicts = summary.lease_conflicts,
         "Ingestion worker stopped"
+    );
+}
+
+/// Chặn vòng poll cho tới khi Ollama trả đúng model và đúng chiều vector.
+async fn probe_embedding_provider() {
+    let client = reqwest::Client::new();
+    for attempt in 1..=EMBEDDING_STARTUP_PROBE_ATTEMPTS {
+        let probe = tokio::time::timeout(
+            Duration::from_secs(EMBEDDING_STARTUP_PROBE_TIMEOUT_SECS),
+            embed_text(&client, "GMRAG ingestion worker startup probe"),
+        )
+        .await;
+
+        match probe {
+            Ok(Ok(embedding)) => {
+                info!(
+                    dimensions = embedding.len(),
+                    attempt, "Embedding startup probe succeeded"
+                );
+                return;
+            }
+            Ok(Err(err)) => warn!(attempt, error = %err, "Embedding startup probe failed"),
+            Err(_) => warn!(
+                attempt,
+                timeout_secs = EMBEDDING_STARTUP_PROBE_TIMEOUT_SECS,
+                "Embedding startup probe timed out"
+            ),
+        }
+
+        if attempt < EMBEDDING_STARTUP_PROBE_ATTEMPTS {
+            sleep(Duration::from_secs(EMBEDDING_STARTUP_PROBE_RETRY_SECS)).await;
+        }
+    }
+
+    panic!(
+        "Embedding startup probe failed after {EMBEDDING_STARTUP_PROBE_ATTEMPTS} attempts; verify Ollama, OLLAMA_EMBED_MODEL, and QDRANT_VECTOR_SIZE"
     );
 }
 

@@ -13,6 +13,7 @@ use uuid::Uuid;
 use zip::{ZipWriter, write::SimpleFileOptions};
 
 use gmrag_api::auth::authz::{Object, Relation};
+use gmrag_api::ingestion::embedding::DEFAULT_EMBEDDING_DIM;
 use gmrag_api::retrieval::{ChunkPoint, RetrievalClient, RetrievalConfig};
 use gmrag_api::state::AppState;
 use gmrag_api::storage::build_original_document_object_key;
@@ -698,7 +699,7 @@ async fn delete_document_also_removes_qdrant_points() {
     let vector_size = std::env::var("QDRANT_VECTOR_SIZE")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(768);
+        .unwrap_or(DEFAULT_EMBEDDING_DIM);
     let embedding = vec![0.02_f32; vector_size];
 
     server
@@ -764,7 +765,7 @@ async fn delete_document_succeeds_when_qdrant_unavailable() {
     let broken_retrieval = RetrievalClient::from_config(RetrievalConfig {
         qdrant_url: "http://127.0.0.1:1".to_string(),
         collection_name: "gmrag_document_chunks".to_string(),
-        vector_size: 768,
+        vector_size: DEFAULT_EMBEDDING_DIM,
         top_k: 5,
         api_key: None,
         delete_request_timeout_secs: 5,
@@ -867,7 +868,7 @@ async fn delete_document_short_circuits_when_qdrant_hangs_and_enqueues_outbox() 
     let hanging_retrieval = RetrievalClient::from_config(RetrievalConfig {
         qdrant_url: format!("http://{hang_addr}"),
         collection_name: "gmrag_document_chunks".to_string(),
-        vector_size: 768,
+        vector_size: DEFAULT_EMBEDDING_DIM,
         top_k: 5,
         api_key: None,
         delete_request_timeout_secs: 1,
@@ -927,7 +928,7 @@ async fn delete_workspace_also_removes_qdrant_points() {
     let vector_size = std::env::var("QDRANT_VECTOR_SIZE")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(768);
+        .unwrap_or(DEFAULT_EMBEDDING_DIM);
     let embedding = vec![0.03_f32; vector_size];
 
     server
@@ -1027,7 +1028,7 @@ async fn delete_workspace_succeeds_when_qdrant_unavailable() {
     let broken_retrieval = RetrievalClient::from_config(RetrievalConfig {
         qdrant_url: "http://127.0.0.1:1".to_string(),
         collection_name: "gmrag_document_chunks".to_string(),
-        vector_size: 768,
+        vector_size: DEFAULT_EMBEDDING_DIM,
         top_k: 5,
         api_key: None,
         delete_request_timeout_secs: 5,

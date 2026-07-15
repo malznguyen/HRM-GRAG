@@ -884,6 +884,7 @@ mod reingestion_idempotency_tests {
     use super::{
         ChunkRow, bulk_upsert_document_chunks, clear_document_output, delete_stale_document_chunks,
     };
+    use crate::ingestion::embedding::DEFAULT_EMBEDDING_DIM;
     use crate::ingestion::graph::{GraphElement, GraphWriteBatch, bulk_upsert_graph};
     use sqlx::{PgPool, postgres::PgPoolOptions};
     use uuid::Uuid;
@@ -927,7 +928,7 @@ mod reingestion_idempotency_tests {
         let mut batch = GraphWriteBatch::from_extractions(&extractions);
         if batch.node_count() > 0 {
             batch
-                .attach_node_embeddings(vec![vec![0.01_f32; 768]])
+                .attach_node_embeddings(vec![vec![0.01_f32; DEFAULT_EMBEDDING_DIM]])
                 .unwrap();
         }
         batch
@@ -938,7 +939,7 @@ mod reingestion_idempotency_tests {
             .map(|index| ChunkRow {
                 index: index as i32,
                 text: format!("{suffix}-{index}"),
-                embedding: vec![0.02_f32; 768],
+                embedding: vec![0.02_f32; DEFAULT_EMBEDDING_DIM],
             })
             .collect()
     }

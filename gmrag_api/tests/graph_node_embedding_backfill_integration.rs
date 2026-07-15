@@ -15,7 +15,7 @@ use gmrag_api::audit::{AuditEventRecord, AuditEventType, insert_audit_event};
 use gmrag_api::ingestion::backfill_node_embeddings::{
     BackfillGraphNodeEmbeddingsOptions, backfill_graph_node_embeddings_with_embedder,
 };
-use gmrag_api::ingestion::embedding::EXPECTED_EMBEDDING_DIM;
+use gmrag_api::ingestion::embedding::DEFAULT_EMBEDDING_DIM;
 use gmrag_api::ingestion::graph::node_text_for_embedding;
 
 static TEST_ENV_INIT: OnceLock<()> = OnceLock::new();
@@ -166,7 +166,7 @@ async fn cleanup_workspace(pool: &sqlx::PgPool, seed: &SeededWorkspace) {
 }
 
 fn embedding_vec(seed: f32) -> Vec<f32> {
-    let mut vector = vec![0.0_f32; EXPECTED_EMBEDDING_DIM];
+    let mut vector = vec![0.0_f32; DEFAULT_EMBEDDING_DIM];
     vector[0] = seed;
     vector
 }
@@ -180,7 +180,7 @@ fn format_pgvector_literal(seed: f32) -> String {
     format!("[{values}]")
 }
 
-/// Mock embedder: deterministic 768-d vectors; fails if text contains "FAIL_EMBED".
+/// Mock embedder: deterministic 1024-d vectors; fails if text contains "FAIL_EMBED".
 fn success_embedder() -> impl FnMut(
     Vec<String>,
 ) -> std::pin::Pin<
@@ -312,7 +312,7 @@ async fn apply_backfills_null_nodes_and_skips_existing() {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(dims as usize, EXPECTED_EMBEDDING_DIM);
+        assert_eq!(dims as usize, DEFAULT_EMBEDDING_DIM);
     }
 
     // Node đã có embedding không bị ghi đè.

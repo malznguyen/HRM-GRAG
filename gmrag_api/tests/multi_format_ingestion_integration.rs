@@ -4,13 +4,14 @@ use std::io::{Cursor, Write};
 
 use axum::{Json, Router, http::StatusCode, routing::post};
 use gmrag_api::document_format::{DOCX_CONTENT_TYPE, MARKDOWN_CONTENT_TYPE, TEXT_CONTENT_TYPE};
-use gmrag_api::ingestion::embedding::EXPECTED_EMBEDDING_DIM;
+use gmrag_api::ingestion::embedding::DEFAULT_EMBEDDING_DIM;
 use gmrag_api::ingestion::jobs::{
     IngestionWorkerConfig, JobFailure, claim_document_job, enqueue_job_tx, finish_job_failure,
 };
 use gmrag_api::ingestion::processor::{ProcessError, process_claimed_job};
-use gmrag_api::retrieval::RetrievalClient;
+use gmrag_api::retrieval::{RetrievalClient, RetrievalConfig};
 use gmrag_api::storage::{StorageClient, StorageConfig, build_original_document_object_key};
+use reqwest::Client;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, postgres::PgPoolOptions};
@@ -34,11 +35,22 @@ async fn multi_format_ingestion_completes_and_uses_format_specific_terminal_fail
         .unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     let storage = StorageClient::from_config(StorageConfig::from_env().unwrap()).await;
-    let retrieval = RetrievalClient::from_env().unwrap();
-    retrieval
-        .search_chunk_ids(Uuid::nil(), &[Uuid::nil()], &mock_embedding(), 1)
+    let mut retrieval_config = RetrievalConfig::from_env().unwrap();
+    let collection_name = format!("gmrag_test_multi_format_{}", Uuid::new_v4().simple());
+    retrieval_config.collection_name = collection_name.clone();
+    retrieval_config.vector_size = DEFAULT_EMBEDDING_DIM;
+    let collection_url = format!(
+        "{}/collections/{collection_name}",
+        retrieval_config.qdrant_url
+    );
+    let initial_status = Client::new()
+        .get(&collection_url)
+        .send()
         .await
-        .unwrap();
+        .unwrap()
+        .status();
+    assert_eq!(initial_status, StatusCode::NOT_FOUND);
+    let retrieval = RetrievalClient::from_config(retrieval_config);
     let (tenant_id, workspace_id, user_id) = seed_workspace(&pool).await;
 
     let fixtures = [
@@ -156,7 +168,7 @@ async fn multi_format_ingestion_completes_and_uses_format_specific_terminal_fail
         .into_iter()
         .next()
         .expect("broken DOCX job must be claimable");
-    let error = process_claimed_job(pool.clone(), storage, retrieval, &job, &worker_id)
+    let error = process_claimed_job(pool.clone(), storage, retrieval.clone(), &job, &worker_id)
         .await
         .expect_err("broken DOCX must fail extraction");
     assert!(matches!(error, ProcessError::DocxParse(_)));
@@ -195,6 +207,14 @@ async fn multi_format_ingestion_completes_and_uses_format_specific_terminal_fail
             Some("DOCX_PARSE_FAILED".to_string())
         )
     );
+
+    let cleanup_status = Client::new()
+        .delete(collection_url)
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert!(cleanup_status.is_success() || cleanup_status == StatusCode::NOT_FOUND);
 }
 
 async fn seed_workspace(pool: &PgPool) -> (Uuid, Uuid, String) {
@@ -294,7 +314,7 @@ async fn mock_ollama_embed(Json(payload): Json<Value>) -> (StatusCode, Json<Valu
 }
 
 fn mock_embedding() -> Vec<f32> {
-    let mut embedding = vec![0.0; EXPECTED_EMBEDDING_DIM];
+    let mut embedding = vec![0.0; DEFAULT_EMBEDDING_DIM];
     embedding[0] = 1.0;
     embedding
 }

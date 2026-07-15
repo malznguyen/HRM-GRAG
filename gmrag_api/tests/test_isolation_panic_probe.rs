@@ -1,5 +1,6 @@
 mod support;
 
+use gmrag_api::ingestion::embedding::DEFAULT_EMBEDDING_DIM;
 use gmrag_api::{
     auth::authz::{AuthzClient, Object, Relation},
     retrieval::{ChunkPoint, RetrievalClient},
@@ -36,7 +37,7 @@ async fn forced_panic_after_writing_all_external_stores() {
     let workspace_id = Uuid::new_v4();
     let document_id = Uuid::new_v4();
     let chunk_id = Uuid::new_v4();
-    let embedding = vec![0.25_f32; 768];
+    let embedding = vec![0.25_f32; DEFAULT_EMBEDDING_DIM];
     let retrieval = RetrievalClient::from_env().expect("isolated Qdrant config");
     retrieval
         .upsert_chunk_points(&[ChunkPoint {

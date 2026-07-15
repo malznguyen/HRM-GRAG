@@ -181,7 +181,7 @@ async fn setup_state(pool: sqlx::PgPool, authz_client: AuthzClient) -> AppState 
     let retrieval = RetrievalClient::from_config(RetrievalConfig {
         qdrant_url: "http://127.0.0.1:6333".to_string(),
         collection_name: "gmrag_document_chunks".to_string(),
-        vector_size: gmrag_api::ingestion::embedding::EXPECTED_EMBEDDING_DIM,
+        vector_size: gmrag_api::ingestion::embedding::DEFAULT_EMBEDDING_DIM,
         top_k: 5,
         api_key: None,
         delete_request_timeout_secs: 5,

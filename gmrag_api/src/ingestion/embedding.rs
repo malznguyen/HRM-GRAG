@@ -11,9 +11,9 @@ const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434/api/embed";
 // qua `ollama_embed_model()` / `embed_texts()`. Không được hard-code model
 // khác ở call site — lệch model sẽ làm similarity search im lặng hỏng.
 //
-// Model khuyến nghị / mặc định: AITeamVN/Vietnamese_Embedding (768 dims),
-// phục vụ qua Ollama. Schema: `document_chunks.embedding vector(768)`,
-// Qdrant `QDRANT_VECTOR_SIZE` default 768.
+// Model khuyến nghị / mặc định: AITeamVN/Vietnamese_Embedding (1024 dims),
+// phục vụ qua Ollama. `QDRANT_VECTOR_SIZE` là nguồn cấu hình chiều vector dùng
+// chung cho guard embedding và Qdrant; mặc định 1024.
 //
 // Override: `OLLAMA_EMBED_MODEL` (tương thích ngược, ví dụ nomic-embed-text).
 // Dùng model khác ADR-21 sẽ làm giảm chất lượng retrieval tiếng Việt và
@@ -27,8 +27,8 @@ pub const PINNED_EMBED_MODEL: &str = "AITeamVN/Vietnamese_Embedding";
 /// Default khi không set `OLLAMA_EMBED_MODEL` — luôn trùng `PINNED_EMBED_MODEL`.
 const DEFAULT_EMBED_MODEL: &str = PINNED_EMBED_MODEL;
 
-/// Chiều vector bắt buộc (khớp schema pgvector + Qdrant default).
-pub const EXPECTED_EMBEDDING_DIM: usize = 768;
+/// Chiều vector mặc định của model ADR-21 khi không set `QDRANT_VECTOR_SIZE`.
+pub const DEFAULT_EMBEDDING_DIM: usize = 1024;
 
 /// Log cảnh báo dim mismatch một lần mỗi process (tránh spam log).
 static DIM_MISMATCH_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -51,6 +51,15 @@ pub fn ollama_embed_model() -> String {
     std::env::var("OLLAMA_EMBED_MODEL").unwrap_or_else(|_| DEFAULT_EMBED_MODEL.to_string())
 }
 
+/// Chiều vector runtime dùng chung cho embedding guard và Qdrant.
+pub fn configured_embedding_dimension() -> usize {
+    std::env::var("QDRANT_VECTOR_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_EMBEDDING_DIM)
+}
+
 /// Gọi lúc startup: log model đang dùng và cảnh báo nếu lệch ADR-21.
 ///
 /// Không fail process — vẫn cho phép override (môi trường legacy), nhưng
@@ -58,16 +67,12 @@ pub fn ollama_embed_model() -> String {
 pub fn log_embedding_config_on_startup() {
     let model = ollama_embed_model();
     let url = ollama_embed_url();
-    let qdrant_vector_size = std::env::var("QDRANT_VECTOR_SIZE")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(EXPECTED_EMBEDDING_DIM);
+    let expected_dims = configured_embedding_dimension();
 
     tracing::info!(
         embed_model = %model,
         embed_url = %url,
-        expected_dims = EXPECTED_EMBEDDING_DIM,
-        qdrant_vector_size,
+        expected_dims,
         pinned_model = PINNED_EMBED_MODEL,
         "Embedding config (ADR-21): shared model for ingestion + chat query"
     );
@@ -76,20 +81,11 @@ pub fn log_embedding_config_on_startup() {
         tracing::warn!(
             configured_model = %model,
             recommended_model = PINNED_EMBED_MODEL,
-            expected_dims = EXPECTED_EMBEDDING_DIM,
+            expected_dims,
             "OLLAMA_EMBED_MODEL is not the ADR-21 pinned model \
              (AITeamVN/Vietnamese_Embedding). Using a different model will \
              degrade Vietnamese retrieval quality and may be incompatible with \
-             already-indexed 768-d vectors — re-embed all chunks after any model change."
-        );
-    }
-
-    if qdrant_vector_size != EXPECTED_EMBEDDING_DIM {
-        tracing::warn!(
-            qdrant_vector_size,
-            expected_dims = EXPECTED_EMBEDDING_DIM,
-            "QDRANT_VECTOR_SIZE does not match the ADR-21 embedding dimension (768). \
-             Collection dim and embed output must stay aligned."
+             already-indexed vectors — re-embed all chunks after any model change."
         );
     }
 }
@@ -132,14 +128,14 @@ pub async fn embed_texts(client: &Client, texts: &[String]) -> Result<Vec<Vec<f3
         return Err(EmbedError::Empty);
     }
 
-    // Dimension guard: mọi vector phải đúng EXPECTED_EMBEDDING_DIM (768).
+    // Guard dùng đúng cấu hình QDRANT_VECTOR_SIZE để Postgres/Qdrant không lệch nhau.
     // Sai dim → lỗi cứng (không ghi vector lệch vào DB/Qdrant).
     validate_embedding_dimensions(&payload.embeddings, &model)?;
 
     Ok(payload.embeddings)
 }
 
-/// Kiểm tra mọi embedding có đúng `EXPECTED_EMBEDDING_DIM` (768).
+/// Kiểm tra mọi embedding có đúng `QDRANT_VECTOR_SIZE` (mặc định 1024).
 ///
 /// Trong môi trường non-test: log error rõ ràng (một lần) rồi trả `DimensionMismatch`.
 /// Trong test: chỉ trả error (không panic) để mock/assert ổn định.
@@ -147,19 +143,19 @@ pub fn validate_embedding_dimensions(
     embeddings: &[Vec<f32>],
     model: &str,
 ) -> Result<(), EmbedError> {
+    let expected = configured_embedding_dimension();
     for embedding in embeddings {
         let actual = embedding.len();
-        if actual != EXPECTED_EMBEDDING_DIM {
+        if actual != expected {
             if !cfg!(test) && !DIM_MISMATCH_LOGGED.swap(true, Ordering::Relaxed) {
                 tracing::error!(
                     model = %model,
-                    expected_dims = EXPECTED_EMBEDDING_DIM,
+                    expected_dims = expected,
                     actual_dims = actual,
                     pinned_model = PINNED_EMBED_MODEL,
                     "Embedding dimension mismatch — refusing to use this vector. \
-                     ADR-21 requires AITeamVN/Vietnamese_Embedding (768-d). \
-                     Check OLLAMA_EMBED_MODEL and that the Ollama model is pulled: \
-                     `ollama pull AITeamVN/Vietnamese_Embedding`. \
+                     ADR-21 requires AITeamVN/Vietnamese_Embedding at its native dimension. \
+                     Check OLLAMA_EMBED_MODEL, QDRANT_VECTOR_SIZE, and the imported Ollama model. \
                      Do not mix models without a full re-embedding backfill."
                 );
             }
@@ -167,7 +163,7 @@ pub fn validate_embedding_dimensions(
             // Production-safety: hard fail (không panic process — request/ingestion fail rõ ràng).
             // Panic sẽ kéo sập worker; Result + error log đủ an toàn và dễ quan sát.
             return Err(EmbedError::DimensionMismatch {
-                expected: EXPECTED_EMBEDDING_DIM,
+                expected,
                 actual,
                 model: model.to_string(),
             });
@@ -212,7 +208,7 @@ pub enum EmbedError {
         expected: usize,
         actual: usize,
     },
-    /// Vector length ≠ `EXPECTED_EMBEDDING_DIM` (768) — schema/Qdrant không tương thích.
+    /// Vector length khác `QDRANT_VECTOR_SIZE` — schema/Qdrant không tương thích.
     DimensionMismatch {
         expected: usize,
         actual: usize,
@@ -237,7 +233,7 @@ impl std::fmt::Display for EmbedError {
                 f,
                 "embedding dimension mismatch for model `{model}`: got {actual}, expected {expected} \
                  (ADR-21 pinned model is `{PINNED_EMBED_MODEL}`; \
-                 pull with `ollama pull {PINNED_EMBED_MODEL}`)"
+                 verify QDRANT_VECTOR_SIZE and the imported Ollama model)"
             ),
         }
     }
@@ -270,8 +266,8 @@ mod tests {
             "default model must equal the ADR-21 pin"
         );
         assert_eq!(
-            EXPECTED_EMBEDDING_DIM, 768,
-            "schema/Qdrant expect 768-d vectors for the pinned model"
+            DEFAULT_EMBEDDING_DIM, 1024,
+            "schema/Qdrant default to native 1024-d vectors for the pinned model"
         );
         // Guard against the pre-fix default that caused the silent mismatch.
         assert_ne!(
@@ -280,13 +276,12 @@ mod tests {
         );
     }
 
-    /// Restore `OLLAMA_EMBED_MODEL` after a test mutation.
-    /// Caller must hold `env_lock()` for the whole mutate/assert/restore window.
-    fn restore_embed_model_env(previous: Option<String>) {
-        // SAFETY: serialized by env_lock in callers; no concurrent env readers in these tests.
+    /// Khôi phục biến môi trường sau test; caller phải giữ `env_lock()`.
+    fn restore_env(name: &str, previous: Option<String>) {
+        // SAFETY: env_lock tuần tự hóa các test này và không còn reader song song.
         match previous {
-            Some(value) => unsafe { std::env::set_var("OLLAMA_EMBED_MODEL", value) },
-            None => unsafe { std::env::remove_var("OLLAMA_EMBED_MODEL") },
+            Some(value) => unsafe { std::env::set_var(name, value) },
+            None => unsafe { std::env::remove_var(name) },
         }
     }
 
@@ -294,35 +289,42 @@ mod tests {
     fn ollama_embed_model_defaults_to_pinned_when_env_unset() {
         let _guard = env_lock();
         let previous = std::env::var("OLLAMA_EMBED_MODEL").ok();
-        // SAFETY: held under env_lock; restored before unlock.
+        // SAFETY: đang giữ env_lock và sẽ khôi phục trước khi nhả khóa.
         unsafe { std::env::remove_var("OLLAMA_EMBED_MODEL") };
 
         assert_eq!(ollama_embed_model(), PINNED_EMBED_MODEL);
         assert_eq!(ollama_embed_model(), "AITeamVN/Vietnamese_Embedding");
 
-        restore_embed_model_env(previous);
+        restore_env("OLLAMA_EMBED_MODEL", previous);
     }
 
     #[test]
     fn ollama_embed_model_respects_env_override() {
         let _guard = env_lock();
         let previous = std::env::var("OLLAMA_EMBED_MODEL").ok();
-        // SAFETY: held under env_lock; restored before unlock.
+        // SAFETY: đang giữ env_lock và sẽ khôi phục trước khi nhả khóa.
         unsafe { std::env::set_var("OLLAMA_EMBED_MODEL", "nomic-embed-text") };
 
         assert_eq!(ollama_embed_model(), "nomic-embed-text");
 
-        restore_embed_model_env(previous);
+        restore_env("OLLAMA_EMBED_MODEL", previous);
     }
 
     #[test]
-    fn validate_dimensions_accepts_exactly_768() {
-        let vecs = vec![vec![0.0_f32; EXPECTED_EMBEDDING_DIM], vec![1.0_f32; 768]];
+    fn validate_dimensions_accepts_configured_size() {
+        let _guard = env_lock();
+        let previous = std::env::var("QDRANT_VECTOR_SIZE").ok();
+        unsafe { std::env::remove_var("QDRANT_VECTOR_SIZE") };
+        let vecs = vec![vec![0.0_f32; DEFAULT_EMBEDDING_DIM], vec![1.0_f32; 1024]];
         assert!(validate_embedding_dimensions(&vecs, PINNED_EMBED_MODEL).is_ok());
+        restore_env("QDRANT_VECTOR_SIZE", previous);
     }
 
     #[test]
     fn validate_dimensions_rejects_wrong_size() {
+        let _guard = env_lock();
+        let previous = std::env::var("QDRANT_VECTOR_SIZE").ok();
+        unsafe { std::env::remove_var("QDRANT_VECTOR_SIZE") };
         let vecs = vec![vec![0.0_f32; 384]];
         let err = validate_embedding_dimensions(&vecs, "some-model").unwrap_err();
         match err {
@@ -331,25 +333,26 @@ mod tests {
                 actual,
                 model,
             } => {
-                assert_eq!(expected, EXPECTED_EMBEDDING_DIM);
-                assert_eq!(expected, 768);
+                assert_eq!(expected, DEFAULT_EMBEDDING_DIM);
+                assert_eq!(expected, 1024);
                 assert_eq!(actual, 384);
                 assert_eq!(model, "some-model");
             }
             other => panic!("unexpected error: {other}"),
         }
+        restore_env("QDRANT_VECTOR_SIZE", previous);
     }
 
     #[test]
     fn dimension_mismatch_display_mentions_pinned_model_and_dim() {
         let err = EmbedError::DimensionMismatch {
-            expected: EXPECTED_EMBEDDING_DIM,
+            expected: DEFAULT_EMBEDDING_DIM,
             actual: 512,
             model: "wrong-model".to_string(),
         };
         let msg = err.to_string();
         assert!(msg.contains("512"), "actual dim in message: {msg}");
-        assert!(msg.contains("768"), "expected dim in message: {msg}");
+        assert!(msg.contains("1024"), "expected dim in message: {msg}");
         assert!(
             msg.contains(PINNED_EMBED_MODEL),
             "pinned model guidance in message: {msg}"

@@ -382,7 +382,12 @@ function New-TestQdrantContainer {
             try { Invoke-RestMethod -Method Get -Uri "$url/collections" -TimeoutSec 2 | Out-Null; $ready = $true; break } catch { Start-Sleep -Milliseconds 500 }
         }
         if (-not $ready) { throw "Isolated Qdrant did not become ready." }
-        $collectionBody = @{ vectors = @{ size = 768; distance = "Cosine" }; on_disk_payload = $true } | ConvertTo-Json -Depth 5 -Compress
+        [int]$vectorSize = 1024
+        if ($env:QDRANT_VECTOR_SIZE -and -not [int]::TryParse($env:QDRANT_VECTOR_SIZE, [ref]$vectorSize)) {
+            throw "QDRANT_VECTOR_SIZE must be a positive integer."
+        }
+        if ($vectorSize -le 0) { throw "QDRANT_VECTOR_SIZE must be a positive integer." }
+        $collectionBody = @{ vectors = @{ size = $vectorSize; distance = "Cosine" }; on_disk_payload = $true } | ConvertTo-Json -Depth 5 -Compress
         Invoke-RestMethod -Method Put -Uri "$url/collections/$CollectionName" -ContentType "application/json" -Body $collectionBody | Out-Null
         foreach ($field in @("workspace_id", "document_id")) {
             $indexBody = @{ field_name = $field; field_schema = "keyword" } | ConvertTo-Json -Compress

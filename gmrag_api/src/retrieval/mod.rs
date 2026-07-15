@@ -58,12 +58,7 @@ impl RetrievalConfig {
             return Err(RetrievalConfigError::MissingCollectionName);
         }
 
-        // Default matches ADR-21 / `document_chunks.embedding vector(768)`.
-        let vector_size = std::env::var("QDRANT_VECTOR_SIZE")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(crate::ingestion::embedding::EXPECTED_EMBEDDING_DIM)
-            .max(1);
+        let vector_size = crate::ingestion::embedding::configured_embedding_dimension();
 
         let top_k = std::env::var("QDRANT_TOP_K")
             .ok()
@@ -512,6 +507,9 @@ impl RetrievalClient {
         let send_future = async {
             let request = self.http.post(&url).json(&payload);
             let response = self.with_auth_header(request).send().await?;
+            if response.status() == StatusCode::NOT_FOUND {
+                return Ok(());
+            }
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
@@ -976,7 +974,7 @@ mod tests {
         RetrievalConfig {
             qdrant_url: qdrant_url.trim_end_matches('/').to_string(),
             collection_name: "gmrag_document_chunks_test".to_string(),
-            vector_size: crate::ingestion::embedding::EXPECTED_EMBEDDING_DIM,
+            vector_size: crate::ingestion::embedding::DEFAULT_EMBEDDING_DIM,
             top_k: 5,
             api_key: None,
             delete_request_timeout_secs: DEFAULT_DELETE_REQUEST_TIMEOUT_SECS,
@@ -989,7 +987,7 @@ mod tests {
         RetrievalConfig {
             qdrant_url: environment.qdrant_url.clone(),
             collection_name: environment.qdrant_collection.clone(),
-            vector_size: crate::ingestion::embedding::EXPECTED_EMBEDDING_DIM,
+            vector_size: crate::ingestion::embedding::DEFAULT_EMBEDDING_DIM,
             top_k: 5,
             api_key: None,
             delete_request_timeout_secs: DEFAULT_DELETE_REQUEST_TIMEOUT_SECS,
@@ -1075,7 +1073,7 @@ mod tests {
         let client = RetrievalClient::from_config(RetrievalConfig {
             qdrant_url: base,
             collection_name: "gmrag_document_chunks_test".to_string(),
-            vector_size: crate::ingestion::embedding::EXPECTED_EMBEDDING_DIM,
+            vector_size: crate::ingestion::embedding::DEFAULT_EMBEDDING_DIM,
             top_k: 5,
             api_key: None,
             delete_request_timeout_secs: 1,
@@ -1110,7 +1108,7 @@ mod tests {
         let client = RetrievalClient::from_config(RetrievalConfig {
             qdrant_url: base,
             collection_name: "gmrag_document_chunks_test".to_string(),
-            vector_size: crate::ingestion::embedding::EXPECTED_EMBEDDING_DIM,
+            vector_size: crate::ingestion::embedding::DEFAULT_EMBEDDING_DIM,
             top_k: 5,
             api_key: None,
             delete_request_timeout_secs: 1,
@@ -1146,7 +1144,7 @@ mod tests {
         let workspace_id = Uuid::new_v4();
         let document_id = Uuid::new_v4();
         let chunk_id = Uuid::new_v4();
-        let dim = crate::ingestion::embedding::EXPECTED_EMBEDDING_DIM;
+        let dim = crate::ingestion::embedding::DEFAULT_EMBEDDING_DIM;
         let embedding = vec![0.01_f32; dim];
 
         client
@@ -1191,7 +1189,7 @@ mod tests {
         let document_a = Uuid::new_v4();
         let document_b = Uuid::new_v4();
         let other_document = Uuid::new_v4();
-        let dim = crate::ingestion::embedding::EXPECTED_EMBEDDING_DIM;
+        let dim = crate::ingestion::embedding::DEFAULT_EMBEDDING_DIM;
         let embedding = vec![0.02_f32; dim];
 
         client
@@ -1265,7 +1263,7 @@ mod tests {
         let document_a = Uuid::new_v4();
         let document_b = Uuid::new_v4();
         let outside_document = Uuid::new_v4();
-        let dim = crate::ingestion::embedding::EXPECTED_EMBEDDING_DIM;
+        let dim = crate::ingestion::embedding::DEFAULT_EMBEDDING_DIM;
         let embedding = vec![0.04_f32; dim];
 
         client
