@@ -289,7 +289,7 @@ Evidence: `gmrag_api/src/tenant_cleanup.rs:373-428,649-706` and
 - Security notes: OpenFGA failure stops before SQL. If SQL fails after successful
   revoke, access remains denied (fail closed) and operator recovery may be
   required. S3/Qdrant failures after commit do not change the `204`; outbox rows
-  provide durable recovery. Evidence: `gmrag_api/src/routes/workspaces.rs:493-548`.
+  provide durable recovery. Evidence: `gmrag_api/src/routes/workspaces.rs:514-588`.
 
 ## Workspace Members
 
@@ -408,7 +408,7 @@ Evidence: `gmrag_api/src/tenant_cleanup.rs:373-428,649-706` and
   HTTP remains `204` if either external cleanup fails.
 - Security notes: FGA revoke failure leaves SQL untouched. Cleanup recovery rows
   commit atomically with SQL deletion; object keys remain internal. Evidence:
-  `gmrag_api/src/routes/documents.rs:725-765,825-848`.
+  `gmrag_api/src/routes/documents.rs:819-968`.
 
 ### `POST /workspaces/{workspace_id}/documents/{document_id}/retry`
 
