@@ -26,6 +26,20 @@ pub struct WorkspaceMemberResponse {
     pub joined_at: NaiveDateTime,
 }
 
+/// Quyền hiệu lực của caller trên workspace, được tính trực tiếp từ OpenFGA.
+#[derive(Serialize)]
+pub struct WorkspaceMemberCallerCapabilities {
+    pub can_manage_member: bool,
+    pub can_assign_role: bool,
+}
+
+/// Danh sách thành viên kèm quyền quản lý hiệu lực của caller.
+#[derive(Serialize)]
+pub struct WorkspaceMembersResponse {
+    pub members: Vec<WorkspaceMemberResponse>,
+    pub caller: WorkspaceMemberCallerCapabilities,
+}
+
 #[derive(Deserialize)]
 pub struct AddWorkspaceMemberRequest {
     pub email: String,
@@ -44,15 +58,42 @@ pub async fn list_workspace_members(
     authz: Authz,
     Path(workspace_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    if let Err(err) = authz
-        .require_relation(Relation::Member, &Object::Workspace(workspace_id))
-        .await
-    {
+    let workspace = Object::Workspace(workspace_id);
+    if let Err(err) = authz.require_relation(Relation::Member, &workspace).await {
         return err.into_response();
     }
 
+    let capabilities = tokio::try_join!(
+        authz.check(Relation::CanManageMember, &workspace),
+        authz.check(Relation::CanAssignRole, &workspace),
+    );
+    let (can_manage_member, can_assign_role) = match capabilities {
+        Ok(capabilities) => capabilities,
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                "Failed to resolve workspace member capabilities"
+            );
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "AUTHZ_ERROR",
+                "Authorization service unavailable",
+            )
+            .into_response();
+        }
+    };
+
     match fetch_workspace_members(&state.pool, workspace_id).await {
-        Ok(members) => Json(members).into_response(),
+        Ok(members) => Json(WorkspaceMembersResponse {
+            members,
+            caller: WorkspaceMemberCallerCapabilities {
+                can_manage_member,
+                can_assign_role,
+            },
+        })
+        .into_response(),
         Err(err) => {
             error!(
                 error = %err,

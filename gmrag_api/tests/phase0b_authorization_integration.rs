@@ -291,6 +291,38 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn get_members_returns_openfga_caller_capabilities() {
+    let _guard = phase0b_lock().await.lock().await;
+    init_test_env();
+    let fx = Fixture::bootstrap(AuthzClient::from_env().unwrap()).await;
+    let client = Client::new();
+
+    for (caller_id, can_manage_member, can_assign_role) in [
+        (&fx.owner_id, true, true),
+        (&fx.ws_admin_id, true, false),
+        (&fx.member_id, false, false),
+    ] {
+        let response = client
+            .get(format!(
+                "{}/workspaces/{}/members",
+                fx.addr, fx.workspace_id
+            ))
+            .bearer_auth(caller_id)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert!(body["members"].is_array());
+        assert_eq!(body["caller"]["can_manage_member"], can_manage_member);
+        assert_eq!(body["caller"]["can_assign_role"], can_assign_role);
+    }
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
 async fn acl001_ws_admin_add_member_ok_admin_denied_no_side_effect() {
     let _guard = phase0b_lock().await.lock().await;
     init_test_env();

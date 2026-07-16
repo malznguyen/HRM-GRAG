@@ -298,10 +298,17 @@ Evidence: `gmrag_api/src/tenant_cleanup.rs:373-428,649-706` and
 - Auth: bearer JWT.
 - Authorization: `member` on `workspace:{workspace_id}`.
 - Request body: none.
-- Success: `200` with an array of member rows containing user id, email, role, and join time.
-- Errors: authz `403` or `500 INTERNAL_ERROR`, both JSON envelopes.
+- Success: `200` with `{ members, caller }`. `members` is the existing array of
+  `{ id, email, role, joined_at }` rows where `role` is the SQL wire value
+  `ADMIN` or `MEMBER`. `caller` is
+  `{ can_manage_member, can_assign_role }`, with both booleans computed from the
+  corresponding OpenFGA relations on `workspace:{workspace_id}`.
+- Errors: authz `403`; `500 AUTHZ_ERROR` when either caller-capability check
+  fails; or `500 INTERNAL_ERROR` on SQL failure, all JSON envelopes.
 - Side effects: none.
-- Security notes: role values are SQL read-model data; authorization still comes from OpenFGA.
+- Security notes: role values are SQL read-model data (`ADMIN`/`MEMBER`). Caller
+  capabilities and authorization come from OpenFGA; the response does not expose
+  `tenant_id` or other authorization internals.
 
 ### `POST /workspaces/{workspace_id}/members`
 
@@ -309,12 +316,12 @@ Evidence: `gmrag_api/src/tenant_cleanup.rs:373-428,649-706` and
 - Authorization:
   1. Always require `can_manage_member` on `workspace:{workspace_id}` (Tenant Owner or Workspace Admin).
   2. If `role` is `admin`, also require `can_assign_role` (Tenant Owner only). Workspace Admin cannot create admins.
-- Request body: JSON `{ "email": "user@example.com", "role": "member|admin" }` only. Aliases `user` / `owner` are **rejected**.
-- Success: `201` with the inserted member row (`id` is the Keycloak `sub`). SQL role is `MEMBER` or `ADMIN`.
+- Request body: JSON `{ "email": "user@example.com", "role": "member|admin" }` only. Aliases `user` / `owner` are **rejected**. Role parsing is case-insensitive (`ADMIN` / ` Member ` accepted); stored and returned wire role remains SQL `ADMIN` or `MEMBER`.
+- Success: `201` with the inserted member row (`id` is the Keycloak `sub`). Response `role` wire value is `MEMBER` or `ADMIN`.
 - Errors:
   | Status | Body | When |
   | --- | --- | --- |
-  | `400` | JSON `INVALID_MEMBER_ROLE` | Role not exactly `member` or `admin` |
+  | `400` | JSON `INVALID_MEMBER_ROLE` | Role is not `member` or `admin` after case-insensitive trim (aliases `user`/`owner` rejected) |
   | `400` | JSON `INVALID_EMAIL` | Invalid email |
   | `403` | JSON `MEMBER_MANAGEMENT_DENIED` | Caller lacks `can_manage_member` |
   | `403` | JSON `ROLE_ASSIGNMENT_DENIED` / message *Only tenant owners can assign workspace admin roles* | Workspace Admin (or other non-owner) requested `role=admin` |
