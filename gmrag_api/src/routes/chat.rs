@@ -1,9 +1,10 @@
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::time::Duration;
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, rejection::JsonRejection},
     http::StatusCode,
     response::{
         IntoResponse,
@@ -15,16 +16,20 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::api_error::ApiError;
 use crate::auth::authz::{Authz, Object, Relation};
 use crate::chat::deepseek::{DeepseekTokenParser, deepseek_stream_idle_timeout, next_stream_token};
 use crate::chat::retrieval::{StoredChatMessage, fetch_session_chat_messages};
 use crate::chat::{
     ChatPipelineError, SessionError, build_chat_context, delete_chat_session, ensure_chat_session,
-    filter_citations_for_user, insert_chat_message, list_user_chat_sessions,
-    prepare_deepseek_stream, resolve_chunk_index_citations, truncate_session_title,
-    verify_chat_session_owner,
+    filter_citation_ids_for_user, filter_citations_for_user, insert_chat_message,
+    list_user_chat_sessions, prepare_deepseek_stream, resolve_chunk_index_citations,
+    truncate_session_title, verify_chat_session_owner,
 };
 use crate::state::AppState;
+
+const MAX_CITATION_IDS: usize = 64;
+const CITATION_SNIPPET_CHARS: usize = 280;
 
 #[derive(Deserialize)]
 pub struct ChatHistoryQuery {
@@ -50,6 +55,213 @@ pub struct ChatHistoryMessageResponse {
 pub struct ChatRequest {
     pub session_id: Uuid,
     pub message: String,
+}
+
+/// Danh sách chunk cần phân giải thành thông tin nguồn hiển thị.
+#[derive(Deserialize)]
+pub struct ResolveCitationsRequest {
+    pub chunk_ids: Vec<Uuid>,
+}
+
+/// Kết quả phân giải chỉ gồm các citation caller được phép xem.
+#[derive(Serialize)]
+pub struct ResolveCitationsResponse {
+    pub citations: Vec<ResolvedCitation>,
+}
+
+/// Thông tin nguồn đã được kiểm tra ACL cho một chunk.
+#[derive(Serialize)]
+pub struct ResolvedCitation {
+    pub chunk_id: Uuid,
+    pub document_id: Uuid,
+    pub document_name: String,
+    pub snippet: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct CitationHydrationRow {
+    chunk_id: Uuid,
+    document_id: Uuid,
+    document_name: String,
+    original_text: String,
+}
+
+/// Phân giải citation theo lô và loại bỏ im lặng các chunk không thể xem.
+pub async fn resolve_workspace_citations(
+    State(state): State<AppState>,
+    authz: Authz,
+    Path(workspace_id): Path<Uuid>,
+    payload: Result<Json<ResolveCitationsRequest>, JsonRejection>,
+) -> Result<Json<ResolveCitationsResponse>, ApiError> {
+    if let Err(err) = authz
+        .require_relation(Relation::Member, &Object::Workspace(workspace_id))
+        .await
+    {
+        if err.status.is_server_error() {
+            return Err(ApiError::from_status(StatusCode::INTERNAL_SERVER_ERROR));
+        }
+        return Err(err);
+    }
+
+    let chunk_ids = parse_citation_ids(payload)?;
+    if chunk_ids.is_empty() {
+        return Ok(Json(ResolveCitationsResponse {
+            citations: Vec::new(),
+        }));
+    }
+
+    let allowed_ids =
+        authorize_citation_ids(&state, workspace_id, &authz.user_id, &chunk_ids).await?;
+    if allowed_ids.is_empty() {
+        return Ok(Json(ResolveCitationsResponse {
+            citations: Vec::new(),
+        }));
+    }
+
+    let citations = hydrate_citations(&state, workspace_id, &authz.user_id, allowed_ids).await?;
+    Ok(Json(ResolveCitationsResponse { citations }))
+}
+
+fn parse_citation_ids(
+    payload: Result<Json<ResolveCitationsRequest>, JsonRejection>,
+) -> Result<Vec<Uuid>, ApiError> {
+    let Json(request) = payload.map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "Malformed citation resolve request",
+        )
+    })?;
+
+    if request.chunk_ids.len() > MAX_CITATION_IDS {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            format!("chunk_ids must contain at most {MAX_CITATION_IDS} items"),
+        ));
+    }
+
+    let mut seen = HashSet::with_capacity(request.chunk_ids.len());
+    Ok(request
+        .chunk_ids
+        .into_iter()
+        .filter(|chunk_id| seen.insert(*chunk_id))
+        .collect())
+}
+
+async fn authorize_citation_ids(
+    state: &AppState,
+    workspace_id: Uuid,
+    user_id: &str,
+    chunk_ids: &[Uuid],
+) -> Result<Vec<Uuid>, ApiError> {
+    match filter_citation_ids_for_user(
+        &state.pool,
+        &state.authz_client,
+        workspace_id,
+        user_id,
+        chunk_ids,
+    )
+    .await
+    {
+        Ok(ids) => Ok(ids),
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                user_id = %user_id,
+                workspace_id = %workspace_id,
+                "Failed to authorize citation resolution"
+            );
+            Err(ApiError::from_status(StatusCode::INTERNAL_SERVER_ERROR))
+        }
+    }
+}
+
+async fn hydrate_citations(
+    state: &AppState,
+    workspace_id: Uuid,
+    user_id: &str,
+    allowed_ids: Vec<Uuid>,
+) -> Result<Vec<ResolvedCitation>, ApiError> {
+    let rows: Vec<CitationHydrationRow> = sqlx::query_as(
+        r#"
+        SELECT
+            dc.id AS chunk_id,
+            dc.document_id,
+            d.filename AS document_name,
+            dc.original_text
+        FROM document_chunks dc
+        INNER JOIN documents d
+            ON d.id = dc.document_id
+           AND d.workspace_id = dc.workspace_id
+        WHERE dc.workspace_id = $1
+          AND dc.id = ANY($2)
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(&allowed_ids)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|err| {
+        tracing::error!(
+            error = %err,
+            user_id = %user_id,
+            workspace_id = %workspace_id,
+            "Failed to hydrate citations"
+        );
+        ApiError::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+    })?;
+
+    let mut row_by_chunk = rows
+        .into_iter()
+        .map(|row| (row.chunk_id, row))
+        .collect::<HashMap<_, _>>();
+    Ok(allowed_ids
+        .into_iter()
+        .filter_map(|chunk_id| row_by_chunk.remove(&chunk_id))
+        .map(|row| ResolvedCitation {
+            chunk_id: row.chunk_id,
+            document_id: row.document_id,
+            document_name: row.document_name,
+            snippet: truncate_citation_snippet(&row.original_text),
+        })
+        .collect())
+}
+
+fn truncate_citation_snippet(text: &str) -> String {
+    let mut prefix = text
+        .chars()
+        .take(CITATION_SNIPPET_CHARS + 1)
+        .collect::<Vec<_>>();
+    if prefix.len() <= CITATION_SNIPPET_CHARS {
+        return prefix.into_iter().collect();
+    }
+
+    prefix.truncate(CITATION_SNIPPET_CHARS);
+    while prefix
+        .last()
+        .is_some_and(|character| character.is_whitespace())
+    {
+        prefix.pop();
+    }
+
+    if let Some(boundary) = prefix
+        .iter()
+        .rposition(|character| character.is_whitespace())
+        .filter(|boundary| *boundary >= CITATION_SNIPPET_CHARS / 2)
+    {
+        prefix.truncate(boundary);
+        while prefix
+            .last()
+            .is_some_and(|character| character.is_whitespace())
+        {
+            prefix.pop();
+        }
+    }
+
+    let mut snippet = prefix.into_iter().collect::<String>();
+    snippet.push('…');
+    snippet
 }
 
 pub async fn list_workspace_chat_sessions(

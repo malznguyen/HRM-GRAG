@@ -151,6 +151,7 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
 
     let tenant_id = Uuid::new_v4();
     let workspace_id = Uuid::new_v4();
+    let other_workspace_id = Uuid::new_v4();
     let platform_admin = format!("phase2-platform-admin-{}", Uuid::new_v4());
     let tenant_owner = format!("phase2-tenant-owner-{}", Uuid::new_v4());
     let member_user = format!("phase2-member-{}", Uuid::new_v4());
@@ -167,6 +168,14 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         .bind(workspace_id)
         .bind(tenant_id)
         .bind(format!("Test Workspace {workspace_id}"))
+        .execute(&server.pool)
+        .await
+        .unwrap();
+
+    sqlx::query("INSERT INTO workspaces (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(other_workspace_id)
+        .bind(tenant_id)
+        .bind(format!("Other Test Workspace {other_workspace_id}"))
         .execute(&server.pool)
         .await
         .unwrap();
@@ -227,6 +236,7 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         (second_provenance_doc_id, first_provenance_doc_id)
     };
     let legacy_public_doc_id = Uuid::new_v4();
+    let other_workspace_doc_id = Uuid::new_v4();
 
     insert_document(
         &server.pool,
@@ -255,10 +265,23 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         "restricted",
     )
     .await;
+    insert_document(
+        &server.pool,
+        other_workspace_id,
+        other_workspace_doc_id,
+        &member_user,
+        "other-workspace-doc.pdf",
+        "workspace_default",
+    )
+    .await;
 
     let public_chunk_id = Uuid::new_v4();
+    let public_long_chunk_id = Uuid::new_v4();
     let legacy_public_chunk_id = Uuid::new_v4();
     let restricted_chunk_id = Uuid::new_v4();
+    let other_workspace_chunk_id = Uuid::new_v4();
+    let long_vietnamese_text =
+        "Nội dung tiếng Việt có dấu dùng để kiểm tra cắt chuỗi an toàn theo từng ký tự. ".repeat(6);
 
     insert_chunk(
         &server.pool,
@@ -272,12 +295,32 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
     .await;
     insert_chunk(
         &server.pool,
+        public_long_chunk_id,
+        public_doc_id,
+        workspace_id,
+        1,
+        &long_vietnamese_text,
+        0.03,
+    )
+    .await;
+    insert_chunk(
+        &server.pool,
         legacy_public_chunk_id,
         legacy_public_doc_id,
         workspace_id,
         0,
         "legacy public content",
         0.02,
+    )
+    .await;
+    insert_chunk(
+        &server.pool,
+        other_workspace_chunk_id,
+        other_workspace_doc_id,
+        other_workspace_id,
+        0,
+        "other workspace content",
+        0.04,
     )
     .await;
     insert_chunk(
@@ -509,6 +552,170 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         .await
         .unwrap();
     assert_eq!(owner_chunk.status(), reqwest::StatusCode::OK);
+
+    let member_public_chunk = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/chunks/{public_chunk_id}",
+            server.addr
+        ))
+        .bearer_auth(&member_user)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(member_public_chunk.status(), reqwest::StatusCode::OK);
+
+    let member_resolve = client
+        .post(format!(
+            "{}/workspaces/{workspace_id}/citations/resolve",
+            server.addr
+        ))
+        .bearer_auth(&member_user)
+        .json(&json!({
+            "chunk_ids": [
+                public_long_chunk_id,
+                public_chunk_id,
+                public_long_chunk_id,
+                restricted_chunk_id,
+                other_workspace_chunk_id,
+                unknown_chunk_id
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(member_resolve.status(), reqwest::StatusCode::OK);
+    let member_resolve_json: Value = member_resolve.json().await.unwrap();
+    let member_citations = member_resolve_json["citations"].as_array().unwrap();
+    assert_eq!(member_citations.len(), 2);
+    assert_eq!(
+        member_citations[0]["chunk_id"],
+        public_long_chunk_id.to_string()
+    );
+    assert_eq!(
+        member_citations[0]["document_id"],
+        public_doc_id.to_string()
+    );
+    assert_eq!(member_citations[0]["document_name"], "public-doc.pdf");
+    let long_snippet = member_citations[0]["snippet"].as_str().unwrap();
+    let long_snippet_prefix = long_snippet.strip_suffix('…').unwrap();
+    assert!(long_snippet.chars().count() <= 281);
+    assert!(long_vietnamese_text.starts_with(long_snippet_prefix));
+    assert!(
+        !long_snippet_prefix
+            .chars()
+            .last()
+            .is_some_and(char::is_whitespace)
+    );
+    assert_eq!(member_citations[1]["chunk_id"], public_chunk_id.to_string());
+    assert_eq!(
+        member_citations[1]["document_id"],
+        public_doc_id.to_string()
+    );
+    assert_eq!(member_citations[1]["document_name"], "public-doc.pdf");
+    assert_eq!(member_citations[1]["snippet"], "public alpha content");
+
+    let all_omitted = client
+        .post(format!(
+            "{}/workspaces/{workspace_id}/citations/resolve",
+            server.addr
+        ))
+        .bearer_auth(&member_user)
+        .json(&json!({
+            "chunk_ids": [restricted_chunk_id, other_workspace_chunk_id, unknown_chunk_id]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(all_omitted.status(), reqwest::StatusCode::OK);
+    let all_omitted_json: Value = all_omitted.json().await.unwrap();
+    assert_eq!(all_omitted_json, json!({ "citations": [] }));
+
+    let viewer_resolve = client
+        .post(format!(
+            "{}/workspaces/{workspace_id}/citations/resolve",
+            server.addr
+        ))
+        .bearer_auth(&explicit_viewer)
+        .json(&json!({ "chunk_ids": [restricted_chunk_id] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(viewer_resolve.status(), reqwest::StatusCode::OK);
+    let viewer_resolve_json: Value = viewer_resolve.json().await.unwrap();
+    assert_eq!(
+        viewer_resolve_json["citations"][0]["chunk_id"],
+        restricted_chunk_id.to_string()
+    );
+    assert_eq!(
+        viewer_resolve_json["citations"][0]["document_id"],
+        restricted_doc_id.to_string()
+    );
+    assert_eq!(
+        viewer_resolve_json["citations"][0]["document_name"],
+        "restricted-doc.pdf"
+    );
+    assert_eq!(
+        viewer_resolve_json["citations"][0]["snippet"],
+        "secret beta content"
+    );
+
+    let non_member_resolve = client
+        .post(format!(
+            "{}/workspaces/{workspace_id}/citations/resolve",
+            server.addr
+        ))
+        .bearer_auth(&platform_admin)
+        .json(&json!({ "chunk_ids": [public_chunk_id] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(non_member_resolve.status(), reqwest::StatusCode::FORBIDDEN);
+    let non_member_error: Value = non_member_resolve.json().await.unwrap();
+    assert_eq!(non_member_error["error"]["code"], "FORBIDDEN");
+
+    let empty_resolve = client
+        .post(format!(
+            "{}/workspaces/{workspace_id}/citations/resolve",
+            server.addr
+        ))
+        .bearer_auth(&member_user)
+        .json(&json!({ "chunk_ids": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(empty_resolve.status(), reqwest::StatusCode::OK);
+    let empty_resolve_json: Value = empty_resolve.json().await.unwrap();
+    assert_eq!(empty_resolve_json, json!({ "citations": [] }));
+
+    let oversized_chunk_ids = (0..65).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+    let oversized_resolve = client
+        .post(format!(
+            "{}/workspaces/{workspace_id}/citations/resolve",
+            server.addr
+        ))
+        .bearer_auth(&member_user)
+        .json(&json!({ "chunk_ids": oversized_chunk_ids }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(oversized_resolve.status(), reqwest::StatusCode::BAD_REQUEST);
+    let oversized_error: Value = oversized_resolve.json().await.unwrap();
+    assert_eq!(oversized_error["error"]["code"], "INVALID_REQUEST");
+
+    let malformed_resolve = client
+        .post(format!(
+            "{}/workspaces/{workspace_id}/citations/resolve",
+            server.addr
+        ))
+        .bearer_auth(&member_user)
+        .header("content-type", "application/json")
+        .body(r#"{"chunk_ids":["not-a-uuid"]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed_resolve.status(), reqwest::StatusCode::BAD_REQUEST);
+    let malformed_error: Value = malformed_resolve.json().await.unwrap();
+    assert_eq!(malformed_error["error"]["code"], "INVALID_REQUEST");
 
     let member_graph = client
         .get(format!("{}/workspaces/{workspace_id}/graph", server.addr))

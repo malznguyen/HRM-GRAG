@@ -34,7 +34,8 @@ use axum::{
 };
 use routes::chat::{
     delete_workspace_chat_session, get_workspace_chat_session_messages,
-    list_workspace_chat_sessions, workspace_chat, workspace_chat_history,
+    list_workspace_chat_sessions, resolve_workspace_citations, workspace_chat,
+    workspace_chat_history,
 };
 use routes::documents::{
     delete_document, get_document_chunk, get_document_preview, get_document_shares, list_documents,
@@ -311,6 +312,10 @@ pub fn app_router(state: AppState) -> Router {
         .route(
             "/workspaces/{workspace_id}/chunks/{chunk_id}",
             get(get_document_chunk),
+        )
+        .route(
+            "/workspaces/{workspace_id}/citations/resolve",
+            post(resolve_workspace_citations),
         )
         .route("/workspaces/{workspace_id}/chat", post(workspace_chat))
         .route(

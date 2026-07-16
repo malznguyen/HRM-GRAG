@@ -73,6 +73,10 @@ const PROTECTED_ROUTES: &[(&str, &str)] = &[
     ),
     (
         "POST",
+        "/workspaces/00000000-0000-0000-0000-000000000001/citations/resolve",
+    ),
+    (
+        "POST",
         "/workspaces/00000000-0000-0000-0000-000000000001/chat",
     ),
     (

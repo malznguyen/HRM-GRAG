@@ -7,7 +7,7 @@ Current live architecture after Phase 4 API consistency and defense-in-depth clo
 - tenant and workspace hierarchy in PostgreSQL,
 - OpenFGA as the authorization source of truth,
 - Keycloak-only login, verified-user directory, and tenant/workspace onboarding,
-- original PDF storage in MinIO/S3 through `aws-sdk-s3` v1,
+- original PDF/DOCX/TXT/MD storage in MinIO/S3 through `aws-sdk-s3` v1,
 - Qdrant vector retrieval for ACL-aware chunk search,
 - PostgreSQL graph store: ACL-aware graph retrieval ranks document-scoped `graph_node_sources.embedding` after visible-provenance filtering and falls back to source-scoped text search; `graph_nodes.embedding` remains global compatibility/read-model data (HNSW `vector_l2_ops`; not ACL-filtered content fallback; legacy NULL global nodes need operator `backfill-graph-node-embeddings`),
 - document-level ACL fully live; Phase 3A operator workers (outbox, storage cleanup, invite-placeholder cleanup) available.
@@ -33,6 +33,7 @@ Historical v1 audit snapshots are archived under `docs/archive/v1/`.
 | Authorization | OpenFGA via `AuthzClient` and route-level relation checks |
 | Original document storage | S3-compatible object storage; MinIO in local development |
 | Current retrieval path | **Chunk:** Qdrant (ACL-aware). **Graph:** ACL-aware retrieval ranks document-scoped `graph_node_sources.embedding` after visible-provenance filtering and falls back to source-scoped text search. `graph_nodes.embedding` remains global compatibility/read-model data and is not used as ACL-filtered graph content fallback. |
+| Chat Sandbox | SSE chat with persisted sessions/messages, assistant-only GFM, shared session fishbone/thread state, and ACL-filtered citation resolution into per-message chips plus the newest-response References panel. |
 | Phase 3A hardening | ✅ complete — authz outbox processor, storage cleanup, invite-placeholder cleanup, audit trail (see `docs/RUNBOOK.md`) |
 | Phase 1 durable ingestion | ✅ complete — API enqueue only; independent worker claim/lease, retry/backoff, stable Qdrant replay, restart recovery, and terminal failure states (see `docs/RUNBOOK.md` §11) |
 | Phase 3B/3C | 🟡 partial — Qdrant lifecycle/outbox (claim, backoff, `DEAD`) + orphan cleanup shipped; daemon orchestration and other follow-up remain (see `docs/authz-refactor-taskboard.md`) |

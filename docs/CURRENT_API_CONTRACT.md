@@ -130,6 +130,7 @@ every application failure.
 | `PUT` | `/workspaces/{workspace_id}/documents/{document_id}/permissions` | `admin` on `workspace:{workspace_id}` |
 | `GET` | `/workspaces/{workspace_id}/documents/{document_id}/preview` | `member` on `workspace:{workspace_id}` |
 | `GET` | `/workspaces/{workspace_id}/chunks/{chunk_id}` | `member` on `workspace:{workspace_id}` |
+| `POST` | `/workspaces/{workspace_id}/citations/resolve` | `member` on `workspace:{workspace_id}` plus document-level viewer ACL per chunk |
 | `POST` | `/workspaces/{workspace_id}/chat` | `member` on `workspace:{workspace_id}` plus chat-session ownership |
 | `GET` | `/workspaces/{workspace_id}/chat/history` | `member` on `workspace:{workspace_id}` plus chat-session ownership |
 | `GET` | `/workspaces/{workspace_id}/chat/sessions` | `member` on `workspace:{workspace_id}` |
@@ -207,7 +208,7 @@ every application failure.
 
 ## Tenant And Workspace Lifecycle
 
-The merged router exposes **33 method/path combinations**. The inventory above
+The merged router exposes **34 method/path combinations**. The inventory above
 counts methods separately when a path supports more than one method.
 ### `GET /tenants`
 
@@ -432,7 +433,7 @@ Stable document `failure_code` values currently emitted by the worker include:
 | `failure_code` | Meaning | Auto-retry |
 | --- | --- | --- |
 | `DOCUMENT_OBJECT_MISSING` | Original object absent in storage | No |
-| `NEEDS_OCR` | Page(s) need OCR and no usable OCR result is available (no production provider yet) | No |
+| `NEEDS_OCR` | Page(s) need OCR; production OCR is unavailable | No |
 | `PDF_PARSE_FAILED` | PDF could not be parsed or chunked | No |
 | `DOCX_PARSE_FAILED` | DOCX archive/XML could not be parsed or produced no usable text | No |
 | `TEXT_DECODE_FAILED` | TXT/MD could not be decoded, or stored `content_type` is missing/unsupported | No |
@@ -443,14 +444,12 @@ Stable document `failure_code` values currently emitted by the worker include:
 | `INTERNAL_INGESTION_ERROR` | Other internal ingestion error | Yes (until max attempts) |
 | `INGESTION_MAX_ATTEMPTS_EXCEEDED` | Retryable failure exhausted `max_attempts` | No (terminal after retries) |
 
-`NEEDS_OCR` applies only to PDF and is non-retryable for the worker while no OCR provider is configured,
-avoiding futile claim loops. After a future OCR provider/configuration change
-(OCR-003+), operators may re-queue via `POST .../documents/{document_id}/retry`
-(document must be terminal `FAILED`, object must still exist).
+`NEEDS_OCR` applies only to PDF and is non-retryable because production OCR is
+unavailable, avoiding futile claim loops.
 `GET /workspaces/{workspace_id}/documents` already surfaces optional
 `failure_code` / `failure_message` on each row; no API schema change is required.
 
-OCR-004 corpus audit/reingest planning is an **operator binary**
+OCR-004 corpus audit is an **operator binary**
 (`audit-ocr-affected-documents`), not a public REST endpoint. Dry-run is the
 default and is fully read-only (no SQL mutation including no `audit_events`, no
 object/Qdrant writes). `--apply` is refused while production OCR capability is
@@ -529,6 +528,16 @@ write metadata-only audit rows. See `docs/RUNBOOK.md` (OCR-004 section).
 - Security notes: chunk lookup checks document-level ACL viewer permissions.
 
 ## Chat
+
+### `POST /workspaces/{workspace_id}/citations/resolve`
+
+- Auth: bearer JWT.
+- Authorization: `member` on `workspace:{workspace_id}`, then document-level viewer ACL for every requested chunk using the same check as the single-chunk route.
+- Request body: JSON `{ "chunk_ids": ["uuid", ...] }`. The input is capped at 64 items before duplicate removal. Duplicate ids keep their first request position.
+- Success: `200` with `{ citations: [{ chunk_id, document_id, document_name, snippet }] }` in deduplicated request order. `document_name` comes from `documents.filename`; `snippet` comes from `document_chunks.original_text`, is truncated server-side at a character-safe boundary near 280 characters, and ends with `…` when truncated. Empty input or an all-omitted result returns `{ "citations": [] }`.
+- Errors: malformed or oversized input returns `400 INVALID_REQUEST`; a non-member returns `403 FORBIDDEN`; authorization dependency or database failure returns `500 INTERNAL_ERROR`, all JSON envelopes.
+- Side effects: none.
+- Security notes: inaccessible, nonexistent, and wrong-workspace chunks are omitted silently with no placeholder. OpenFGA viewer decisions are authoritative and fail closed; the hydration join runs only over ACL-approved chunk ids.
 
 ### `POST /workspaces/{workspace_id}/chat`
 
