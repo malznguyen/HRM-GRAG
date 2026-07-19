@@ -34,6 +34,7 @@ Historical v1 audit snapshots are archived under `docs/archive/v1/`.
 | Original document storage | S3-compatible object storage; MinIO in local development |
 | Current retrieval path | **Chunk:** Qdrant (ACL-aware). **Graph:** ACL-aware retrieval ranks document-scoped `graph_node_sources.embedding` after visible-provenance filtering and falls back to source-scoped text search. `graph_nodes.embedding` remains global compatibility/read-model data and is not used as ACL-filtered graph content fallback. |
 | Chat Sandbox | SSE chat with persisted sessions/messages, assistant-only GFM, shared session fishbone/thread state, and ACL-filtered citation resolution into per-message chips plus the newest-response References panel. |
+| Knowledge Graph | Interactive Sigma/Graphology workspace graph with ACL-filtered nodes and links, bounded client layout, search, selection, and detail inspection. |
 | Phase 3A hardening | ✅ complete — authz outbox processor, storage cleanup, invite-placeholder cleanup, audit trail (see `docs/RUNBOOK.md`) |
 | Phase 1 durable ingestion | ✅ complete — API enqueue only; independent worker claim/lease, retry/backoff, stable Qdrant replay, restart recovery, and terminal failure states (see `docs/RUNBOOK.md` §11) |
 | Phase 3B/3C | 🟡 partial — Qdrant lifecycle/outbox (claim, backoff, `DEAD`) + orphan cleanup shipped; daemon orchestration and other follow-up remain (see `docs/authz-refactor-taskboard.md`) |
