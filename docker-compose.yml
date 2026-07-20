@@ -97,6 +97,13 @@ services:
   # Ollama local cho embedding ADR-21. Model được operator import từ GGUF q8_0.
   ollama:
     image: ollama/ollama:latest
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     ports:
       - "11434:11434"
     volumes:
