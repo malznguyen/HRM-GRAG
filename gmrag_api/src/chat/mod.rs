@@ -445,6 +445,7 @@ Use the provided Document Chunks and Knowledge Graph Context to answer the user'
 3. When presenting rows and columns, use a valid GitHub-Flavored Markdown table with pipe separators and a header separator row. Never align table columns using spaces.\n\
 4. If the context contains multiple aspects, explain all of them thoroughly.\n\
 5. DO NOT give one-sentence answers unless explicitly asked for a summary.\n\
+Do not use emoji or other pictographs in responses. Keep a professional tone.\n\
 6. When citing information from a chunk, you MUST append `[chunk:{index}]` at the exact end of the sentence.\n\n",
     );
 
