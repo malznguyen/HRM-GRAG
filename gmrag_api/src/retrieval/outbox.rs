@@ -331,11 +331,28 @@ pub async fn process_qdrant_outbox(
     retrieval: &RetrievalClient,
     config: QdrantOutboxProcessorConfig,
 ) -> Result<QdrantOutboxRunResult, sqlx::Error> {
+    process_qdrant_outbox_until(pool, retrieval, config, || false).await
+}
+
+/// Dừng trước batch claim kế tiếp khi worker đã nhận tín hiệu shutdown.
+pub async fn process_qdrant_outbox_until<StopRequested>(
+    pool: &PgPool,
+    retrieval: &RetrievalClient,
+    config: QdrantOutboxProcessorConfig,
+    stop_requested: StopRequested,
+) -> Result<QdrantOutboxRunResult, sqlx::Error>
+where
+    StopRequested: Fn() -> bool,
+{
     let mut result = QdrantOutboxRunResult::default();
     // Loại id đã xử lý trong run này khỏi claim — tránh vòng lặp khi backoff/lease = 0.
     let mut seen_ids: HashSet<Uuid> = HashSet::new();
 
     loop {
+        if stop_requested() {
+            break;
+        }
+
         let exclude: Vec<Uuid> = seen_ids.iter().copied().collect();
         let rows = claim_qdrant_outbox_batch(pool, &config, &exclude).await?;
         if rows.is_empty() {

@@ -1,11 +1,15 @@
 use gmrag_api::auth;
 use gmrag_api::retrieval::RetrievalClient;
+use gmrag_api::shutdown::{DrainOutcome, Shutdown, drain_with_deadline, shutdown_signal};
 use gmrag_api::state::AppState;
 use gmrag_api::storage::{StorageClient, StorageConfig};
 use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tracing::warn;
+
+const API_DRAIN_TIMEOUT_SECS: u64 = 20;
 
 #[tokio::main]
 async fn main() {
@@ -17,6 +21,8 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,lopdf=error")),
         )
         .init();
+
+    let shutdown = Shutdown::install().expect("Failed to install shutdown signal handler");
 
     if let Err(error) = auth::validate_test_bypass_configuration() {
         eprintln!("Invalid test bypass configuration: {error}");
@@ -86,5 +92,54 @@ async fn main() {
 
     println!("gmrag_api listening on {addr}");
 
-    axum::serve(listener, app).await.expect("Server failed");
+    let server_result = {
+        let graceful_shutdown_listener = shutdown.clone();
+        let graceful_shutdown = async move {
+            shutdown_signal(graceful_shutdown_listener).await;
+        };
+        let server = axum::serve(listener, app).with_graceful_shutdown(graceful_shutdown);
+        let server = async move { server.await };
+        tokio::pin!(server);
+
+        tokio::select! {
+            biased;
+            signal = shutdown_signal(shutdown.clone()) => {
+                warn!(signal = signal.as_str(), "API shutdown signal received");
+                warn!(
+                    drain_timeout_secs = API_DRAIN_TIMEOUT_SECS,
+                    "API connection draining started"
+                );
+
+                match drain_with_deadline(
+                    &mut server,
+                    shutdown,
+                    std::time::Duration::from_secs(API_DRAIN_TIMEOUT_SECS),
+                )
+                .await
+                {
+                    DrainOutcome::Completed(result) => Some(result),
+                    DrainOutcome::DeadlineElapsed => {
+                        warn!(
+                            drain_timeout_secs = API_DRAIN_TIMEOUT_SECS,
+                            "API drain deadline elapsed; forcing remaining connections closed"
+                        );
+                        None
+                    }
+                    DrainOutcome::SecondSignal(signal) => {
+                        warn!(
+                            signal = signal.as_str(),
+                            "Second shutdown signal received; forcing API connections closed"
+                        );
+                        None
+                    }
+                }
+            }
+            result = &mut server => Some(result),
+        }
+    };
+
+    if let Some(result) = server_result {
+        result.expect("Server failed");
+    }
+    warn!("gmrag_api stopped");
 }

@@ -4,12 +4,13 @@ use gmrag_api::audit::{AuditEventRecord, AuditEventType, insert_audit_event, san
 use gmrag_api::retrieval::RetrievalClient;
 use gmrag_api::retrieval::outbox::{
     QDRANT_OUTBOX_EXIT_FAILURE, QdrantOutboxProcessorConfig, QdrantOutboxRunMode,
-    process_qdrant_outbox, qdrant_outbox_exit_code,
+    process_qdrant_outbox_until, qdrant_outbox_exit_code,
 };
+use gmrag_api::shutdown::{Shutdown, drain_or_second_signal, shutdown_signal};
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() {
@@ -21,6 +22,8 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    let shutdown = Shutdown::install().expect("Failed to install shutdown signal handler");
 
     let cli_args: Vec<String> = std::env::args().skip(1).collect();
     if cli_args.iter().any(|a| a == "--help" || a == "-h") {
@@ -54,9 +57,9 @@ async fn main() {
     );
 
     if run_mode.loop_mode {
-        run_loop(&pool, &retrieval, config, run_mode).await;
+        run_loop(&pool, &retrieval, config, run_mode, shutdown).await;
     } else {
-        let code = run_once(&pool, &retrieval, config).await;
+        let code = run_once(&pool, &retrieval, config, &shutdown).await;
         std::process::exit(code);
     }
 }
@@ -66,10 +69,39 @@ async fn run_loop(
     retrieval: &RetrievalClient,
     config: QdrantOutboxProcessorConfig,
     run_mode: QdrantOutboxRunMode,
+    shutdown: Shutdown,
 ) {
     let interval = Duration::from_secs(run_mode.interval_secs);
     loop {
-        let code = run_once(pool, retrieval, config).await;
+        if shutdown.received() {
+            let signal = shutdown_signal(shutdown.clone()).await;
+            log_shutdown_start(signal);
+            break;
+        }
+
+        let run = run_once(pool, retrieval, config, &shutdown);
+        tokio::pin!(run);
+        let mut draining = false;
+        let code = tokio::select! {
+            biased;
+            signal = shutdown_signal(shutdown.clone()) => {
+                log_shutdown_start(signal);
+                draining = true;
+                match drain_or_second_signal(&mut run, shutdown.clone()).await {
+                    Ok(code) => code,
+                    Err(signal) => {
+                        warn!(
+                            signal = signal.as_str(),
+                            "Second shutdown signal received; stopping process-qdrant-outbox immediately"
+                        );
+                        warn!("process-qdrant-outbox stopped");
+                        return;
+                    }
+                }
+            }
+            code = &mut run => code,
+        };
+
         if code != 0 {
             // Thoát non-zero để Compose restart — không nuốt lỗi trong loop.
             error!(
@@ -79,20 +111,27 @@ async fn run_loop(
             std::process::exit(code);
         }
 
+        if draining {
+            break;
+        }
+
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("Received shutdown signal; stopping process-qdrant-outbox");
+            signal = shutdown_signal(shutdown.clone()) => {
+                log_shutdown_start(signal);
                 break;
             }
             _ = sleep(interval) => {}
         }
     }
+
+    warn!("process-qdrant-outbox stopped");
 }
 
 async fn run_once(
     pool: &sqlx::PgPool,
     retrieval: &RetrievalClient,
     config: QdrantOutboxProcessorConfig,
+    shutdown: &Shutdown,
 ) -> i32 {
     let _ = insert_audit_event(
         pool,
@@ -106,7 +145,7 @@ async fn run_once(
     )
     .await;
 
-    let result = process_qdrant_outbox(pool, retrieval, config).await;
+    let result = process_qdrant_outbox_until(pool, retrieval, config, || shutdown.received()).await;
     let exit_code = qdrant_outbox_exit_code(&result);
 
     match result {
@@ -163,6 +202,14 @@ async fn run_once(
     }
 
     exit_code
+}
+
+fn log_shutdown_start(signal: gmrag_api::shutdown::ShutdownSignal) {
+    warn!(
+        signal = signal.as_str(),
+        "Qdrant outbox shutdown signal received"
+    );
+    warn!("Qdrant outbox draining started");
 }
 
 fn print_usage() {

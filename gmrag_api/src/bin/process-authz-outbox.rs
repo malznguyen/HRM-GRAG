@@ -6,10 +6,11 @@ use gmrag_api::auth::outbox::{
     AUTHZ_OUTBOX_EXIT_FAILURE, AuthzOutboxProcessorConfig, AuthzOutboxRunMode,
     authz_outbox_exit_code, process_authz_outbox,
 };
+use gmrag_api::shutdown::{Shutdown, drain_or_second_signal, shutdown_signal};
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() {
@@ -21,6 +22,8 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    let shutdown = Shutdown::install().expect("Failed to install shutdown signal handler");
 
     let cli_args: Vec<String> = std::env::args().skip(1).collect();
     if cli_args.iter().any(|a| a == "--help" || a == "-h") {
@@ -48,7 +51,7 @@ async fn main() {
     );
 
     if run_mode.loop_mode {
-        run_loop(&pool, &authz_client, config, run_mode).await;
+        run_loop(&pool, &authz_client, config, run_mode, shutdown).await;
     } else {
         let code = run_once(&pool, &authz_client, config).await;
         std::process::exit(code);
@@ -60,10 +63,39 @@ async fn run_loop(
     authz_client: &AuthzClient,
     config: AuthzOutboxProcessorConfig,
     run_mode: AuthzOutboxRunMode,
+    shutdown: Shutdown,
 ) {
     let interval = Duration::from_secs(run_mode.interval_secs);
     loop {
-        let code = run_once(pool, authz_client, config).await;
+        if shutdown.received() {
+            let signal = shutdown_signal(shutdown.clone()).await;
+            log_shutdown_start(signal);
+            break;
+        }
+
+        let run = run_once(pool, authz_client, config);
+        tokio::pin!(run);
+        let mut draining = false;
+        let code = tokio::select! {
+            biased;
+            signal = shutdown_signal(shutdown.clone()) => {
+                log_shutdown_start(signal);
+                draining = true;
+                match drain_or_second_signal(&mut run, shutdown.clone()).await {
+                    Ok(code) => code,
+                    Err(signal) => {
+                        warn!(
+                            signal = signal.as_str(),
+                            "Second shutdown signal received; stopping process-authz-outbox immediately"
+                        );
+                        warn!("process-authz-outbox stopped");
+                        return;
+                    }
+                }
+            }
+            code = &mut run => code,
+        };
+
         if code != 0 {
             // Thoát non-zero để Compose restart — không nuốt lỗi trong loop.
             error!(
@@ -73,14 +105,20 @@ async fn run_loop(
             std::process::exit(code);
         }
 
+        if draining {
+            break;
+        }
+
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("Received shutdown signal; stopping process-authz-outbox");
+            signal = shutdown_signal(shutdown.clone()) => {
+                log_shutdown_start(signal);
                 break;
             }
             _ = sleep(interval) => {}
         }
     }
+
+    warn!("process-authz-outbox stopped");
 }
 
 async fn run_once(
@@ -146,6 +184,14 @@ async fn run_once(
     }
 
     exit_code
+}
+
+fn log_shutdown_start(signal: gmrag_api::shutdown::ShutdownSignal) {
+    warn!(
+        signal = signal.as_str(),
+        "Authz outbox shutdown signal received"
+    );
+    warn!("Authz outbox draining started");
 }
 
 fn print_usage() {

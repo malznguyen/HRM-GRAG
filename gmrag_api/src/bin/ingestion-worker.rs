@@ -6,6 +6,7 @@ use gmrag_api::ingestion::jobs::{
 };
 use gmrag_api::ingestion::processor::process_claimed_job;
 use gmrag_api::retrieval::RetrievalClient;
+use gmrag_api::shutdown::{Shutdown, drain_or_second_signal, shutdown_signal};
 use gmrag_api::storage::{StorageClient, StorageConfig};
 use sqlx::postgres::PgPoolOptions;
 use tokio::time::{interval, sleep};
@@ -35,6 +36,8 @@ async fn main() {
         )
         .init();
 
+    let shutdown = Shutdown::install().expect("Failed to install shutdown signal handler");
+
     let options = WorkerOptions::parse();
     let config = IngestionWorkerConfig::from_env();
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
@@ -58,39 +61,115 @@ async fn main() {
     let poll_interval =
         Duration::from_millis(env_u64("INGESTION_WORKER_POLL_INTERVAL_MS", 1_000, 100));
     let mut summary = RunSummary::default();
-    loop {
-        let claimed = match claim_jobs(&pool, &options.worker_id, config).await {
+    let mut draining = false;
+    'worker: loop {
+        if shutdown.received() {
+            let signal = shutdown_signal(shutdown.clone()).await;
+            log_shutdown_start(signal);
+            break;
+        }
+
+        let claim = claim_jobs(&pool, &options.worker_id, config);
+        tokio::pin!(claim);
+        let claim_result = tokio::select! {
+            biased;
+            signal = shutdown_signal(shutdown.clone()) => {
+                log_shutdown_start(signal);
+                draining = true;
+                match drain_or_second_signal(&mut claim, shutdown.clone()).await {
+                    Ok(result) => result,
+                    Err(signal) => {
+                        warn!(
+                            signal = signal.as_str(),
+                            "Second shutdown signal received; stopping ingestion worker immediately"
+                        );
+                        break 'worker;
+                    }
+                }
+            }
+            result = &mut claim => result,
+        };
+
+        let claimed = match claim_result {
             Ok(rows) => rows,
             Err(err) => {
                 error!(error = %err, "Failed to claim ingestion jobs");
                 if options.once {
                     std::process::exit(1);
                 }
-                sleep(poll_interval).await;
+                tokio::select! {
+                    signal = shutdown_signal(shutdown.clone()) => {
+                        log_shutdown_start(signal);
+                        break;
+                    }
+                    _ = sleep(poll_interval) => {}
+                }
                 continue;
             }
         };
         if claimed.is_empty() {
-            if options.once {
+            if options.once || draining {
                 break;
             }
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => break,
+                signal = shutdown_signal(shutdown.clone()) => {
+                    log_shutdown_start(signal);
+                    break;
+                }
                 _ = sleep(poll_interval) => {}
             }
             continue;
         }
         for job in claimed {
+            if !draining && shutdown.received() {
+                let signal = shutdown_signal(shutdown.clone()).await;
+                log_shutdown_start(signal);
+                draining = true;
+            }
+
             summary.claimed += 1;
-            let outcome = process_one(
+            let process = process_one(
                 pool.clone(),
                 storage.clone(),
                 retrieval.clone(),
                 job.clone(),
                 options.worker_id.clone(),
                 config,
-            )
-            .await;
+            );
+            tokio::pin!(process);
+
+            let outcome = if draining {
+                match drain_or_second_signal(&mut process, shutdown.clone()).await {
+                    Ok(outcome) => outcome,
+                    Err(signal) => {
+                        warn!(
+                            signal = signal.as_str(),
+                            "Second shutdown signal received; stopping ingestion worker immediately"
+                        );
+                        break 'worker;
+                    }
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    signal = shutdown_signal(shutdown.clone()) => {
+                        log_shutdown_start(signal);
+                        draining = true;
+                        match drain_or_second_signal(&mut process, shutdown.clone()).await {
+                            Ok(outcome) => outcome,
+                            Err(signal) => {
+                                warn!(
+                                    signal = signal.as_str(),
+                                    "Second shutdown signal received; stopping ingestion worker immediately"
+                                );
+                                break 'worker;
+                            }
+                        }
+                    }
+                    outcome = &mut process => outcome,
+                }
+            };
+
             match outcome {
                 ProcessOutcome::Succeeded => summary.succeeded += 1,
                 ProcessOutcome::Retried => summary.retried += 1,
@@ -98,7 +177,7 @@ async fn main() {
                 ProcessOutcome::LeaseConflict => summary.lease_conflicts += 1,
             }
         }
-        if options.once {
+        if options.once || draining {
             break;
         }
     }
@@ -110,6 +189,14 @@ async fn main() {
         lease_conflicts = summary.lease_conflicts,
         "Ingestion worker stopped"
     );
+}
+
+fn log_shutdown_start(signal: gmrag_api::shutdown::ShutdownSignal) {
+    warn!(
+        signal = signal.as_str(),
+        "Ingestion worker shutdown signal received"
+    );
+    warn!("Ingestion worker draining started");
 }
 
 /// Chặn vòng poll cho tới khi Ollama trả đúng model và đúng chiều vector.

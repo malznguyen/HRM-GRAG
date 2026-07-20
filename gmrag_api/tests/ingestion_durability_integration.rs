@@ -524,6 +524,43 @@ async fn abandoned_worker_lease_is_reclaimed_and_pipeline_completes() {
 }
 
 #[tokio::test]
+async fn graceful_completion_leaves_no_owned_processing_lease() {
+    let Some(pool) = pool_or_skip().await else {
+        eprintln!("skip: DATABASE_URL unavailable");
+        return;
+    };
+    let (workspace_id, document_id, user_id) = seed_document(&pool, "PROCESSING").await;
+    let config = test_worker_config(3);
+    let worker_id = "worker-graceful-stop";
+    let job = enqueue_and_claim(&pool, workspace_id, document_id, worker_id, config).await;
+
+    assert!(
+        gmrag_api::ingestion::jobs::complete_job_and_document(&pool, &job, worker_id)
+            .await
+            .unwrap()
+    );
+
+    let owned_processing_leases: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM ingestion_jobs WHERE status = 'PROCESSING' AND claimed_by = $1 AND lease_expires_at IS NOT NULL",
+    )
+    .bind(worker_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(owned_processing_leases, 0);
+
+    let final_state: (String, Option<chrono::NaiveDateTime>) =
+        sqlx::query_as("SELECT status, lease_expires_at FROM ingestion_jobs WHERE id = $1")
+            .bind(job.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(final_state, ("SUCCEEDED".to_string(), None));
+
+    cleanup(&pool, workspace_id, &user_id).await;
+}
+
+#[tokio::test]
 async fn qdrant_failure_exhausts_attempts_and_marks_document_failed() {
     let Some(pool) = pool_or_skip().await else {
         eprintln!("skip: DATABASE_URL unavailable");

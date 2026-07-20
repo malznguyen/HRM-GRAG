@@ -1,4 +1,5 @@
 use gmrag_api::audit::{AuditEventRecord, AuditEventType, insert_audit_event, sanitize_error_code};
+use gmrag_api::shutdown::{Shutdown, drain_or_second_signal, shutdown_signal};
 use gmrag_api::storage::cleanup::{
     PrefixCleanupReport, StorageCleanupOptions, build_tenant_prefix, cleanup_prefix,
     resolve_workspace_prefix, scan_documents_and_orphans,
@@ -6,6 +7,7 @@ use gmrag_api::storage::cleanup::{
 use gmrag_api::storage::{StorageClient, StorageConfig};
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
+use tracing::warn;
 use uuid::Uuid;
 
 const DEFAULT_LOOP_INTERVAL_SECS: u64 = 3600;
@@ -44,6 +46,8 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    let shutdown = Shutdown::install().expect("Failed to install shutdown signal handler");
 
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(args) => args,
@@ -90,7 +94,7 @@ async fn main() {
     let storage = StorageClient::from_config(storage_config).await;
 
     if args.loop_mode {
-        run_loop(&pool, &storage, &args, mode).await;
+        run_loop(&pool, &storage, &args, mode, shutdown).await;
         return;
     }
 
@@ -135,11 +139,40 @@ async fn run_loop(
     storage: &StorageClient,
     args: &CleanupArgs,
     mode: CleanupMode,
+    shutdown: Shutdown,
 ) {
     let interval = std::time::Duration::from_secs(args.interval_secs);
 
     loop {
-        let result = run_cleanup(pool, storage, args, mode.clone()).await;
+        if shutdown.received() {
+            let signal = shutdown_signal(shutdown.clone()).await;
+            log_shutdown_start(signal);
+            break;
+        }
+
+        let cleanup = run_cleanup(pool, storage, args, mode.clone());
+        tokio::pin!(cleanup);
+        let mut draining = false;
+        let result = tokio::select! {
+            biased;
+            signal = shutdown_signal(shutdown.clone()) => {
+                log_shutdown_start(signal);
+                draining = true;
+                match drain_or_second_signal(&mut cleanup, shutdown.clone()).await {
+                    Ok(result) => result,
+                    Err(signal) => {
+                        warn!(
+                            signal = signal.as_str(),
+                            "Second shutdown signal received; stopping storage-orphan-scan immediately"
+                        );
+                        warn!("storage-orphan-scan stopped");
+                        return;
+                    }
+                }
+            }
+            result = &mut cleanup => result,
+        };
+
         match result {
             Ok(metadata) => {
                 let _ = insert_audit_event(
@@ -172,14 +205,28 @@ async fn run_loop(
             }
         }
 
+        if draining {
+            break;
+        }
+
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                println!("Received shutdown signal; stopping storage-orphan-scan");
-                return;
+            signal = shutdown_signal(shutdown.clone()) => {
+                log_shutdown_start(signal);
+                break;
             }
             _ = tokio::time::sleep(interval) => {}
         }
     }
+
+    warn!("storage-orphan-scan stopped");
+}
+
+fn log_shutdown_start(signal: gmrag_api::shutdown::ShutdownSignal) {
+    warn!(
+        signal = signal.as_str(),
+        "Storage orphan scan shutdown signal received"
+    );
+    warn!("Storage orphan scan draining started");
 }
 
 async fn run_cleanup(

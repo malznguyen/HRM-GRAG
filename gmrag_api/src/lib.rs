@@ -13,6 +13,7 @@ pub mod outbox;
 pub mod rate_limit;
 pub mod retrieval;
 pub mod routes;
+pub mod shutdown;
 pub mod state;
 pub mod storage;
 pub mod telemetry;
