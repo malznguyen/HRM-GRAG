@@ -1155,7 +1155,7 @@ fn effective_graph_extraction_concurrency(chunk_count: usize) -> usize {
 }
 
 fn graph_extraction_timeout_secs() -> u64 {
-    env_u64("GMRAG_GRAPH_EXTRACTION_TIMEOUT_SECS", 20, 1)
+    env_u64("GMRAG_GRAPH_EXTRACTION_TIMEOUT_SECS", 60, 1)
 }
 
 fn graph_extraction_retries() -> usize {
@@ -1163,7 +1163,7 @@ fn graph_extraction_retries() -> usize {
 }
 
 fn graph_extraction_stage_timeout_secs() -> u64 {
-    env_u64("GMRAG_GRAPH_EXTRACTION_STAGE_TIMEOUT_SECS", 30, 1)
+    env_u64("GMRAG_GRAPH_EXTRACTION_STAGE_TIMEOUT_SECS", 300, 1)
 }
 
 fn graph_extraction_retry_backoff_ms() -> u64 {
