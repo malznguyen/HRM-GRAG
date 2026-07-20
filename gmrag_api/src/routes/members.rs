@@ -11,9 +11,12 @@ use sqlx::{PgPool, Postgres, Transaction};
 use tracing::error;
 use uuid::Uuid;
 
-use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event};
+use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event, insert_audit_event_tx};
 use crate::auth::authz::{ApiError, Authz, AuthzClient, AuthzError, Object, Relation, TupleKey};
-use crate::auth::outbox::enqueue_tuple_write;
+use crate::auth::outbox::{
+    enqueue_tuple_write, enqueue_workspace_role_sync, enqueue_workspace_role_sync_tx,
+    mark_authz_outbox_processed,
+};
 use crate::auth::workspace_role::WorkspaceMemberRole;
 use crate::invite::normalize_email;
 use crate::state::AppState;
@@ -382,34 +385,19 @@ pub async fn update_workspace_member_role(
     let old_relation = current_role.as_fga_relation();
     let new_relation = new_role.as_fga_relation();
 
-    // OpenFGA trước commit SQL — fail-closed nếu write lỗi (tx rollback)
-    if let Err(err) = state
-        .authz_client
-        .write_tuples(
-            vec![TupleKey {
-                user: format!("user:{member_id}"),
-                relation: new_relation.as_str().to_string(),
-                object: Object::Workspace(workspace_id).to_string(),
-            }],
-            vec![TupleKey {
-                user: format!("user:{member_id}"),
-                relation: old_relation.as_str().to_string(),
-                object: Object::Workspace(workspace_id).to_string(),
-            }],
-        )
-        .await
-    {
-        error!(error = %err, workspace_id = %workspace_id, user_id = %member_id, "Failed to sync role update to OpenFGA");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    let old_tuple = TupleKey {
+        user: format!("user:{member_id}"),
+        relation: old_relation.as_str().to_string(),
+        object: Object::Workspace(workspace_id).to_string(),
+    };
+    let new_tuple = TupleKey {
+        user: format!("user:{member_id}"),
+        relation: new_relation.as_str().to_string(),
+        object: Object::Workspace(workspace_id).to_string(),
+    };
 
-    if let Err(err) = tx.commit().await {
-        error!(error = %err, "Failed to commit member role update");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-
-    if let Err(err) = insert_audit_event(
-        &state.pool,
+    if let Err(err) = insert_audit_event_tx(
+        &mut tx,
         AuditEventRecord::new(AuditEventType::MemberRoleChanged)
             .with_actor_user_id(authz.user_id.clone())
             .with_workspace_id(workspace_id)
@@ -426,7 +414,94 @@ pub async fn update_workspace_member_role(
             error = %err,
             actor_user_id = %authz.user_id,
             workspace_id = %workspace_id,
-            "Failed to write audit event for member role change"
+            "Failed to write transactional audit event for member role change"
+        );
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    let role_sync_event_id =
+        match enqueue_workspace_role_sync_tx(&mut tx, workspace_id, &member_id).await {
+            Ok(event_id) => event_id,
+            Err(err) => {
+                error!(
+                    error = %err,
+                    workspace_id = %workspace_id,
+                    user_id = %member_id,
+                    "Failed to enqueue transactional role-sync event"
+                );
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+
+    // Thu hồi relation cũ trước commit để mọi lỗi đều fail-closed.
+    if let Err(err) = state
+        .authz_client
+        .write_tuples(Vec::new(), vec![old_tuple])
+        .await
+    {
+        error!(error = %err, workspace_id = %workspace_id, user_id = %member_id, "Failed to revoke old workspace role in OpenFGA");
+
+        if let Err(rollback_err) = tx.rollback().await {
+            error!(
+                error = %rollback_err,
+                workspace_id = %workspace_id,
+                user_id = %member_id,
+                "Failed to roll back member role transaction after OpenFGA revoke failure"
+            );
+        }
+
+        if let Err(outbox_err) =
+            enqueue_workspace_role_sync(&state.pool, workspace_id, &member_id).await
+        {
+            error!(
+                error = %outbox_err,
+                workspace_id = %workspace_id,
+                user_id = %member_id,
+                "Failed to enqueue role-sync recovery after OpenFGA revoke failure"
+            );
+        }
+
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    if let Err(err) = tx.commit().await {
+        error!(error = %err, workspace_id = %workspace_id, user_id = %member_id, "Failed to commit member role update");
+
+        if let Err(outbox_err) =
+            enqueue_workspace_role_sync(&state.pool, workspace_id, &member_id).await
+        {
+            error!(
+                error = %outbox_err,
+                workspace_id = %workspace_id,
+                user_id = %member_id,
+                "Failed to enqueue role-sync recovery after member role commit failure"
+            );
+        }
+
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    if let Err(err) = state
+        .authz_client
+        .write_tuples(vec![new_tuple], Vec::new())
+        .await
+    {
+        error!(
+            error = %err,
+            workspace_id = %workspace_id,
+            user_id = %member_id,
+            "Failed to grant new workspace role in OpenFGA"
+        );
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    if let Err(err) = mark_authz_outbox_processed(&state.pool, role_sync_event_id).await {
+        error!(
+            error = %err,
+            workspace_id = %workspace_id,
+            user_id = %member_id,
+            event_id = %role_sync_event_id,
+            "Failed to mark role-sync event processed after direct OpenFGA grant"
         );
     }
 

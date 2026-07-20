@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use std::collections::HashSet;
 use tracing::{error, info};
 use uuid::Uuid;
 
-use crate::auth::authz::{AuthzClient, AuthzError, TupleKey};
+use crate::auth::authz::{AuthzClient, AuthzError, Object, Relation, TupleKey};
+use crate::auth::workspace_role::WorkspaceMemberRole;
 
 const DEFAULT_AUTHZ_OUTBOX_BATCH_SIZE: i64 = 50;
 const DEFAULT_AUTHZ_OUTBOX_MAX_RETRIES: i32 = 5;
@@ -17,6 +18,7 @@ const MAX_ERROR_MESSAGE_LEN: usize = 200;
 pub enum AuthzOutboxEventType {
     TupleWrite,
     TupleDelete,
+    WorkspaceRoleSync,
 }
 
 impl AuthzOutboxEventType {
@@ -24,6 +26,7 @@ impl AuthzOutboxEventType {
         match self {
             AuthzOutboxEventType::TupleWrite => "tuple_write",
             AuthzOutboxEventType::TupleDelete => "tuple_delete",
+            AuthzOutboxEventType::WorkspaceRoleSync => "workspace_role_sync",
         }
     }
 
@@ -51,6 +54,7 @@ impl AuthzOutboxEventType {
             | "workspace_member_delete"
             | "tenant_owner_delete"
             | "tenant_platform_delete" => Some(Self::TupleDelete),
+            "workspace_role_sync" => Some(Self::WorkspaceRoleSync),
             _ => {
                 if normalized.contains("delete")
                     || normalized.contains("remove")
@@ -78,6 +82,13 @@ pub struct AuthzOutboxTuplePayload {
     pub user: String,
     pub relation: String,
     pub object: String,
+}
+
+/// Payload role-agnostic; processor luôn nạp role hiện tại từ SQL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceRoleSyncPayload {
+    pub workspace_id: Uuid,
+    pub user_id: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -243,6 +254,54 @@ pub async fn enqueue_tuple_delete(pool: &PgPool, tuple: &TupleKey) -> Result<Uui
     enqueue_tuple_event(pool, AuthzOutboxEventType::TupleDelete, tuple).await
 }
 
+/// Enqueue recovery role-sync ngoài transaction đang xử lý request.
+pub async fn enqueue_workspace_role_sync(
+    pool: &PgPool,
+    workspace_id: Uuid,
+    user_id: &str,
+) -> Result<Uuid, sqlx::Error> {
+    let payload = json!({
+        "workspace_id": workspace_id,
+        "user_id": user_id,
+    });
+
+    sqlx::query_scalar(
+        r#"
+        INSERT INTO authz_outbox (event_type, payload, status, retry_count)
+        VALUES ($1, $2, 'PENDING', 0)
+        RETURNING id
+        "#,
+    )
+    .bind(AuthzOutboxEventType::WorkspaceRoleSync.as_str())
+    .bind(payload)
+    .fetch_one(pool)
+    .await
+}
+
+/// Enqueue role-sync trong cùng transaction với thay đổi membership.
+pub async fn enqueue_workspace_role_sync_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+    user_id: &str,
+) -> Result<Uuid, sqlx::Error> {
+    let payload = json!({
+        "workspace_id": workspace_id,
+        "user_id": user_id,
+    });
+
+    sqlx::query_scalar(
+        r#"
+        INSERT INTO authz_outbox (event_type, payload, status, retry_count)
+        VALUES ($1, $2, 'PENDING', 0)
+        RETURNING id
+        "#,
+    )
+    .bind(AuthzOutboxEventType::WorkspaceRoleSync.as_str())
+    .bind(payload)
+    .fetch_one(&mut **tx)
+    .await
+}
+
 pub async fn process_authz_outbox(
     pool: &PgPool,
     authz_client: &AuthzClient,
@@ -326,6 +385,10 @@ async fn process_single_row(
         }
     };
 
+    if event_type == AuthzOutboxEventType::WorkspaceRoleSync {
+        return process_workspace_role_sync_row(pool, authz_client, row).await;
+    }
+
     let tuple = match parse_tuple_payload(row.payload) {
         Ok(tuple) => tuple,
         Err(error_code) => {
@@ -347,15 +410,16 @@ async fn process_single_row(
         AuthzOutboxEventType::TupleDelete => {
             authz_client.write_tuples(Vec::new(), vec![tuple_key]).await
         }
+        AuthzOutboxEventType::WorkspaceRoleSync => unreachable!(),
     };
 
     match write_result {
         Ok(()) => {
-            mark_outbox_row_processed(pool, row.id).await?;
+            mark_authz_outbox_processed(pool, row.id).await?;
             Ok(true)
         }
         Err(err) if is_idempotent_outcome(event_type, &err) => {
-            mark_outbox_row_processed(pool, row.id).await?;
+            mark_authz_outbox_processed(pool, row.id).await?;
             Ok(true)
         }
         Err(err) => {
@@ -366,7 +430,126 @@ async fn process_single_row(
     }
 }
 
-async fn mark_outbox_row_processed(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
+async fn process_workspace_role_sync_row(
+    pool: &PgPool,
+    authz_client: &AuthzClient,
+    row: AuthzOutboxRow,
+) -> Result<bool, sqlx::Error> {
+    let payload = match serde_json::from_value::<WorkspaceRoleSyncPayload>(row.payload) {
+        Ok(payload) => payload,
+        Err(_) => {
+            mark_outbox_row_failed(
+                pool,
+                row.id,
+                row.retry_count,
+                "invalid_workspace_role_sync_payload".to_string(),
+            )
+            .await?;
+            return Ok(false);
+        }
+    };
+
+    let current_role: Option<String> = sqlx::query_scalar(
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(payload.workspace_id)
+    .bind(&payload.user_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let sync_result = match current_role {
+        Some(role) => {
+            let Some(role) = WorkspaceMemberRole::from_sql(&role) else {
+                mark_outbox_row_failed(
+                    pool,
+                    row.id,
+                    row.retry_count,
+                    "invalid_workspace_member_role".to_string(),
+                )
+                .await?;
+                return Ok(false);
+            };
+
+            sync_existing_workspace_role(authz_client, &payload, role).await
+        }
+        None => delete_workspace_role_tuples(authz_client, &payload).await,
+    };
+
+    match sync_result {
+        Ok(()) => {
+            mark_authz_outbox_processed(pool, row.id).await?;
+            Ok(true)
+        }
+        Err(err) => {
+            mark_outbox_row_failed(pool, row.id, row.retry_count, sanitize_error_message(&err))
+                .await?;
+            Ok(false)
+        }
+    }
+}
+
+async fn sync_existing_workspace_role(
+    authz_client: &AuthzClient,
+    payload: &WorkspaceRoleSyncPayload,
+    current_role: WorkspaceMemberRole,
+) -> Result<(), AuthzError> {
+    let matching_relation = current_role.as_fga_relation();
+    let opposite_relation = match current_role {
+        WorkspaceMemberRole::Admin => Relation::Member,
+        WorkspaceMemberRole::Member => Relation::Admin,
+    };
+
+    let matching_tuple = workspace_role_tuple(payload, matching_relation);
+    let opposite_tuple = workspace_role_tuple(payload, opposite_relation);
+
+    delete_tuple_idempotently(authz_client, opposite_tuple).await?;
+    write_tuple_idempotently(authz_client, matching_tuple).await
+}
+
+async fn delete_workspace_role_tuples(
+    authz_client: &AuthzClient,
+    payload: &WorkspaceRoleSyncPayload,
+) -> Result<(), AuthzError> {
+    delete_tuple_idempotently(authz_client, workspace_role_tuple(payload, Relation::Admin)).await?;
+    delete_tuple_idempotently(
+        authz_client,
+        workspace_role_tuple(payload, Relation::Member),
+    )
+    .await
+}
+
+fn workspace_role_tuple(payload: &WorkspaceRoleSyncPayload, relation: Relation) -> TupleKey {
+    TupleKey {
+        user: format!("user:{}", payload.user_id),
+        relation: relation.as_str().to_string(),
+        object: Object::Workspace(payload.workspace_id).to_string(),
+    }
+}
+
+async fn write_tuple_idempotently(
+    authz_client: &AuthzClient,
+    tuple: TupleKey,
+) -> Result<(), AuthzError> {
+    match authz_client.write_tuples(vec![tuple], Vec::new()).await {
+        Ok(()) => Ok(()),
+        Err(err) if is_idempotent_outcome(AuthzOutboxEventType::TupleWrite, &err) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+async fn delete_tuple_idempotently(
+    authz_client: &AuthzClient,
+    tuple: TupleKey,
+) -> Result<(), AuthzError> {
+    match authz_client.write_tuples(Vec::new(), vec![tuple]).await {
+        Ok(()) => Ok(()),
+        Err(err) if is_idempotent_outcome(AuthzOutboxEventType::TupleDelete, &err) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Đánh dấu event đã xử lý sau khi direct OpenFGA grant thành công.
+pub async fn mark_authz_outbox_processed(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         UPDATE authz_outbox
@@ -462,6 +645,7 @@ fn is_idempotent_outcome(event_type: AuthzOutboxEventType, err: &AuthzError) -> 
         AuthzOutboxEventType::TupleDelete => {
             body_lower.contains("does not exist") || body_lower.contains("not found")
         }
+        AuthzOutboxEventType::WorkspaceRoleSync => false,
     }
 }
 

@@ -280,22 +280,34 @@ pub async fn add_tenant_owner(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    // Ghi quan hệ Owner vào OpenFGA: user:{id} - owner - tenant:{tenant_id}
-    if let Err(err) = state
-        .authz_client
-        .write_tuple(
-            &format!("user:{}", keycloak_user.id),
-            Relation::Owner,
-            &Object::Tenant(tenant_id),
-        )
-        .await
-    {
-        error!(error = %err, tenant_id = %tenant_id, user_id = %keycloak_user.id, "Failed to write tenant owner to OpenFGA");
+    if let Err(err) = tx.commit().await {
+        error!(error = %err, "Failed to commit transaction");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    if let Err(err) = tx.commit().await {
-        error!(error = %err, "Failed to commit transaction");
+    let tenant_owner_tuple = TupleKey {
+        user: format!("user:{}", keycloak_user.id),
+        relation: Relation::Owner.as_str().to_string(),
+        object: Object::Tenant(tenant_id).to_string(),
+    };
+
+    // Chỉ cấp quyền sau khi SQL đã commit; outbox phục hồi nếu OpenFGA lỗi.
+    if let Err(err) = state
+        .authz_client
+        .write_tuples(vec![tenant_owner_tuple.clone()], Vec::new())
+        .await
+    {
+        error!(error = %err, tenant_id = %tenant_id, user_id = %keycloak_user.id, "Failed to write tenant owner to OpenFGA");
+
+        if let Err(outbox_err) = enqueue_tuple_write(&state.pool, &tenant_owner_tuple).await {
+            error!(
+                error = %outbox_err,
+                tenant_id = %tenant_id,
+                user_id = %keycloak_user.id,
+                "Failed to enqueue authz outbox recovery event for tenant owner"
+            );
+        }
+
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -381,36 +393,62 @@ pub async fn create_workspace(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
-    // Ghi quan hệ workspace-tenant vào OpenFGA: tenant:{tenant_id} - tenant - workspace:{workspace_id}
+    if let Err(err) = tx.commit().await {
+        error!(error = %err, "Failed to commit transaction");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    let workspace_tenant_tuple = TupleKey {
+        user: format!("tenant:{tenant_id}"),
+        relation: Relation::Tenant.as_str().to_string(),
+        object: Object::Workspace(workspace.id).to_string(),
+    };
+    let workspace_admin_tuple = TupleKey {
+        user: format!("user:{}", authz.user_id),
+        relation: Relation::Admin.as_str().to_string(),
+        object: Object::Workspace(workspace.id).to_string(),
+    };
+
+    let mut authz_write_failed = false;
+
+    // Hai grant chạy riêng sau commit để mỗi tuple có recovery độc lập.
     if let Err(err) = state
         .authz_client
-        .write_tuple(
-            &format!("tenant:{}", tenant_id),
-            Relation::Tenant,
-            &Object::Workspace(workspace.id),
-        )
+        .write_tuples(vec![workspace_tenant_tuple.clone()], Vec::new())
         .await
     {
         error!(error = %err, workspace_id = %workspace.id, "Failed to write workspace tenant to OpenFGA");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+
+        if let Err(outbox_err) = enqueue_tuple_write(&state.pool, &workspace_tenant_tuple).await {
+            error!(
+                error = %outbox_err,
+                tenant_id = %tenant_id,
+                workspace_id = %workspace.id,
+                "Failed to enqueue authz outbox recovery event for workspace tenant relation"
+            );
+        }
+        authz_write_failed = true;
     }
 
-    // Ghi quan hệ workspace admin vào OpenFGA cho Tenant Owner: user:{id} - admin - workspace:{workspace_id}
     if let Err(err) = state
         .authz_client
-        .write_tuple(
-            &format!("user:{}", authz.user_id),
-            Relation::Admin,
-            &Object::Workspace(workspace.id),
-        )
+        .write_tuples(vec![workspace_admin_tuple.clone()], Vec::new())
         .await
     {
         error!(error = %err, workspace_id = %workspace.id, "Failed to write workspace admin to OpenFGA");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+
+        if let Err(outbox_err) = enqueue_tuple_write(&state.pool, &workspace_admin_tuple).await {
+            error!(
+                error = %outbox_err,
+                workspace_id = %workspace.id,
+                user_id = %authz.user_id,
+                "Failed to enqueue authz outbox recovery event for workspace admin relation"
+            );
+        }
+        authz_write_failed = true;
     }
 
-    if let Err(err) = tx.commit().await {
-        error!(error = %err, "Failed to commit transaction");
+    if authz_write_failed {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 

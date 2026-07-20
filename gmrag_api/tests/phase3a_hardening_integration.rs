@@ -1,5 +1,6 @@
 mod support;
 
+use std::collections::HashSet;
 use std::process::Stdio;
 use std::sync::{Arc, OnceLock};
 
@@ -11,8 +12,10 @@ use uuid::Uuid;
 
 use gmrag_api::auth::authz::{AuthzClient, Object, Relation, TupleKey};
 use gmrag_api::auth::outbox::{
-    AuthzOutboxProcessorConfig, enqueue_tuple_delete, enqueue_tuple_write, process_authz_outbox,
+    AuthzOutboxProcessorConfig, enqueue_tuple_delete, enqueue_tuple_write,
+    enqueue_workspace_role_sync, process_authz_outbox,
 };
+use gmrag_api::auth::workspace_role::WorkspaceMemberRole;
 use gmrag_api::ingestion::embedding::DEFAULT_EMBEDDING_DIM;
 use gmrag_api::invite_cleanup::{
     InvitePlaceholderCleanupOptions, cleanup_invite_placeholders, find_invite_placeholders,
@@ -1793,6 +1796,536 @@ async fn qdrant_cleanup_force_allows_delete_attempt_on_live_workspace() {
         .ok();
 }
 
+#[tokio::test]
+async fn tenant_owner_grant_openfga_failure_commits_sql_and_enqueues_recovery() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+
+    let mock_fga_url = spawn_authz_mock(AuthzMockMode::CheckAllowWriteFail).await;
+    let store_id = std::env::var("OPENFGA_STORE_ID").unwrap_or_else(|_| "test-store".into());
+    let addr = spawn_app_with_authz(&pool, AuthzClient::new(mock_fga_url, store_id, None)).await;
+
+    let tenant_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(tenant_id)
+        .bind(format!("Phase3A owner grant {tenant_id}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let response = Client::new()
+        .post(format!("{addr}/tenants/{tenant_id}/owners"))
+        .bearer_auth(format!("phase3a-platform-admin-{}", Uuid::new_v4()))
+        .json(&json!({ "email": "verified-owner@test.com" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    let sql_owner_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM tenant_members WHERE tenant_id = $1 AND user_id = $2)",
+    )
+    .bind(tenant_id)
+    .bind("verified-keycloak-owner-uuid")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        sql_owner_exists,
+        "SQL owner row must commit before the OpenFGA grant"
+    );
+
+    let outbox: Option<(String, serde_json::Value)> = sqlx::query_as(
+        r#"
+        SELECT event_type, payload
+        FROM authz_outbox
+        WHERE status = 'PENDING'
+          AND event_type = 'tuple_write'
+          AND payload->>'user' = $1
+          AND payload->>'object' = $2
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#,
+    )
+    .bind("user:verified-keycloak-owner-uuid")
+    .bind(format!("tenant:{tenant_id}"))
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+
+    let Some((event_type, payload)) = outbox else {
+        panic!("expected tenant-owner tuple_write recovery after OpenFGA failure");
+    };
+    assert_eq!(event_type, "tuple_write");
+    assert_eq!(payload["relation"], json!("owner"));
+
+    sqlx::query("DELETE FROM authz_outbox WHERE payload->>'object' = $1")
+        .bind(format!("tenant:{tenant_id}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(tenant_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn workspace_creation_openfga_failure_commits_sql_and_enqueues_each_recovery() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+
+    let mock_fga_url = spawn_authz_mock(AuthzMockMode::CheckAllowWriteFail).await;
+    let store_id = std::env::var("OPENFGA_STORE_ID").unwrap_or_else(|_| "test-store".into());
+    let addr = spawn_app_with_authz(&pool, AuthzClient::new(mock_fga_url, store_id, None)).await;
+
+    let tenant_id = Uuid::new_v4();
+    let owner_user_id = format!("phase3a-workspace-owner-{}", Uuid::new_v4());
+    let workspace_name = format!("Phase3A workspace grant {tenant_id}");
+
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(tenant_id)
+        .bind(format!("Phase3A workspace tenant {tenant_id}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
+        .bind(&owner_user_id)
+        .bind(format!("{owner_user_id}@test.local"))
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let response = Client::new()
+        .post(format!("{addr}/tenants/{tenant_id}/workspaces"))
+        .bearer_auth(&owner_user_id)
+        .json(&json!({ "name": workspace_name }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    let workspace_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM workspaces WHERE tenant_id = $1 AND name = $2")
+            .bind(tenant_id)
+            .bind(&workspace_name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let sql_admin_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM workspace_members WHERE workspace_id = $1 AND user_id = $2 AND role = 'ADMIN')",
+    )
+    .bind(workspace_id)
+    .bind(&owner_user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        sql_admin_exists,
+        "SQL workspace and admin row must commit before the OpenFGA grants"
+    );
+
+    let outbox: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        r#"
+        SELECT event_type, payload
+        FROM authz_outbox
+        WHERE status = 'PENDING'
+          AND event_type = 'tuple_write'
+          AND payload->>'object' = $1
+        ORDER BY payload->>'relation'
+        "#,
+    )
+    .bind(format!("workspace:{workspace_id}"))
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(outbox.len(), 2, "each failed tuple needs its own recovery");
+    assert!(
+        outbox
+            .iter()
+            .all(|(event_type, _)| event_type == "tuple_write")
+    );
+    assert!(outbox.iter().any(|(_, payload)| {
+        payload["user"] == json!(format!("tenant:{tenant_id}"))
+            && payload["relation"] == json!("tenant")
+    }));
+    assert!(outbox.iter().any(|(_, payload)| {
+        payload["user"] == json!(format!("user:{owner_user_id}"))
+            && payload["relation"] == json!("admin")
+    }));
+
+    sqlx::query("DELETE FROM authz_outbox WHERE payload->>'object' = $1")
+        .bind(format!("workspace:{workspace_id}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM workspaces WHERE id = $1")
+        .bind(workspace_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(tenant_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(&owner_user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn member_role_demote_commits_sql_fga_audit_and_processed_sync_event() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    let fixture =
+        bootstrap_member_role_fixture(&pool, WorkspaceMemberRole::Admin, RoleChangeFailure::None)
+            .await;
+
+    let response = patch_member_role(&fixture, "member").await;
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+
+    assert_role_change_sql_and_fga(
+        &pool,
+        &fixture,
+        WorkspaceMemberRole::Member,
+        Relation::Admin,
+    )
+    .await;
+    assert_eq!(count_member_role_audits(&pool, &fixture).await, 1);
+
+    let events = fetch_role_sync_events(&pool, &fixture).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, "PROCESSED");
+    assert_eq!(
+        events[0].1,
+        json!({
+            "workspace_id": fixture.workspace_id,
+            "user_id": fixture.target_user_id,
+        })
+    );
+
+    cleanup_member_role_fixture(&pool, &fixture).await;
+}
+
+#[tokio::test]
+async fn member_role_promote_commits_sql_fga_audit_and_processed_sync_event() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    let fixture =
+        bootstrap_member_role_fixture(&pool, WorkspaceMemberRole::Member, RoleChangeFailure::None)
+            .await;
+
+    let response = patch_member_role(&fixture, "admin").await;
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+
+    assert_role_change_sql_and_fga(
+        &pool,
+        &fixture,
+        WorkspaceMemberRole::Admin,
+        Relation::Member,
+    )
+    .await;
+    assert_eq!(count_member_role_audits(&pool, &fixture).await, 1);
+
+    let events = fetch_role_sync_events(&pool, &fixture).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, "PROCESSED");
+    assert_eq!(
+        events[0].1,
+        json!({
+            "workspace_id": fixture.workspace_id,
+            "user_id": fixture.target_user_id,
+        })
+    );
+
+    cleanup_member_role_fixture(&pool, &fixture).await;
+}
+
+#[tokio::test]
+async fn member_role_old_tuple_delete_failure_rolls_back_and_enqueues_pool_sync() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    let fixture = bootstrap_member_role_fixture(
+        &pool,
+        WorkspaceMemberRole::Member,
+        RoleChangeFailure::Delete,
+    )
+    .await;
+
+    let response = patch_member_role(&fixture, "admin").await;
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    let role: String = sqlx::query_scalar(
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(fixture.workspace_id)
+    .bind(&fixture.target_user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(role, WorkspaceMemberRole::Member.as_sql());
+    assert!(
+        fixture
+            .mock_state
+            .contains_role(
+                fixture.workspace_id,
+                &fixture.target_user_id,
+                Relation::Member,
+            )
+            .await
+    );
+    assert!(
+        !fixture
+            .mock_state
+            .contains_role(
+                fixture.workspace_id,
+                &fixture.target_user_id,
+                Relation::Admin,
+            )
+            .await,
+        "failed promotion must not create an elevated tuple"
+    );
+    assert_eq!(count_member_role_audits(&pool, &fixture).await, 0);
+
+    let events = fetch_role_sync_events(&pool, &fixture).await;
+    assert_eq!(events.len(), 1, "only the pool recovery event may survive");
+    assert_eq!(events[0].0, "PENDING");
+    assert_eq!(
+        events[0].1,
+        json!({
+            "workspace_id": fixture.workspace_id,
+            "user_id": fixture.target_user_id,
+        })
+    );
+
+    cleanup_member_role_fixture(&pool, &fixture).await;
+}
+
+#[tokio::test]
+async fn member_role_new_tuple_add_failure_keeps_commit_audit_and_pending_sync() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    let fixture =
+        bootstrap_member_role_fixture(&pool, WorkspaceMemberRole::Member, RoleChangeFailure::Write)
+            .await;
+
+    let response = patch_member_role(&fixture, "admin").await;
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    let role: String = sqlx::query_scalar(
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(fixture.workspace_id)
+    .bind(&fixture.target_user_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(role, WorkspaceMemberRole::Admin.as_sql());
+    assert!(
+        !fixture
+            .mock_state
+            .contains_role(
+                fixture.workspace_id,
+                &fixture.target_user_id,
+                Relation::Member,
+            )
+            .await,
+        "old member tuple must stay revoked after the committed promotion"
+    );
+    assert!(
+        !fixture
+            .mock_state
+            .contains_role(
+                fixture.workspace_id,
+                &fixture.target_user_id,
+                Relation::Admin,
+            )
+            .await
+    );
+    assert_eq!(count_member_role_audits(&pool, &fixture).await, 1);
+
+    let events = fetch_role_sync_events(&pool, &fixture).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, "PENDING");
+    assert_eq!(
+        events[0].1,
+        json!({
+            "workspace_id": fixture.workspace_id,
+            "user_id": fixture.target_user_id,
+        })
+    );
+
+    cleanup_member_role_fixture(&pool, &fixture).await;
+}
+
+#[tokio::test]
+async fn workspace_role_sync_processor_converges_duplicate_stale_events_to_sql_role() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    let fixture =
+        bootstrap_member_role_fixture(&pool, WorkspaceMemberRole::Admin, RoleChangeFailure::None)
+            .await;
+
+    let stale_event_id =
+        enqueue_workspace_role_sync(&pool, fixture.workspace_id, &fixture.target_user_id)
+            .await
+            .unwrap();
+
+    sqlx::query(
+        "UPDATE workspace_members SET role = 'MEMBER' WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(fixture.workspace_id)
+    .bind(&fixture.target_user_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let duplicate_event_id =
+        enqueue_workspace_role_sync(&pool, fixture.workspace_id, &fixture.target_user_id)
+            .await
+            .unwrap();
+
+    process_authz_outbox(
+        &pool,
+        &fixture.authz_client,
+        AuthzOutboxProcessorConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_role_change_sql_and_fga(
+        &pool,
+        &fixture,
+        WorkspaceMemberRole::Member,
+        Relation::Admin,
+    )
+    .await;
+    assert_outbox_events_processed(&pool, &[stale_event_id, duplicate_event_id]).await;
+
+    let already_consistent_event_id =
+        enqueue_workspace_role_sync(&pool, fixture.workspace_id, &fixture.target_user_id)
+            .await
+            .unwrap();
+    process_authz_outbox(
+        &pool,
+        &fixture.authz_client,
+        AuthzOutboxProcessorConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_role_change_sql_and_fga(
+        &pool,
+        &fixture,
+        WorkspaceMemberRole::Member,
+        Relation::Admin,
+    )
+    .await;
+    assert_outbox_events_processed(&pool, &[already_consistent_event_id]).await;
+
+    cleanup_member_role_fixture(&pool, &fixture).await;
+}
+
+#[tokio::test]
+async fn workspace_role_sync_processor_deletes_both_roles_when_membership_is_absent() {
+    let _guard = phase3a_test_lock().lock().await;
+    init_test_env();
+    let pool = setup_pool().await;
+    let fixture =
+        bootstrap_member_role_fixture(&pool, WorkspaceMemberRole::Admin, RoleChangeFailure::None)
+            .await;
+
+    fixture
+        .mock_state
+        .insert_role(
+            fixture.workspace_id,
+            &fixture.target_user_id,
+            Relation::Member,
+        )
+        .await;
+    sqlx::query("DELETE FROM workspace_members WHERE workspace_id = $1 AND user_id = $2")
+        .bind(fixture.workspace_id)
+        .bind(&fixture.target_user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let event_id =
+        enqueue_workspace_role_sync(&pool, fixture.workspace_id, &fixture.target_user_id)
+            .await
+            .unwrap();
+    process_authz_outbox(
+        &pool,
+        &fixture.authz_client,
+        AuthzOutboxProcessorConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !fixture
+            .mock_state
+            .contains_role(
+                fixture.workspace_id,
+                &fixture.target_user_id,
+                Relation::Admin,
+            )
+            .await
+    );
+    assert!(
+        !fixture
+            .mock_state
+            .contains_role(
+                fixture.workspace_id,
+                &fixture.target_user_id,
+                Relation::Member,
+            )
+            .await
+    );
+    assert_outbox_events_processed(&pool, &[event_id]).await;
+
+    let duplicate_event_id =
+        enqueue_workspace_role_sync(&pool, fixture.workspace_id, &fixture.target_user_id)
+            .await
+            .unwrap();
+    process_authz_outbox(
+        &pool,
+        &fixture.authz_client,
+        AuthzOutboxProcessorConfig::default(),
+    )
+    .await
+    .unwrap();
+    assert_outbox_events_processed(&pool, &[duplicate_event_id]).await;
+
+    cleanup_member_role_fixture(&pool, &fixture).await;
+}
+
 /// OpenFGA revoke lỗi → SQL membership giữ nguyên, không trả 204.
 #[tokio::test]
 async fn remove_member_openfga_failure_leaves_sql_and_returns_error() {
@@ -2033,6 +2566,358 @@ async fn remove_member_sql_and_outbox_failure_still_returns_error() {
     .await;
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoleChangeFailure {
+    None,
+    Delete,
+    Write,
+}
+
+#[derive(Clone)]
+struct RoleChangeMockState {
+    tuples: Arc<Mutex<HashSet<TupleKey>>>,
+    failure: RoleChangeFailure,
+}
+
+impl RoleChangeMockState {
+    async fn contains_role(&self, workspace_id: Uuid, user_id: &str, relation: Relation) -> bool {
+        self.tuples
+            .lock()
+            .await
+            .contains(&workspace_role_tuple(workspace_id, user_id, relation))
+    }
+
+    async fn insert_role(&self, workspace_id: Uuid, user_id: &str, relation: Relation) {
+        self.tuples
+            .lock()
+            .await
+            .insert(workspace_role_tuple(workspace_id, user_id, relation));
+    }
+}
+
+struct MemberRoleFixture {
+    addr: String,
+    tenant_id: Uuid,
+    workspace_id: Uuid,
+    actor_user_id: String,
+    target_user_id: String,
+    authz_client: AuthzClient,
+    mock_state: RoleChangeMockState,
+}
+
+async fn bootstrap_member_role_fixture(
+    pool: &sqlx::PgPool,
+    initial_role: WorkspaceMemberRole,
+    failure: RoleChangeFailure,
+) -> MemberRoleFixture {
+    let tenant_id = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
+    let actor_user_id = format!("phase3a-role-owner-{}", Uuid::new_v4());
+    let target_user_id = format!("phase3a-role-target-{}", Uuid::new_v4());
+
+    let initial_tuples = HashSet::from([
+        workspace_role_tuple(workspace_id, &actor_user_id, Relation::Admin),
+        workspace_role_tuple(
+            workspace_id,
+            &target_user_id,
+            initial_role.as_fga_relation(),
+        ),
+    ]);
+    let (mock_fga_url, mock_state) = spawn_role_change_authz_mock(initial_tuples, failure).await;
+    let store_id = std::env::var("OPENFGA_STORE_ID").unwrap_or_else(|_| "test-store".into());
+    let authz_client = AuthzClient::new(mock_fga_url, store_id, None);
+    let addr = spawn_app_with_authz(pool, authz_client.clone()).await;
+
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(tenant_id)
+        .bind(format!("Phase3A role tenant {tenant_id}"))
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO workspaces (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(workspace_id)
+        .bind(tenant_id)
+        .bind(format!("Phase3A role workspace {workspace_id}"))
+        .execute(pool)
+        .await
+        .unwrap();
+
+    for user_id in [&actor_user_id, &target_user_id] {
+        sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(format!("{user_id}@test.local"))
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'ADMIN')",
+    )
+    .bind(workspace_id)
+    .bind(&actor_user_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, $3)")
+        .bind(workspace_id)
+        .bind(&target_user_id)
+        .bind(initial_role.as_sql())
+        .execute(pool)
+        .await
+        .unwrap();
+
+    MemberRoleFixture {
+        addr,
+        tenant_id,
+        workspace_id,
+        actor_user_id,
+        target_user_id,
+        authz_client,
+        mock_state,
+    }
+}
+
+async fn spawn_role_change_authz_mock(
+    initial_tuples: HashSet<TupleKey>,
+    failure: RoleChangeFailure,
+) -> (String, RoleChangeMockState) {
+    use axum::{Router, routing::post};
+
+    let state = RoleChangeMockState {
+        tuples: Arc::new(Mutex::new(initial_tuples)),
+        failure,
+    };
+    let router = Router::new()
+        .route("/stores/{store_id}/check", post(role_change_mock_check))
+        .route("/stores/{store_id}/write", post(role_change_mock_write))
+        .with_state(state.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    (format!("http://{addr}"), state)
+}
+
+async fn role_change_mock_check(
+    axum::extract::State(state): axum::extract::State<RoleChangeMockState>,
+    axum::Json(payload): axum::Json<serde_json::Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let tuple = payload
+        .get("tuple_key")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<TupleKey>(value).ok());
+    let Some(tuple) = tuple else {
+        return (axum::http::StatusCode::BAD_REQUEST, "invalid check payload").into_response();
+    };
+
+    let allowed = if tuple.relation == Relation::CanAssignRole.as_str() {
+        true
+    } else {
+        state.tuples.lock().await.contains(&tuple)
+    };
+
+    axum::Json(json!({ "allowed": allowed })).into_response()
+}
+
+async fn role_change_mock_write(
+    axum::extract::State(state): axum::extract::State<RoleChangeMockState>,
+    axum::Json(payload): axum::Json<serde_json::Value>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let Some(writes) = extract_mock_tuple_keys(&payload, "writes") else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid writes payload",
+        )
+            .into_response();
+    };
+    let Some(deletes) = extract_mock_tuple_keys(&payload, "deletes") else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "invalid deletes payload",
+        )
+            .into_response();
+    };
+
+    if state.failure == RoleChangeFailure::Delete && !deletes.is_empty() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "injected delete failure",
+        )
+            .into_response();
+    }
+    if state.failure == RoleChangeFailure::Write && !writes.is_empty() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "injected write failure",
+        )
+            .into_response();
+    }
+
+    let mut tuples = state.tuples.lock().await;
+    if writes.iter().any(|tuple| tuples.contains(tuple)) {
+        return (axum::http::StatusCode::BAD_REQUEST, "tuple already exists").into_response();
+    }
+    if deletes.iter().any(|tuple| !tuples.contains(tuple)) {
+        return (axum::http::StatusCode::BAD_REQUEST, "tuple does not exist").into_response();
+    }
+
+    for tuple in deletes {
+        tuples.remove(&tuple);
+    }
+    for tuple in writes {
+        tuples.insert(tuple);
+    }
+
+    axum::http::StatusCode::NO_CONTENT.into_response()
+}
+
+fn extract_mock_tuple_keys(payload: &serde_json::Value, operation: &str) -> Option<Vec<TupleKey>> {
+    let Some(operation_payload) = payload.get(operation) else {
+        return Some(Vec::new());
+    };
+
+    serde_json::from_value(operation_payload.get("tuple_keys")?.clone()).ok()
+}
+
+fn workspace_role_tuple(workspace_id: Uuid, user_id: &str, relation: Relation) -> TupleKey {
+    TupleKey {
+        user: format!("user:{user_id}"),
+        relation: relation.as_str().to_string(),
+        object: Object::Workspace(workspace_id).to_string(),
+    }
+}
+
+async fn patch_member_role(fixture: &MemberRoleFixture, role: &str) -> reqwest::Response {
+    Client::new()
+        .patch(format!(
+            "{}/workspaces/{}/members/{}",
+            fixture.addr, fixture.workspace_id, fixture.target_user_id
+        ))
+        .bearer_auth(&fixture.actor_user_id)
+        .json(&json!({ "role": role }))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn assert_role_change_sql_and_fga(
+    pool: &sqlx::PgPool,
+    fixture: &MemberRoleFixture,
+    expected_role: WorkspaceMemberRole,
+    opposite_relation: Relation,
+) {
+    let role: String = sqlx::query_scalar(
+        "SELECT role FROM workspace_members WHERE workspace_id = $1 AND user_id = $2",
+    )
+    .bind(fixture.workspace_id)
+    .bind(&fixture.target_user_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(role, expected_role.as_sql());
+    assert!(
+        fixture
+            .mock_state
+            .contains_role(
+                fixture.workspace_id,
+                &fixture.target_user_id,
+                expected_role.as_fga_relation(),
+            )
+            .await
+    );
+    assert!(
+        !fixture
+            .mock_state
+            .contains_role(
+                fixture.workspace_id,
+                &fixture.target_user_id,
+                opposite_relation,
+            )
+            .await
+    );
+}
+
+async fn count_member_role_audits(pool: &sqlx::PgPool, fixture: &MemberRoleFixture) -> i64 {
+    sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM audit_events
+        WHERE workspace_id = $1
+          AND event_type = 'member_role_changed'
+          AND target_id = $2
+        "#,
+    )
+    .bind(fixture.workspace_id)
+    .bind(&fixture.target_user_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn fetch_role_sync_events(
+    pool: &sqlx::PgPool,
+    fixture: &MemberRoleFixture,
+) -> Vec<(String, serde_json::Value)> {
+    sqlx::query_as(
+        r#"
+        SELECT status, payload
+        FROM authz_outbox
+        WHERE event_type = 'workspace_role_sync'
+          AND payload->>'workspace_id' = $1
+          AND payload->>'user_id' = $2
+        ORDER BY created_at ASC
+        "#,
+    )
+    .bind(fixture.workspace_id.to_string())
+    .bind(&fixture.target_user_id)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+async fn assert_outbox_events_processed(pool: &sqlx::PgPool, event_ids: &[Uuid]) {
+    for event_id in event_ids {
+        let status: String = sqlx::query_scalar("SELECT status FROM authz_outbox WHERE id = $1")
+            .bind(event_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "PROCESSED");
+    }
+}
+
+async fn cleanup_member_role_fixture(pool: &sqlx::PgPool, fixture: &MemberRoleFixture) {
+    let _ = sqlx::query("DELETE FROM authz_outbox WHERE payload->>'workspace_id' = $1")
+        .bind(fixture.workspace_id.to_string())
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM audit_events WHERE workspace_id = $1")
+        .bind(fixture.workspace_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM workspaces WHERE id = $1")
+        .bind(fixture.workspace_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM tenants WHERE id = $1")
+        .bind(fixture.tenant_id)
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM users WHERE id = $1 OR id = $2")
+        .bind(&fixture.actor_user_id)
+        .bind(&fixture.target_user_id)
+        .execute(pool)
+        .await;
+}
+
 #[derive(Clone, Copy)]
 enum AuthzMockMode {
     /// Check luôn allow; Write luôn fail (mô phỏng outage lúc revoke).
@@ -2072,6 +2957,27 @@ async fn spawn_authz_mock(mode: AuthzMockMode) -> String {
         axum::serve(listener, router).await.unwrap();
     });
     format!("http://{}", addr)
+}
+
+async fn spawn_app_with_authz(pool: &sqlx::PgPool, authz_client: AuthzClient) -> String {
+    let state = AppState {
+        pool: pool.clone(),
+        jwt: gmrag_api::auth::jwt::JwtValidator::from_env().unwrap(),
+        storage: setup_storage().await,
+        retrieval: gmrag_api::retrieval::RetrievalClient::from_env().unwrap(),
+        ingestion_limiter: Arc::new(Semaphore::new(0)),
+        authz_client,
+        keycloak_client: gmrag_api::auth::keycloak::KeycloakClient::from_env().unwrap(),
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, gmrag_api::app_router(state))
+            .await
+            .unwrap();
+    });
+    addr
 }
 
 async fn bootstrap_member_remove_fixture(
