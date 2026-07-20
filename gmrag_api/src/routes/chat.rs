@@ -76,6 +76,7 @@ pub struct ResolvedCitation {
     pub document_id: Uuid,
     pub document_name: String,
     pub snippet: String,
+    pub chunk_index: i32,
 }
 
 #[derive(sqlx::FromRow)]
@@ -84,6 +85,7 @@ struct CitationHydrationRow {
     document_id: Uuid,
     document_name: String,
     original_text: String,
+    chunk_index: i32,
 }
 
 /// Phân giải citation theo lô và loại bỏ im lặng các chunk không thể xem.
@@ -189,7 +191,8 @@ async fn hydrate_citations(
             dc.id AS chunk_id,
             dc.document_id,
             d.filename AS document_name,
-            dc.original_text
+            dc.original_text,
+            dc.chunk_index
         FROM document_chunks dc
         INNER JOIN documents d
             ON d.id = dc.document_id
@@ -224,6 +227,7 @@ async fn hydrate_citations(
             document_id: row.document_id,
             document_name: row.document_name,
             snippet: truncate_citation_snippet(&row.original_text),
+            chunk_index: row.chunk_index,
         })
         .collect())
 }

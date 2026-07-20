@@ -512,7 +512,7 @@ write metadata-only audit rows. See `docs/RUNBOOK.md` (OCR-004 section).
 - Auth: bearer JWT.
 - Authorization: `member` on `workspace:{workspace_id}`.
 - Request body: none.
-- Success: `200` with `{ content, chunks }`, where `chunks` is ordered by `chunk_index`.
+- Success: `200` with `{ content, chunks }`, where `chunks` is ordered by `chunk_index` and each item contains `{ chunk_index, text, id }`. `id` is the chunk UUID.
 - Errors: authz `403`; `404 RESOURCE_NOT_FOUND`; `409 CONFLICT` when the document is not `COMPLETED`; or `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: none.
 - Security notes: preview checks document-level ACL viewer permissions.
@@ -534,7 +534,7 @@ write metadata-only audit rows. See `docs/RUNBOOK.md` (OCR-004 section).
 - Auth: bearer JWT.
 - Authorization: `member` on `workspace:{workspace_id}`, then document-level viewer ACL for every requested chunk using the same check as the single-chunk route.
 - Request body: JSON `{ "chunk_ids": ["uuid", ...] }`. The input is capped at 64 items before duplicate removal. Duplicate ids keep their first request position.
-- Success: `200` with `{ citations: [{ chunk_id, document_id, document_name, snippet }] }` in deduplicated request order. `document_name` comes from `documents.filename`; `snippet` comes from `document_chunks.original_text`, is truncated server-side at a character-safe boundary near 280 characters, and ends with `…` when truncated. Empty input or an all-omitted result returns `{ "citations": [] }`.
+- Success: `200` with `{ citations: [{ chunk_id, document_id, document_name, snippet, chunk_index }] }` in deduplicated request order. `document_name` comes from `documents.filename`; `snippet` comes from `document_chunks.original_text`, is truncated server-side at a character-safe boundary near 280 characters, and ends with `…` when truncated; `chunk_index` is the cited chunk's stored position in the document. Empty input or an all-omitted result returns `{ "citations": [] }`.
 - Errors: malformed or oversized input returns `400 INVALID_REQUEST`; a non-member returns `403 FORBIDDEN`; authorization dependency or database failure returns `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: none.
 - Security notes: inaccessible, nonexistent, and wrong-workspace chunks are omitted silently with no placeholder. OpenFGA viewer decisions are authoritative and fail closed; the hydration join runs only over ACL-approved chunk ids.

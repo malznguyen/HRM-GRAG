@@ -65,6 +65,7 @@ pub struct UploadDocumentsResponse {
 pub struct PreviewChunkRow {
     pub chunk_index: i32,
     pub original_text: String,
+    pub id: Uuid,
 }
 
 #[derive(Serialize)]
@@ -77,6 +78,7 @@ pub struct DocumentPreviewResponse {
 pub struct PreviewChunkItem {
     pub chunk_index: i32,
     pub text: String,
+    pub id: Uuid,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -1135,7 +1137,7 @@ async fn fetch_document_preview(
 ) -> Result<DocumentPreviewResponse, sqlx::Error> {
     let rows: Vec<PreviewChunkRow> = sqlx::query_as(
         r#"
-        SELECT chunk_index, original_text
+        SELECT chunk_index, original_text, id
         FROM document_chunks
         WHERE workspace_id = $1 AND document_id = $2
         ORDER BY chunk_index ASC
@@ -1151,6 +1153,7 @@ async fn fetch_document_preview(
         .map(|row| PreviewChunkItem {
             chunk_index: row.chunk_index,
             text: row.original_text,
+            id: row.id,
         })
         .collect();
 
