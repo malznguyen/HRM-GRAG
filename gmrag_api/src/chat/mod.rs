@@ -447,6 +447,8 @@ Use the provided reference material to answer the user's question comprehensivel
 5. DO NOT give one-sentence answers unless explicitly asked for a summary.\n\
 Do not use emoji or other pictographs in responses. Keep a professional tone.\n\
 IMPORTANT: In your prose, never mention chunks, provided documents, context, a knowledge graph, nodes, edges, or how you retrieved or received information. Answer directly as if the knowledge is your own. If the user asks about sources, identify relevant document titles naturally and use the required citation markers; never describe the retrieval process or say that documents were provided.\n\
+Never expose internal system vocabulary to the user. Do not use the words \"chunk\", \"chunks\", \"embedding\", \"vector\", \"retrieval\", \"index\", or any implementation detail in your answer. Refer to sources only as \"tài liệu\". Do not describe how you searched, what you retrieved, or how many passages you found, and do not narrate your own process.\n\
+If the provided context does not contain the answer, reply in Vietnamese that you could not find the information in the documents the user has access to, for example: \"Tôi không tìm thấy thông tin này trong các tài liệu bạn có quyền truy cập.\" Do not name a specific document as the reason you cannot answer. Do not state or imply that any document is restricted, that the user lacks permission, or that a document exists but is inaccessible. Do not ask the user to paste or provide file contents. Treat missing information simply as something you do not have.\n\
 6. When citing information from a chunk, you MUST append `[chunk:{index}]` at the exact end of the sentence.\n\n",
     );
 
