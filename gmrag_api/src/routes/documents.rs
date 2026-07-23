@@ -1,8 +1,8 @@
 use axum::{
-    Json,
     extract::{Multipart, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
+    Json,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -11,20 +11,20 @@ use sqlx::PgPool;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event, insert_audit_event_tx};
-use crate::auth::authz::{ApiError, Authz, Object, Relation, delete_tuples_fga_first};
+use crate::audit::{insert_audit_event, insert_audit_event_tx, AuditEventRecord, AuditEventType};
+use crate::auth::authz::{delete_tuples_fga_first, ApiError, Authz, Object, Relation};
 use crate::auth::document_acl::{
-    DocumentAccessMode, DocumentAclError, DocumentPermissionsUpdateError, can_user_view_document,
-    collect_viewable_restricted_document_ids, ensure_document_workspace_relation,
-    grant_document_explicit_viewer, replace_document_permissions, revoke_document_explicit_viewer,
-    set_document_access_mode,
+    can_user_view_document, collect_viewable_restricted_document_ids,
+    ensure_document_workspace_relation, grant_document_explicit_viewer,
+    replace_document_permissions, revoke_document_explicit_viewer, set_document_access_mode,
+    DocumentAccessMode, DocumentAclError, DocumentPermissionsUpdateError,
 };
 use crate::auth::resource_cleanup::capture_document_delete_plan;
 use crate::document_directory::{
-    get_document_permissions, list_documents as list_document_directory,
+    get_document_permissions, list_documents as list_document_directory, DocumentDirectoryPage,
 };
-use crate::document_format::{DocumentFormat, document_max_upload_bytes};
-use crate::ingestion::jobs::{IngestionWorkerConfig, enqueue_job_tx, retry_failed_document};
+use crate::document_format::{document_max_upload_bytes, DocumentFormat};
+use crate::ingestion::jobs::{enqueue_job_tx, retry_failed_document, IngestionWorkerConfig};
 use crate::retrieval::outbox::enqueue_delete_by_document_tx;
 use crate::state::AppState;
 use crate::storage::build_original_document_object_key;
@@ -41,6 +41,18 @@ pub struct ListDocumentsQuery {
     offset: Option<i64>,
     q: Option<String>,
     status: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct WorkspaceDocumentCallerCapabilities {
+    pub can_manage_documents: bool,
+}
+
+#[derive(Serialize)]
+pub struct WorkspaceDocumentsResponse {
+    #[serde(flatten)]
+    pub page: DocumentDirectoryPage,
+    pub caller: WorkspaceDocumentCallerCapabilities,
 }
 
 #[derive(Deserialize)]
@@ -330,10 +342,8 @@ pub async fn list_documents(
     Path(workspace_id): Path<Uuid>,
     Query(params): Query<ListDocumentsQuery>,
 ) -> impl IntoResponse {
-    if let Err(err) = authz
-        .require_relation(Relation::Member, &Object::Workspace(workspace_id))
-        .await
-    {
+    let workspace = Object::Workspace(workspace_id);
+    if let Err(err) = authz.require_relation(Relation::Member, &workspace).await {
         return err.into_response();
     }
 
@@ -364,27 +374,47 @@ pub async fn list_documents(
         }
     };
 
-    let visible_restricted_ids =
-        match collect_viewable_restricted_document_ids(&state.authz_client, &authz.user_id).await {
-            Ok(ids) => ids.into_iter().collect::<Vec<_>>(),
-            Err(err) => {
-                error!(
-                    error = %err,
-                    user_id = %authz.user_id,
-                    workspace_id = %workspace_id,
-                    "Failed to apply document ACL while listing"
-                );
-                return match err {
-                    DocumentAclError::Authz(_) => ApiError::new(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "AUTHZ_ERROR",
-                        "Authorization service unavailable",
-                    )
-                    .into_response(),
-                    _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-                };
-            }
-        };
+    let (can_manage_documents, visible_restricted_ids) = tokio::join!(
+        authz.check(Relation::Admin, &workspace),
+        collect_viewable_restricted_document_ids(&state.authz_client, &authz.user_id),
+    );
+    let can_manage_documents = match can_manage_documents {
+        Ok(allowed) => allowed,
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                "Failed to resolve workspace document capabilities"
+            );
+            return ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "AUTHZ_ERROR",
+                "Authorization service unavailable",
+            )
+            .into_response();
+        }
+    };
+    let visible_restricted_ids = match visible_restricted_ids {
+        Ok(ids) => ids.into_iter().collect::<Vec<_>>(),
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                "Failed to apply document ACL while listing"
+            );
+            return match err {
+                DocumentAclError::Authz(_) => ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "AUTHZ_ERROR",
+                    "Authorization service unavailable",
+                )
+                .into_response(),
+                _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+        }
+    };
 
     match list_document_directory(
         &state.pool,
@@ -397,7 +427,13 @@ pub async fn list_documents(
     )
     .await
     {
-        Ok(page) => Json(page).into_response(),
+        Ok(page) => Json(WorkspaceDocumentsResponse {
+            page,
+            caller: WorkspaceDocumentCallerCapabilities {
+                can_manage_documents,
+            },
+        })
+        .into_response(),
         Err(err) => {
             error!(
                 error = %err,

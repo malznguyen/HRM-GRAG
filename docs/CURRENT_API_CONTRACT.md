@@ -1,20 +1,17 @@
 # Current API Contract
 
-This document reflects the routes registered by `gmrag_api/src/lib.rs` after Phase 4
-API consistency and defense-in-depth closure.
-Historical audit snapshots are archived under `docs/archive/v1/`.
+This document reflects the routes registered by `gmrag_api/src/lib.rs` and their
+current behavior.
 
-**As of Phase 4 source baseline:** `3c865ebaf542c5880b1a83462452ce206b4719bb`.
-
-Phase 3 adds operational endpoints for deployment/runtime observability:
+The API exposes operational endpoints for deployment/runtime observability:
 
 - `GET /ready` for dependency-aware readiness checks.
 - `GET /metrics` for Prometheus scrape output.
 
-Operator-only binaries (including `backfill-graph-node-embeddings`) are still
-documented in `docs/RUNBOOK.md`, not as HTTP routes.
+Operator-only binaries (including `backfill-graph-node-embeddings`) are not HTTP
+routes.
 
-Some existing write/delete endpoints now emit metadata-only audit events and may
+Some write/delete endpoints emit metadata-only audit events and may
 enqueue internal authz outbox recovery rows on non-blocking OpenFGA sync failures.
 These are internal side effects and do not change request/response contracts.
 
@@ -30,7 +27,7 @@ These are internal side effects and do not change request/response contracts.
 - Protected routes use `Authorization: Bearer <Keycloak access token>`.
 - The backend validates RS256 signature, issuer, audience, expiry, and non-empty subject through Keycloak JWKS.
 - Required invariant: JWT `sub` must equal Keycloak Admin `user.id` and is the canonical user id for SQL and OpenFGA.
-- **Phase 0A ✅ COMPLETE** evidence is two separate harnesses (see `docs/RUNBOOK.md` §0):
+- Two separate harnesses provide evidence for this invariant:
   - API identity E2E (`scripts/run-keycloak-identity-e2e.ps1`, local-test-only confidential `gmrag-e2e`) proves backend token validation, subject equality, SQL/OpenFGA consistency, role flows, and `/users/sync`.
   - Browser PKCE smoke (`scripts/run-keycloak-browser-smoke.ps1`, public `gmrag-frontend`) proves Authorization Code + PKCE end-user login/session/logout. API E2E does not prove browser PKCE.
 - Direct Grant is disabled for `gmrag-frontend` and must never be used by the browser or production user flow. A local-test-only confidential client may use it solely for backend API identity automation.
@@ -52,7 +49,7 @@ Current relation-to-error mapping for `403` responses:
 
 A `403` above means OpenFGA answered "not allowed". When the OpenFGA **dependency
 itself** fails — unreachable, error response, or **timeout** (the OpenFGA client has
-explicit short connect/request timeouts; see `docs/RUNBOOK.md`) — the request
+explicit short connect/request timeouts) — the request
 **fails closed** with `500` `AUTHZ_ERROR` (`{"error":{"code":"AUTHZ_ERROR","message":"Authorization service unavailable"}}`).
 An authz-dependency failure is **never** treated as "allow".
 
@@ -102,8 +99,8 @@ not use this envelope.
 ## Endpoint Inventory
 
 All endpoint-specific error bullets below define only the relevant HTTP status
-and stable domain code; the cross-cutting Phase 4 error contract applies to
-every application failure.
+and stable domain code; the cross-cutting error contract applies to every
+application failure.
 
 | Method | Path | Authorization |
 | --- | --- | --- |
@@ -182,8 +179,8 @@ every application failure.
 - Auth: bearer JWT.
 - Authorization: any authenticated user.
 - Request body: none.
-- Success: `200` with the current SQL user row plus a boolean platform-admin flag derived from OpenFGA.
-- Errors: `404 RESOURCE_NOT_FOUND`; `500 INTERNAL_ERROR`, both JSON envelopes.
+- Success: `200` with a JSON object containing only `id`, `email`, and `is_super_admin`; the platform-admin flag is derived from OpenFGA.
+- Errors: a failed SQL lookup returns `404 RESOURCE_NOT_FOUND`, not HTTP `500`; an OpenFGA failure resolves `is_super_admin` to `false` (fail-closed) rather than returning an error.
 - Side effects: none (invite reconciliation was removed from this path).
 - Security notes: platform-admin status is derived from OpenFGA, not a SQL column.
 
@@ -269,7 +266,7 @@ file, revokes matching OpenFGA tuples first, then commits the SQL cascade,
 audit event, `qdrant_outbox` and `storage_outbox` in one PostgreSQL transaction.
 Post-commit S3/Qdrant cleanup is best-effort; durable outboxes remain retryable.
 If SQL fails after FGA revoke, the command exits `3` and identifies the recovery
-file so the operator can retry deletion or restore tuples. See RUNBOOK §3.4.
+file so the operator can retry deletion or restore tuples.
 
 Evidence: `gmrag_api/src/tenant_cleanup.rs:373-428,649-706` and
 `gmrag_api/src/bin/delete-tenant.rs:109-158`.
@@ -344,7 +341,15 @@ Evidence: `gmrag_api/src/tenant_cleanup.rs:373-428,649-706` and
 - Request body: JSON `{ "role": "member|admin" }` only.
 - Success: `204` empty body. Idempotent if already that role.
 - Errors: `400 INVALID_MEMBER_ROLE`; authz `403`; `404 RESOURCE_NOT_FOUND`; `409 LAST_WORKSPACE_ADMIN`; or `500 INTERNAL_ERROR`, all JSON envelopes.
-- Side effects: serializes via workspace row lock (`FOR UPDATE`), reloads target role, last-admin guard on ADMIN→MEMBER, then updates SQL + swaps OpenFGA tuples before commit.
+- Side effects: serializes through a workspace row lock (`FOR UPDATE`), reloads
+  the target role, and applies the last-admin guard on ADMIN→MEMBER. It updates
+  the SQL role and inserts a `workspace_role_sync` recovery row inside the SQL
+  transaction, deletes the old OpenFGA tuple before committing SQL, then writes
+  the new OpenFGA tuple after commit. The old tuple is therefore deleted before
+  the new tuple is written. Evidence:
+  `gmrag_api/src/routes/members.rs:372-440`,
+  `gmrag_api/src/routes/members.rs:467-508`, and
+  `gmrag_api/src/auth/outbox.rs:281-302`.
 - Security notes: role changes are tenant-owner-only. Last-admin guard requires another verified workspace ADMIN (SQL + FGA) or a valid Tenant Owner (SQL OWNER + FGA owner on tenant).
 
 ### `DELETE /workspaces/{workspace_id}/members/{member_id}`
@@ -377,10 +382,10 @@ Evidence: `gmrag_api/src/tenant_cleanup.rs:373-428,649-706` and
 - Query parameters: optional `limit` (default `20`, range `0-100`), optional non-negative `offset` (default `0`), optional trimmed `q`, and optional exact `status` (`PROCESSING` | `COMPLETED` | `FAILED`).
 - Request body: none.
 - Search and pagination: `q` is a case-insensitive partial match on `filename`. Processing order is ACL visibility, then `q`/`status`, then `total`, then `created_at DESC, id DESC`, then `limit`/`offset`.
-- Success: `200` with `{ documents, total, limit, offset }`. Each document contains `id`, `filename`, `status`, `processing_stage`, optional `failure_code`/`failure_message`, `created_at`, nullable `size_bytes`, `access_mode`, `uploaded_by`, nullable `uploaded_by_email`, and nullable `content_type`.
-- Errors: `400 INVALID_REQUEST` for invalid pagination or status; authz `403`; `500 AUTHZ_ERROR` when OpenFGA visibility lookup fails; or `500 INTERNAL_ERROR`, all JSON envelopes.
+- Success: `200` with `{ documents, total, limit, offset, caller: { can_manage_documents } }`. `caller.can_manage_documents` is the caller's effective OpenFGA `admin` decision on the workspace. Each document contains `id`, `filename`, `status`, `processing_stage`, optional `failure_code`/`failure_message`, `created_at`, nullable `size_bytes`, `access_mode`, `uploaded_by`, nullable `uploaded_by_email`, and nullable `content_type`.
+- Errors: `400 INVALID_REQUEST` for invalid pagination or status; authz `403`; `500 AUTHZ_ERROR` when either the OpenFGA document-management capability check or visibility lookup fails; or `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: none.
-- Security notes: `workspace_default` documents are visible to workspace members; `restricted` documents require explicit or bypass viewer access. OpenFGA supplies the restricted-document candidate set before SQL search/count/pagination, so `total` never reveals hidden restricted documents. Authz dependency failures are fail-closed. Storage internals (`object_key`, `bucket`, `checksum_sha256`, `storage_etag`) are not exposed.
+- Security notes: `workspace_default` documents are visible to workspace members; `restricted` documents require explicit or bypass viewer access. OpenFGA supplies the restricted-document candidate set before SQL search/count/pagination, so `total` never reveals hidden restricted documents. `caller.can_manage_documents` is an advisory UI signal only; every management handler still enforces `admin` independently. `false` means OpenFGA explicitly denied `admin`; dependency failures return `500 AUTHZ_ERROR`. Storage internals (`object_key`, `bucket`, `checksum_sha256`, `storage_etag`) are not exposed.
 
 ### `POST /workspaces/{workspace_id}/documents/upload`
 
@@ -449,12 +454,13 @@ unavailable, avoiding futile claim loops.
 `GET /workspaces/{workspace_id}/documents` already surfaces optional
 `failure_code` / `failure_message` on each row; no API schema change is required.
 
-OCR-004 corpus audit is an **operator binary**
-(`audit-ocr-affected-documents`), not a public REST endpoint. Dry-run is the
-default and is fully read-only (no SQL mutation including no `audit_events`, no
-object/Qdrant writes). `--apply` is refused while production OCR capability is
-closed so operators do not enqueue futile jobs; refused/completed apply may
-write metadata-only audit rows. See `docs/RUNBOOK.md` (OCR-004 section).
+Corpus audit is provided by the **operator binary**
+`audit-ocr-affected-documents`, not a public REST endpoint (OCR-004). Dry-run is
+the default and is fully read-only (no SQL mutation including no `audit_events`,
+no object/Qdrant writes). Production OCR is not available at runtime, and the
+fallback returns no text, so `--apply` is refused to prevent operators from
+enqueueing futile jobs; refused or successful apply attempts may write
+metadata-only audit rows.
 
 ### `PATCH /workspaces/{workspace_id}/documents/{document_id}/access-mode`
 
@@ -610,12 +616,12 @@ Current SSE events:
 
 - Security notes: graph nodes and edges are filtered to only return sources the user has document-level ACL access to.
 
-## Phase 4 visibility policy
+## Visibility Policy
 
 | Boundary | Unauthorized behavior |
 | --- | --- |
-| Workspace membership | `403` envelope theo workspace boundary contract. |
-| Restricted document, preview, chunk, citation | `404 RESOURCE_NOT_FOUND`, giống resource không tồn tại. |
-| Document list, graph, retrieval, chat citations | Omit resource; không placeholder. |
-| Chat session không thuộc caller | Không phân biệt session của người khác với session không tồn tại khi helper ownership trả hidden result. |
-| Admin mutation | Check OpenFGA workspace relation trước resource mutation; deny không tạo SQL/FGA/outbox side effect. |
+| Workspace membership | `403` envelope according to the workspace boundary contract. |
+| Restricted document, preview, chunk, citation | `404 RESOURCE_NOT_FOUND`, identical to a resource that does not exist. |
+| Document list, graph, retrieval, chat citations | Omit the resource; do not return a placeholder. |
+| Chat session not owned by the caller | Do not distinguish another caller's session from a nonexistent session when the ownership helper returns a hidden result. |
+| Admin mutation | Check the OpenFGA workspace relation before mutating the resource; denial creates no SQL, OpenFGA, or outbox side effect. |

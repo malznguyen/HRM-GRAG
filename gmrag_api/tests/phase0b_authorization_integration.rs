@@ -323,6 +323,34 @@ async fn get_members_returns_openfga_caller_capabilities() {
 }
 
 #[tokio::test]
+async fn documents_capability_lookup_failure_returns_authz_error() {
+    let _guard = phase0b_lock().await.lock().await;
+    init_test_env();
+    let mock_url = spawn_authz_mock(AuthzMockMode::DocumentCapabilityFail).await;
+    let store_id = std::env::var("OPENFGA_STORE_ID").unwrap_or_else(|_| "test-store".into());
+    let fx = Fixture::bootstrap_sql_only(AuthzClient::new(mock_url, store_id, None)).await;
+
+    let response = Client::new()
+        .get(format!(
+            "{}/workspaces/{}/documents",
+            fx.addr, fx.workspace_id
+        ))
+        .bearer_auth(&fx.member_id)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR
+    );
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "AUTHZ_ERROR");
+
+    fx.cleanup().await;
+}
+
+#[tokio::test]
 async fn acl001_ws_admin_add_member_ok_admin_denied_no_side_effect() {
     let _guard = phase0b_lock().await.lock().await;
     init_test_env();
@@ -373,12 +401,10 @@ async fn acl001_ws_admin_add_member_ok_admin_denied_no_side_effect() {
     assert_eq!(deny.status(), reqwest::StatusCode::FORBIDDEN);
     let body: serde_json::Value = deny.json().await.unwrap();
     assert_eq!(body["error"]["code"], "ROLE_ASSIGNMENT_DENIED");
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("tenant owners")
-    );
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("tenant owners"));
 
     let after_users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = $1")
         .bind(target_id)
@@ -839,11 +865,9 @@ async fn acl005_workspace_list_intersects_fga() {
         .unwrap();
     assert_eq!(list_ok.status(), reqwest::StatusCode::OK);
     let workspaces: Vec<serde_json::Value> = list_ok.json().await.unwrap();
-    assert!(
-        workspaces
-            .iter()
-            .any(|w| w["id"] == fx.workspace_id.to_string())
-    );
+    assert!(workspaces
+        .iter()
+        .any(|w| w["id"] == fx.workspace_id.to_string()));
 
     // Tenant owner (no SQL workspace_members) → listed via FGA inheritance
     let list_owner = client
@@ -854,11 +878,9 @@ async fn acl005_workspace_list_intersects_fga() {
         .unwrap();
     assert_eq!(list_owner.status(), reqwest::StatusCode::OK);
     let owner_ws: Vec<serde_json::Value> = list_owner.json().await.unwrap();
-    assert!(
-        owner_ws
-            .iter()
-            .any(|w| w["id"] == fx.workspace_id.to_string())
-    );
+    assert!(owner_ws
+        .iter()
+        .any(|w| w["id"] == fx.workspace_id.to_string()));
 
     // WS Admin → listed
     let list_admin = client
@@ -869,11 +891,9 @@ async fn acl005_workspace_list_intersects_fga() {
         .unwrap();
     assert_eq!(list_admin.status(), reqwest::StatusCode::OK);
     let admin_ws: Vec<serde_json::Value> = list_admin.json().await.unwrap();
-    assert!(
-        admin_ws
-            .iter()
-            .any(|w| w["id"] == fx.workspace_id.to_string())
-    );
+    assert!(admin_ws
+        .iter()
+        .any(|w| w["id"] == fx.workspace_id.to_string()));
 
     // Stale SQL membership: revoke FGA member, keep SQL row → not listed
     authz
@@ -1273,20 +1293,42 @@ async fn acl006_share_target_requires_sql_and_fga() {
 #[derive(Clone, Copy)]
 enum AuthzMockMode {
     CheckFail,
+    DocumentCapabilityFail,
 }
 
 async fn spawn_authz_mock(mode: AuthzMockMode) -> String {
     use axum::http::StatusCode as AxumStatus;
     use axum::response::IntoResponse;
-    use axum::{Router, routing::post};
+    use axum::{routing::post, Json, Router};
 
     let router = Router::new()
         .route(
             "/stores/{store_id}/check",
+            post(move |Json(body): Json<serde_json::Value>| async move {
+                match mode {
+                    AuthzMockMode::CheckFail => {
+                        (AxumStatus::SERVICE_UNAVAILABLE, "openfga down").into_response()
+                    }
+                    AuthzMockMode::DocumentCapabilityFail
+                        if body["tuple_key"]["relation"] == "admin" =>
+                    {
+                        (AxumStatus::SERVICE_UNAVAILABLE, "admin check failed").into_response()
+                    }
+                    AuthzMockMode::DocumentCapabilityFail => {
+                        Json(json!({ "allowed": true })).into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/stores/{store_id}/list-objects",
             post(move || async move {
                 match mode {
                     AuthzMockMode::CheckFail => {
                         (AxumStatus::SERVICE_UNAVAILABLE, "openfga down").into_response()
+                    }
+                    AuthzMockMode::DocumentCapabilityFail => {
+                        Json(json!({ "objects": [] })).into_response()
                     }
                 }
             }),
@@ -1295,7 +1337,7 @@ async fn spawn_authz_mock(mode: AuthzMockMode) -> String {
             "/stores/{store_id}/write",
             post(move || async move {
                 match mode {
-                    AuthzMockMode::CheckFail => {
+                    AuthzMockMode::CheckFail | AuthzMockMode::DocumentCapabilityFail => {
                         (AxumStatus::SERVICE_UNAVAILABLE, "openfga unavailable").into_response()
                     }
                 }

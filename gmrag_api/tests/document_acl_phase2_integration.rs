@@ -3,14 +3,14 @@ mod support;
 use std::sync::{Arc, OnceLock};
 
 use axum::{
-    Json, Router,
     extract::{Path, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::{post, put},
+    Json, Router,
 };
 use reqwest::Client;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
@@ -18,7 +18,7 @@ use uuid::Uuid;
 use gmrag_api::auth::authz::{Object, Relation};
 use gmrag_api::auth::document_acl::backfill_document_workspace_relations;
 use gmrag_api::ingestion::embedding::DEFAULT_EMBEDDING_DIM;
-use gmrag_api::ingestion::graph::{GraphElement, GraphWriteBatch, bulk_upsert_graph};
+use gmrag_api::ingestion::graph::{bulk_upsert_graph, GraphElement, GraphWriteBatch};
 use gmrag_api::state::AppState;
 
 const EMBEDDING_DIM: usize = DEFAULT_EMBEDDING_DIM;
@@ -600,12 +600,10 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
     let long_snippet_prefix = long_snippet.strip_suffix('…').unwrap();
     assert!(long_snippet.chars().count() <= 281);
     assert!(long_vietnamese_text.starts_with(long_snippet_prefix));
-    assert!(
-        !long_snippet_prefix
-            .chars()
-            .last()
-            .is_some_and(char::is_whitespace)
-    );
+    assert!(!long_snippet_prefix
+        .chars()
+        .last()
+        .is_some_and(char::is_whitespace));
     assert_eq!(member_citations[1]["chunk_id"], public_chunk_id.to_string());
     assert_eq!(
         member_citations[1]["document_id"],
@@ -747,11 +745,9 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         "public graph edge description"
     );
     assert!(!member_graph_json.to_string().contains("restricted graph"));
-    assert!(
-        !member_graph_json
-            .to_string()
-            .contains("restricted_only_relation")
-    );
+    assert!(!member_graph_json
+        .to_string()
+        .contains("restricted_only_relation"));
 
     let viewer_graph = client
         .get(format!("{}/workspaces/{workspace_id}/graph", server.addr))
@@ -1548,6 +1544,19 @@ async fn documents_list_fields_search_pagination_and_acl_total() {
         .unwrap();
 
     let client = Client::new();
+    let admin_response = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents",
+            server.addr
+        ))
+        .bearer_auth(&admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(admin_response.status(), reqwest::StatusCode::OK);
+    let admin_body: Value = admin_response.json().await.unwrap();
+    assert_eq!(admin_body["caller"]["can_manage_documents"], json!(true));
+
     let member_response = client
         .get(format!(
             "{}/workspaces/{workspace_id}/documents",
@@ -1562,6 +1571,7 @@ async fn documents_list_fields_search_pagination_and_acl_total() {
     assert_eq!(member_body["total"], json!(2));
     assert_eq!(member_body["limit"], json!(20));
     assert_eq!(member_body["offset"], json!(0));
+    assert_eq!(member_body["caller"]["can_manage_documents"], json!(false));
     assert_eq!(member_body["documents"].as_array().unwrap().len(), 2);
     let public_row = member_body["documents"]
         .as_array()
@@ -1586,6 +1596,28 @@ async fn documents_list_fields_search_pagination_and_acl_total() {
         .find(|row| row["id"] == public_failed.to_string())
         .unwrap();
     assert!(failed_row["uploaded_by_email"].is_null());
+
+    let member_retry = client
+        .post(format!(
+            "{}/workspaces/{workspace_id}/documents/{public_failed}/retry",
+            server.addr
+        ))
+        .bearer_auth(&member)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(member_retry.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let member_delete = client
+        .delete(format!(
+            "{}/workspaces/{workspace_id}/documents/{public_alpha}",
+            server.addr
+        ))
+        .bearer_auth(&member)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(member_delete.status(), reqwest::StatusCode::FORBIDDEN);
 
     let viewer_response = client
         .get(format!(
