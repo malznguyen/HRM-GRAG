@@ -54,3 +54,6 @@ docs/generated/
 # Operator recovery snapshots emitted by delete-tenant / cleanup-authz-orphans (never commit)
 authz-orphan-recovery-*.json
 tenant-delete-recovery-*.json
+
+# Keycloak H2 data backups (docker cp of /opt/keycloak/data; local recovery only, never commit)
+keycloak-data-backup-*/
