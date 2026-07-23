@@ -95,10 +95,24 @@ pub async fn stream_chat_completion(
     Err(DeepseekStreamError::UpstreamStatus { status })
 }
 
+/// Provider-side generation metadata captured off the stream for observability.
+/// Metadata-only: no prompt, chunk, answer, or reasoning text — only identifiers
+/// and a count of reasoning deltas. Logged, never persisted or surfaced (Stage 1a).
+#[derive(Debug, Default, Clone)]
+pub struct StreamMetadata {
+    pub model: Option<String>,
+    pub system_fingerprint: Option<String>,
+    pub finish_reason: Option<String>,
+    /// Number of streamed deltas carrying `reasoning_content`. >0 means the
+    /// provider served the request in thinking mode; 0 means non-thinking.
+    pub reasoning_delta_count: u32,
+}
+
 pub struct DeepseekTokenParser {
     line_buffer: String,
     pending_tokens: Vec<String>,
     done: bool,
+    metadata: StreamMetadata,
 }
 
 impl DeepseekTokenParser {
@@ -107,7 +121,13 @@ impl DeepseekTokenParser {
             line_buffer: String::new(),
             pending_tokens: Vec::new(),
             done: false,
+            metadata: StreamMetadata::default(),
         }
+    }
+
+    /// Provider-returned generation metadata accumulated so far.
+    pub fn metadata(&self) -> &StreamMetadata {
+        &self.metadata
     }
 
     pub fn push_chunk(&mut self, chunk: &str) {
@@ -147,7 +167,20 @@ impl DeepseekTokenParser {
             return;
         };
 
+        if self.metadata.model.is_none() {
+            self.metadata.model = parsed.model;
+        }
+        if self.metadata.system_fingerprint.is_none() {
+            self.metadata.system_fingerprint = parsed.system_fingerprint;
+        }
+
         for choice in parsed.choices {
+            if choice.finish_reason.is_some() {
+                self.metadata.finish_reason = choice.finish_reason;
+            }
+            if choice.delta.reasoning_content.is_some() {
+                self.metadata.reasoning_delta_count += 1;
+            }
             if let Some(content) = choice.delta.content {
                 if !content.is_empty() {
                     self.pending_tokens.push(content);
@@ -202,17 +235,28 @@ struct DeepseekApiMessage<'a> {
 
 #[derive(Debug, Deserialize)]
 struct DeepseekStreamChunk {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    system_fingerprint: Option<String>,
     choices: Vec<DeepseekStreamChoice>,
 }
 
 #[derive(Debug, Deserialize)]
 struct DeepseekStreamChoice {
     delta: DeepseekStreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct DeepseekStreamDelta {
     content: Option<String>,
+    // Present only while the model is in thinking mode; absent when thinking is
+    // disabled. Captured as a metadata-only signal (count of reasoning deltas),
+    // never surfaced or persisted — see StreamMetadata.
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug)]
@@ -258,6 +302,7 @@ mod tests {
     fn deepseek_test_lock() -> &'static Mutex<()> {
         DEEPSEEK_TEST_LOCK.get_or_init(|| Mutex::new(()))
     }
+
 
     #[tokio::test]
     async fn request_timeout_fails_when_upstream_hangs_before_headers() {

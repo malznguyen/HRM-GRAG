@@ -539,6 +539,25 @@ pub async fn workspace_chat(
             }
         }
 
+        // Stage 1a observability: log provider-returned generation metadata only.
+        // No prompt/chunk/answer/reasoning text and no credentials are logged;
+        // reasoning_deltas is a count (>0 = served in thinking mode).
+        let generation_metadata = parser.metadata();
+        tracing::info!(
+            %session_id,
+            provider_model = generation_metadata.model.as_deref().unwrap_or("(none)"),
+            system_fingerprint = generation_metadata
+                .system_fingerprint
+                .as_deref()
+                .unwrap_or("(none)"),
+            finish_reason = generation_metadata
+                .finish_reason
+                .as_deref()
+                .unwrap_or("(none)"),
+            reasoning_deltas = generation_metadata.reasoning_delta_count,
+            "DeepSeek chat generation metadata"
+        );
+
         if !assistant_buffer.is_empty() {
             let (content, citations) =
                 resolve_chunk_index_citations(&assistant_buffer, &chunk_ids);
