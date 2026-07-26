@@ -3,7 +3,7 @@ services:
   postgres:
     image: pgvector/pgvector:pg16
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-gmrag_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
@@ -15,7 +15,7 @@ services:
   openfga-postgres:
     image: postgres:16
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     environment:
       POSTGRES_USER: ${OPENFGA_DB_USER:-fga_user}
       POSTGRES_PASSWORD: ${OPENFGA_DB_PASSWORD:-fga_password}
@@ -44,12 +44,18 @@ services:
     image: openfga/openfga:v1.5.0
     command: run
     ports:
-      - "8081:8080" # Map cổng 8081 trên host để tránh xung đột với cổng 8080 của API backend GMRAG
-      - "8082:8081" # Cổng gRPC
+      - "127.0.0.1:8081:8080" # Map cổng 8081 trên host để tránh xung đột với cổng 8080 của API backend GMRAG
+      - "127.0.0.1:8082:8081" # Cổng gRPC
     environment:
       - OPENFGA_DATASTORE_ENGINE=postgres
       - OPENFGA_DATASTORE_URI=postgres://fga_user:fga_password@openfga-postgres:5432/openfga?sslmode=disable
-      - OPENFGA_PLAYGROUND_ENABLED=true
+      # OpenFGA là gốc tin cậy của toàn hệ thống: ai gọi được API này là ghi thẳng
+      # tuple, tự cấp admin trên mọi workspace. Bắt buộc preshared token.
+      - OPENFGA_AUTHN_METHOD=preshared
+      - OPENFGA_AUTHN_PRESHARED_KEYS=${OPENFGA_API_TOKEN}
+      # Playground chỉ chạy được khi authn=none, bật kèm preshared thì container
+      # từ chối start. Tắt có chủ đích, không phải quên.
+      - OPENFGA_PLAYGROUND_ENABLED=false
     depends_on:
       openfga-migrate:
         condition: service_completed_successfully
@@ -59,8 +65,8 @@ services:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
@@ -90,7 +96,7 @@ services:
   qdrant:
     image: qdrant/qdrant:v1.18.2
     ports:
-      - "6333:6333"
+      - "127.0.0.1:6333:6333"
     volumes:
       - ./.docker_data/qdrant:/qdrant/storage
 
@@ -105,7 +111,7 @@ services:
               count: all
               capabilities: [gpu]
     ports:
-      - "11434:11434"
+      - "127.0.0.1:11434:11434"
     volumes:
       - ./.docker_data/ollama:/root/.ollama
       - ./docker/ollama:/models:ro
@@ -122,7 +128,7 @@ services:
     image: quay.io/keycloak/keycloak:26.6.4
     command: ["start-dev", "--import-realm"]
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
@@ -197,6 +203,7 @@ services:
       OPENFGA_API_URL: http://openfga:8080
       OPENFGA_STORE_ID: ${OPENFGA_STORE_ID:-}
       OPENFGA_MODEL_ID: ${OPENFGA_MODEL_ID:-}
+      OPENFGA_API_TOKEN: ${OPENFGA_API_TOKEN:-}
       AUTHZ_OUTBOX_BATCH_SIZE: ${AUTHZ_OUTBOX_BATCH_SIZE:-50}
       AUTHZ_OUTBOX_MAX_RETRIES: ${AUTHZ_OUTBOX_MAX_RETRIES:-5}
       AUTHZ_OUTBOX_POLL_INTERVAL_SECS: ${AUTHZ_OUTBOX_POLL_INTERVAL_SECS:-30}
