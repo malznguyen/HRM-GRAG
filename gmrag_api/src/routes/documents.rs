@@ -1,9 +1,10 @@
 use axum::{
+    Json,
     extract::{Multipart, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
 };
+use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -11,20 +12,20 @@ use sqlx::PgPool;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::audit::{insert_audit_event, insert_audit_event_tx, AuditEventRecord, AuditEventType};
-use crate::auth::authz::{delete_tuples_fga_first, ApiError, Authz, Object, Relation};
+use crate::audit::{AuditEventRecord, AuditEventType, insert_audit_event, insert_audit_event_tx};
+use crate::auth::authz::{ApiError, Authz, Object, Relation, delete_tuples_fga_first};
 use crate::auth::document_acl::{
-    can_user_view_document, collect_viewable_restricted_document_ids,
-    ensure_document_workspace_relation, grant_document_explicit_viewer,
-    replace_document_permissions, revoke_document_explicit_viewer, set_document_access_mode,
-    DocumentAccessMode, DocumentAclError, DocumentPermissionsUpdateError,
+    DocumentAccessMode, DocumentAclError, DocumentPermissionsUpdateError, can_user_view_document,
+    collect_viewable_restricted_document_ids, ensure_document_workspace_relation,
+    grant_document_explicit_viewer, replace_document_permissions, revoke_document_explicit_viewer,
+    set_document_access_mode,
 };
 use crate::auth::resource_cleanup::capture_document_delete_plan;
 use crate::document_directory::{
-    get_document_permissions, list_documents as list_document_directory, DocumentDirectoryPage,
+    DocumentDirectoryPage, get_document_permissions, list_documents as list_document_directory,
 };
-use crate::document_format::{document_max_upload_bytes, DocumentFormat};
-use crate::ingestion::jobs::{enqueue_job_tx, retry_failed_document, IngestionWorkerConfig};
+use crate::document_format::{DocumentFormat, document_max_upload_bytes};
+use crate::ingestion::jobs::{IngestionWorkerConfig, enqueue_job_tx, retry_failed_document};
 use crate::retrieval::outbox::enqueue_delete_by_document_tx;
 use crate::state::AppState;
 use crate::storage::build_original_document_object_key;
@@ -84,6 +85,20 @@ pub struct PreviewChunkRow {
 pub struct DocumentPreviewResponse {
     pub content: String,
     pub chunks: Vec<PreviewChunkItem>,
+    pub document: PreviewDocumentMeta,
+}
+
+/// Metadata đủ để trình xem hiển thị tiêu đề và chọn renderer mà không phải dò lại
+/// danh sách tài liệu (danh sách bị chặn 100 bản ghi mỗi lần gọi).
+#[derive(Serialize)]
+pub struct PreviewDocumentMeta {
+    pub id: Uuid,
+    pub filename: String,
+    pub content_type: Option<String>,
+    pub created_at: NaiveDateTime,
+    pub size_bytes: Option<i64>,
+    pub access_mode: String,
+    pub status: String,
 }
 
 #[derive(Serialize)]
@@ -116,6 +131,10 @@ struct RetryDocumentRow {
 struct PreviewDocumentTarget {
     status: String,
     access_mode: String,
+    filename: String,
+    content_type: Option<String>,
+    created_at: NaiveDateTime,
+    size_bytes: Option<i64>,
 }
 
 pub async fn get_document_chunk(
@@ -230,7 +249,7 @@ pub async fn get_document_preview(
 
     let preview_target: Result<Option<PreviewDocumentTarget>, sqlx::Error> = sqlx::query_as(
         r#"
-        SELECT status, access_mode
+        SELECT status, access_mode, filename, content_type, created_at, size_bytes
         FROM documents
         WHERE id = $1 AND workspace_id = $2
         "#,
@@ -296,7 +315,17 @@ pub async fn get_document_preview(
         return StatusCode::CONFLICT.into_response();
     }
 
-    match fetch_document_preview(&state.pool, workspace_id, document_id).await {
+    let document_meta = PreviewDocumentMeta {
+        id: document_id,
+        filename: preview_target.filename,
+        content_type: preview_target.content_type,
+        created_at: preview_target.created_at,
+        size_bytes: preview_target.size_bytes,
+        access_mode: preview_target.access_mode,
+        status: preview_target.status,
+    };
+
+    match fetch_document_preview(&state.pool, workspace_id, document_id, document_meta).await {
         Ok(preview) => Json(preview).into_response(),
         Err(err) => {
             error!(
@@ -1170,6 +1199,7 @@ async fn fetch_document_preview(
     pool: &PgPool,
     workspace_id: Uuid,
     document_id: Uuid,
+    document: PreviewDocumentMeta,
 ) -> Result<DocumentPreviewResponse, sqlx::Error> {
     let rows: Vec<PreviewChunkRow> = sqlx::query_as(
         r#"
@@ -1199,7 +1229,11 @@ async fn fetch_document_preview(
         .collect::<Vec<_>>()
         .join("\n\n");
 
-    Ok(DocumentPreviewResponse { content, chunks })
+    Ok(DocumentPreviewResponse {
+        content,
+        chunks,
+        document,
+    })
 }
 
 pub async fn upload_document(

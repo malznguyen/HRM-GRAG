@@ -518,7 +518,7 @@ metadata-only audit rows.
 - Auth: bearer JWT.
 - Authorization: `member` on `workspace:{workspace_id}`.
 - Request body: none.
-- Success: `200` with `{ content, chunks }`, where `chunks` is ordered by `chunk_index` and each item contains `{ chunk_index, text, id }`. `id` is the chunk UUID.
+- Success: `200` with `{ content, chunks, document }`. `chunks` is ordered by `chunk_index` and each item contains `{ chunk_index, text, id }`, where `id` is the chunk UUID. `document` carries the metadata the viewer needs without a second call: `{ id, filename, content_type, created_at, size_bytes, access_mode, status }` (`content_type` and `size_bytes` may be `null`; `status` is always `COMPLETED` here because other states return `409`).
 - Errors: authz `403`; `404 RESOURCE_NOT_FOUND`; `409 CONFLICT` when the document is not `COMPLETED`; or `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: none.
 - Security notes: preview checks document-level ACL viewer permissions.
