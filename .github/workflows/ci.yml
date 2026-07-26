@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  api:
+    name: gmrag_api
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gmrag_api
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            gmrag_api/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('gmrag_api/Cargo.lock') }}
+      - run: cargo fmt --check
+      # TODO: tighten to `-- -D warnings` once the backlog is cleared. Measured at
+      # 54 lints / 0 errors on 2026-07-26 (25x needless_borrow, 12x collapsible_if,
+      # 3x redundant_closure, rest one-offs) — all style-level, none correctness.
+      # Reported here without failing the build so the count can only go down.
+      - run: cargo clippy --all-targets
+      - run: cargo build --locked
+      # Docker-free tier only. The 5 infra-dependent lib tests are #[ignore]d and
+      # run via scripts/run-isolated-integration-tests.ps1 against a provisioned stack.
+      - run: cargo test --lib
+
+  ui:
+    name: gmrag_ui
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gmrag_ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: gmrag_ui/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck

@@ -107,6 +107,30 @@ document, checks retrieval content, and prints `Local ingestion smoke: PASS`.
 Sources: `scripts/p0-bringup-migrate.ps1:54-60`,
 `scripts/run-local-ingestion-smoke.ps1:15-29,222-261`.
 
+## Fast verification (no Docker required)
+
+These checks need no running stack and complete in seconds. Run them before
+pushing — CI (`.github/workflows/ci.yml`) runs exactly this set.
+
+```powershell
+Set-Location .\gmrag_api
+cargo fmt --check
+cargo clippy --all-targets
+cargo test --lib          # ~2s; 5 infra-dependent tests are #[ignore]d
+
+Set-Location ..\gmrag_ui
+npm run lint
+npm run typecheck
+```
+
+The full integration suite requires a provisioned isolated environment — run it
+with `.\scripts\run-isolated-integration-tests.ps1` after `docker compose up -d`.
+The five ignored unit tests belong to that tier and run there via
+`cargo test --lib -- --ignored`.
+
+Sources: `rust-toolchain.toml`, `.github/workflows/ci.yml`,
+`scripts/run-isolated-integration-tests.ps1`.
+
 ## Mandatory pre-deploy ordering
 
 Run the `backfill-document-workspace-tuples` binary before enabling strict
