@@ -11,6 +11,7 @@ pub mod invite;
 pub mod invite_cleanup;
 pub mod outbox;
 pub mod rate_limit;
+pub mod retention_report;
 pub mod retrieval;
 pub mod routes;
 pub mod shutdown;
