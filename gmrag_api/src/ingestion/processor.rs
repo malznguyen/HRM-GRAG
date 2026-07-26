@@ -789,6 +789,7 @@ mod race_guard_tests {
 
     /// Fix High #4: sau khi document bị xoá, race guard phải thấy `exists=false`.
     #[tokio::test]
+    #[ignore = "cần external test environment; chạy qua scripts/run-isolated-integration-tests.ps1"]
     async fn document_still_exists_false_after_delete() {
         dotenvy::dotenv().ok();
         let database_url = crate::test_isolation::database_url().expect("DATABASE_URL must be set");
@@ -945,6 +946,7 @@ mod reingestion_idempotency_tests {
     }
 
     #[tokio::test]
+    #[ignore = "cần external test environment; chạy qua scripts/run-isolated-integration-tests.ps1"]
     async fn reprocessing_same_document_does_not_duplicate_outputs() {
         dotenvy::dotenv().ok();
         let database_url = crate::test_isolation::database_url().expect("DATABASE_URL must be set");

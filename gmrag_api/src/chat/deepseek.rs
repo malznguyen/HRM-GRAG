@@ -303,7 +303,6 @@ mod tests {
         DEEPSEEK_TEST_LOCK.get_or_init(|| Mutex::new(()))
     }
 
-
     #[tokio::test]
     async fn request_timeout_fails_when_upstream_hangs_before_headers() {
         let _guard = deepseek_test_lock().lock().await;

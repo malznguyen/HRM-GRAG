@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::{
@@ -14,10 +15,11 @@ use axum::{
 use chrono::NaiveDateTime;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::api_error::ApiError;
-use crate::auth::authz::{Authz, Object, Relation};
+use crate::auth::authz::{Authz, AuthzClient, Object, Relation};
 use crate::chat::deepseek::{DeepseekTokenParser, deepseek_stream_idle_timeout, next_stream_token};
 use crate::chat::retrieval::{StoredChatMessage, fetch_session_chat_messages};
 use crate::chat::{
@@ -425,6 +427,86 @@ pub async fn workspace_chat_history(
     }
 }
 
+/// Đảm bảo assistant message được persist ở cả hai đường: stream chạy xong bình thường
+/// và client ngắt kết nối giữa chừng.
+///
+/// Khi client disconnect, axum drop SSE body -> generator bị drop ngay tại `yield`, nên
+/// mọi code đặt sau vòng lặp stream sẽ không bao giờ chạy. `Drop` thì luôn chạy, đúng
+/// một lần, ở cả hai đường — nên persistence phải nằm ở đây.
+struct PersistAssistantOnDrop {
+    buffer: Arc<Mutex<String>>,
+    chunk_ids: Vec<Uuid>,
+    pool: PgPool,
+    authz_client: AuthzClient,
+    workspace_id: Uuid,
+    user_id: String,
+    session_id: Uuid,
+}
+
+impl Drop for PersistAssistantOnDrop {
+    fn drop(&mut self) {
+        let assistant_text = match self.buffer.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+
+        if assistant_text.is_empty() {
+            return;
+        }
+
+        let (content, citations) = resolve_chunk_index_citations(&assistant_text, &self.chunk_ids);
+
+        let pool = self.pool.clone();
+        let authz_client = self.authz_client.clone();
+        let workspace_id = self.workspace_id;
+        let user_id = self.user_id.clone();
+        let session_id = self.session_id;
+
+        // Drop không async: cần Handle để spawn. Ngoài runtime thì bỏ qua, không panic.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(
+                %session_id,
+                "No tokio runtime available while persisting assistant message"
+            );
+            return;
+        };
+
+        handle.spawn(async move {
+            let filtered = filter_citations_for_user(
+                &pool,
+                &authz_client,
+                workspace_id,
+                &user_id,
+                &content,
+                &citations,
+            )
+            .await;
+
+            let (content, citations) = match filtered {
+                Ok(value) => value,
+                Err(err) => {
+                    tracing::error!(
+                        %session_id,
+                        error = %err,
+                        "Failed to re-check citations before persisting assistant message"
+                    );
+                    return;
+                }
+            };
+
+            if let Err(err) =
+                insert_chat_message(&pool, session_id, "assistant", &content, &citations).await
+            {
+                tracing::error!(
+                    %session_id,
+                    error = %err,
+                    "Failed to persist assistant chat message"
+                );
+            }
+        });
+    }
+}
+
 pub async fn workspace_chat(
     State(state): State<AppState>,
     authz: Authz,
@@ -521,12 +603,26 @@ pub async fn workspace_chat(
     let event_stream = async_stream::stream! {
         let mut byte_stream = byte_stream;
         let mut parser = DeepseekTokenParser::new();
-        let mut assistant_buffer = String::new();
+        let assistant_buffer = Arc::new(Mutex::new(String::new()));
+
+        // Tên binding quan trọng: `let _ = ...` sẽ drop ngay lập tức, persist một
+        // message rỗng rồi không bao giờ chạy lại nữa.
+        let _persist_guard = PersistAssistantOnDrop {
+            buffer: Arc::clone(&assistant_buffer),
+            chunk_ids,
+            pool,
+            authz_client,
+            workspace_id: workspace_id_for_acl,
+            user_id: user_id_for_acl,
+            session_id,
+        };
 
         while let Some(token_result) = next_stream_token(&mut byte_stream, &mut parser, idle_timeout).await {
             match token_result {
                 Ok(token) => {
-                    assistant_buffer.push_str(&token);
+                    if let Ok(mut buffer) = assistant_buffer.lock() {
+                        buffer.push_str(&token);
+                    }
                     yield Ok::<Event, Infallible>(Event::default().data(token));
                 }
                 Err(err) => {
@@ -558,49 +654,8 @@ pub async fn workspace_chat(
             "DeepSeek chat generation metadata"
         );
 
-        if !assistant_buffer.is_empty() {
-            let (content, citations) =
-                resolve_chunk_index_citations(&assistant_buffer, &chunk_ids);
-            tokio::spawn(async move {
-                let filtered = filter_citations_for_user(
-                    &pool,
-                    &authz_client,
-                    workspace_id_for_acl,
-                    &user_id_for_acl,
-                    &content,
-                    &citations,
-                )
-                .await;
-
-                let (content, citations) = match filtered {
-                    Ok(value) => value,
-                    Err(err) => {
-                        tracing::error!(
-                            %session_id,
-                            error = %err,
-                            "Failed to re-check citations before persisting assistant message"
-                        );
-                        return;
-                    }
-                };
-
-                if let Err(err) = insert_chat_message(
-                    &pool,
-                    session_id,
-                    "assistant",
-                    &content,
-                    &citations,
-                )
-                .await
-                {
-                    tracing::error!(
-                        %session_id,
-                        error = %err,
-                        "Failed to persist assistant chat message"
-                    );
-                }
-            });
-        }
+        // Persistence nằm trong Drop của `_persist_guard` (xem PersistAssistantOnDrop):
+        // đặt ở đây thì đường client-disconnect không bao giờ chạy tới.
 
         yield Ok::<Event, Infallible>(
             Event::default().event("done").data(session_id.to_string()),
@@ -667,4 +722,52 @@ fn chat_pipeline_error_response(err: ChatPipelineError) -> axum::response::Respo
     };
 
     (status, message).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use futures::StreamExt;
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Bảo vệ giả định của `PersistAssistantOnDrop`: generator bị drop giữa chừng
+    /// (client disconnect) vẫn chạy `Drop` của giá trị nó sở hữu.
+    #[tokio::test]
+    async fn guard_owned_by_stream_drops_when_stream_is_abandoned_midway() {
+        let fired = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&fired);
+
+        // Box::pin để test thực sự SỞ HỮU generator. `futures::pin_mut!` chỉ tạo
+        // Pin<&mut _>, nên `drop()` lên nó chỉ bỏ một mutable reference — generator
+        // vẫn sống tới hết scope và test sẽ fail nhầm, che mất thứ cần đo.
+        let mut stream = Box::pin(async_stream::stream! {
+            let _guard = DropFlag(flag);
+            for value in 0..10u8 {
+                yield value;
+            }
+        });
+
+        // Chỉ đọc 1 item rồi bỏ stream — mô phỏng client ngắt kết nối giữa chừng.
+        let first = stream.next().await;
+        assert_eq!(first, Some(0));
+        assert!(
+            !fired.load(Ordering::SeqCst),
+            "guard must still be alive mid-stream"
+        );
+
+        drop(stream);
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "Drop phải chạy khi generator bị huỷ giữa chừng — nếu fail, cơ chế persist đã hỏng"
+        );
+    }
 }

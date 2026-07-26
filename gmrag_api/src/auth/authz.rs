@@ -135,6 +135,7 @@ pub struct AuthzClient {
     api_url: String,
     store_id: String,
     model_id: Option<String>,
+    api_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -206,12 +207,28 @@ impl AuthzClient {
             "OPENFGA_REQUEST_TIMEOUT_SECS",
             DEFAULT_OPENFGA_REQUEST_TIMEOUT_SECS,
         );
+        // Đọc token ngay trong `new` thay vì thêm tham số: giữ nguyên chữ ký cho
+        // mọi caller hiện có. Chuỗi rỗng coi như không cấu hình.
+        let api_token = std::env::var("OPENFGA_API_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+
         Self {
             client: super::build_auth_http_client(connect_timeout_secs, request_timeout_secs),
             api_url,
             store_id,
             model_id,
+            api_token,
         }
+    }
+
+    /// Gắn preshared token cho outbound OpenFGA khi `OPENFGA_API_TOKEN` được cấu hình.
+    /// Không cấu hình thì request đi nguyên trạng — giữ tương thích với setup local cũ.
+    fn with_auth_header(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if let Some(token) = &self.api_token {
+            return request.bearer_auth(token);
+        }
+        request
     }
 
     pub fn from_env() -> Result<Self, &'static str> {
@@ -240,7 +257,10 @@ impl AuthzClient {
             },
         };
 
-        let response = self.client.post(&url).json(&payload).send().await?;
+        let response = self
+            .with_auth_header(self.client.post(&url).json(&payload))
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -304,7 +324,10 @@ impl AuthzClient {
             deletes: deletes_payload,
         };
 
-        let response = self.client.post(&url).json(&payload).send().await?;
+        let response = self
+            .with_auth_header(self.client.post(&url).json(&payload))
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -329,7 +352,10 @@ impl AuthzClient {
             user: user.to_string(),
         };
 
-        let response = self.client.post(&url).json(&payload).send().await?;
+        let response = self
+            .with_auth_header(self.client.post(&url).json(&payload))
+            .send()
+            .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -358,7 +384,10 @@ impl AuthzClient {
                 );
             }
 
-            let response = self.client.post(&url).json(&body).send().await?;
+            let response = self
+                .with_auth_header(self.client.post(&url).json(&body))
+                .send()
+                .await?;
             if !response.status().is_success() {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
@@ -618,7 +647,55 @@ mod tests {
             api_url: spawn_blackhole_openfga(),
             store_id: "test-store".to_string(),
             model_id: None,
+            api_token: None,
         }
+    }
+
+    /// Client tối thiểu chỉ để test `with_auth_header`; không gửi request thật.
+    fn client_with_token(api_token: Option<&str>) -> AuthzClient {
+        AuthzClient {
+            client: reqwest::Client::new(),
+            api_url: "http://127.0.0.1".to_string(),
+            store_id: "test-store".to_string(),
+            model_id: None,
+            api_token: api_token.map(str::to_string),
+        }
+    }
+
+    /// Không cấu hình token thì request phải đi nguyên trạng — đây là thứ giữ cho
+    /// setup local cũ (OpenFGA authn=none) tiếp tục chạy sau thay đổi này.
+    #[test]
+    fn with_auth_header_is_noop_when_token_absent() {
+        let authz = client_with_token(None);
+        let request = authz
+            .with_auth_header(authz.client.post("http://127.0.0.1/"))
+            .build()
+            .expect("build request");
+
+        assert!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .is_none(),
+            "không cấu hình OPENFGA_API_TOKEN thì không được gắn Authorization header"
+        );
+    }
+
+    /// Có token thì mọi outbound OpenFGA phải mang bearer — thiếu ở bất kỳ site nào
+    /// sẽ thành 401 chỉ trên đúng một thao tác, rất khó truy.
+    #[test]
+    fn with_auth_header_sets_bearer_when_token_present() {
+        let authz = client_with_token(Some("test-token"));
+        let request = authz
+            .with_auth_header(authz.client.post("http://127.0.0.1/"))
+            .build()
+            .expect("build request");
+
+        let header = request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .expect("phải có Authorization header khi token được cấu hình");
+        assert_eq!(header, "Bearer test-token");
     }
 
     #[tokio::test]

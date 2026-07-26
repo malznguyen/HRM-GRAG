@@ -1136,6 +1136,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "cần external test environment; chạy qua scripts/run-isolated-integration-tests.ps1"]
     async fn delete_points_by_document_is_idempotent_when_no_matching_points() {
         dotenvy::dotenv().ok();
         let client = RetrievalClient::from_config(live_test_config());
@@ -1180,6 +1181,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "cần external test environment; chạy qua scripts/run-isolated-integration-tests.ps1"]
     async fn delete_points_by_workspace_is_idempotent_and_removes_all_workspace_points() {
         dotenvy::dotenv().ok();
         let client = RetrievalClient::from_config(live_test_config());
@@ -1251,6 +1253,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "cần external test environment; chạy qua scripts/run-isolated-integration-tests.ps1"]
     async fn delete_points_by_workspaces_is_idempotent_and_removes_tenant_workspace_points() {
         // Mô phỏng tenant cleanup: xoá points của nhiều workspace thuộc cùng tenant
         // trong một filter `match.any`, không đụng workspace ngoài danh sách.

@@ -401,10 +401,12 @@ async fn acl001_ws_admin_add_member_ok_admin_denied_no_side_effect() {
     assert_eq!(deny.status(), reqwest::StatusCode::FORBIDDEN);
     let body: serde_json::Value = deny.json().await.unwrap();
     assert_eq!(body["error"]["code"], "ROLE_ASSIGNMENT_DENIED");
-    assert!(body["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("tenant owners"));
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("tenant owners")
+    );
 
     let after_users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = $1")
         .bind(target_id)
@@ -865,9 +867,11 @@ async fn acl005_workspace_list_intersects_fga() {
         .unwrap();
     assert_eq!(list_ok.status(), reqwest::StatusCode::OK);
     let workspaces: Vec<serde_json::Value> = list_ok.json().await.unwrap();
-    assert!(workspaces
-        .iter()
-        .any(|w| w["id"] == fx.workspace_id.to_string()));
+    assert!(
+        workspaces
+            .iter()
+            .any(|w| w["id"] == fx.workspace_id.to_string())
+    );
 
     // Tenant owner (no SQL workspace_members) → listed via FGA inheritance
     let list_owner = client
@@ -878,9 +882,11 @@ async fn acl005_workspace_list_intersects_fga() {
         .unwrap();
     assert_eq!(list_owner.status(), reqwest::StatusCode::OK);
     let owner_ws: Vec<serde_json::Value> = list_owner.json().await.unwrap();
-    assert!(owner_ws
-        .iter()
-        .any(|w| w["id"] == fx.workspace_id.to_string()));
+    assert!(
+        owner_ws
+            .iter()
+            .any(|w| w["id"] == fx.workspace_id.to_string())
+    );
 
     // WS Admin → listed
     let list_admin = client
@@ -891,9 +897,11 @@ async fn acl005_workspace_list_intersects_fga() {
         .unwrap();
     assert_eq!(list_admin.status(), reqwest::StatusCode::OK);
     let admin_ws: Vec<serde_json::Value> = list_admin.json().await.unwrap();
-    assert!(admin_ws
-        .iter()
-        .any(|w| w["id"] == fx.workspace_id.to_string()));
+    assert!(
+        admin_ws
+            .iter()
+            .any(|w| w["id"] == fx.workspace_id.to_string())
+    );
 
     // Stale SQL membership: revoke FGA member, keep SQL row → not listed
     authz
@@ -1299,7 +1307,7 @@ enum AuthzMockMode {
 async fn spawn_authz_mock(mode: AuthzMockMode) -> String {
     use axum::http::StatusCode as AxumStatus;
     use axum::response::IntoResponse;
-    use axum::{routing::post, Json, Router};
+    use axum::{Json, Router, routing::post};
 
     let router = Router::new()
         .route(

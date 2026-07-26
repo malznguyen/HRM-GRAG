@@ -3,14 +3,14 @@ mod support;
 use std::sync::{Arc, OnceLock};
 
 use axum::{
+    Json, Router,
     extract::{Path, State},
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     response::IntoResponse,
     routing::{post, put},
-    Json, Router,
 };
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
@@ -18,7 +18,7 @@ use uuid::Uuid;
 use gmrag_api::auth::authz::{Object, Relation};
 use gmrag_api::auth::document_acl::backfill_document_workspace_relations;
 use gmrag_api::ingestion::embedding::DEFAULT_EMBEDDING_DIM;
-use gmrag_api::ingestion::graph::{bulk_upsert_graph, GraphElement, GraphWriteBatch};
+use gmrag_api::ingestion::graph::{GraphElement, GraphWriteBatch, bulk_upsert_graph};
 use gmrag_api::state::AppState;
 
 const EMBEDDING_DIM: usize = DEFAULT_EMBEDDING_DIM;
@@ -390,6 +390,22 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         .await
         .unwrap();
     assert_eq!(legacy_preview.status(), reqwest::StatusCode::OK);
+    // Preview mang theo metadata tài liệu để trình xem không phải dò lại danh sách.
+    let legacy_preview_body: Value = legacy_preview.json().await.unwrap();
+    assert_eq!(
+        legacy_preview_body["document"]["id"],
+        legacy_public_doc_id.to_string()
+    );
+    assert_eq!(
+        legacy_preview_body["document"]["filename"],
+        "legacy-public-doc.pdf"
+    );
+    assert_eq!(
+        legacy_preview_body["document"]["access_mode"],
+        "workspace_default"
+    );
+    assert_eq!(legacy_preview_body["document"]["status"], "COMPLETED");
+    assert!(legacy_preview_body["document"]["created_at"].is_string());
 
     let legacy_chunk = client
         .get(format!(
@@ -490,6 +506,12 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         .await
         .unwrap();
     assert_eq!(viewer_preview.status(), reqwest::StatusCode::OK);
+    let viewer_preview_body: Value = viewer_preview.json().await.unwrap();
+    assert_eq!(
+        viewer_preview_body["document"]["filename"],
+        "restricted-doc.pdf"
+    );
+    assert_eq!(viewer_preview_body["document"]["access_mode"], "restricted");
 
     let owner_preview = client
         .get(format!(
@@ -600,10 +622,12 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
     let long_snippet_prefix = long_snippet.strip_suffix('…').unwrap();
     assert!(long_snippet.chars().count() <= 281);
     assert!(long_vietnamese_text.starts_with(long_snippet_prefix));
-    assert!(!long_snippet_prefix
-        .chars()
-        .last()
-        .is_some_and(char::is_whitespace));
+    assert!(
+        !long_snippet_prefix
+            .chars()
+            .last()
+            .is_some_and(char::is_whitespace)
+    );
     assert_eq!(member_citations[1]["chunk_id"], public_chunk_id.to_string());
     assert_eq!(
         member_citations[1]["document_id"],
@@ -745,9 +769,11 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         "public graph edge description"
     );
     assert!(!member_graph_json.to_string().contains("restricted graph"));
-    assert!(!member_graph_json
-        .to_string()
-        .contains("restricted_only_relation"));
+    assert!(
+        !member_graph_json
+            .to_string()
+            .contains("restricted_only_relation")
+    );
 
     let viewer_graph = client
         .get(format!("{}/workspaces/{workspace_id}/graph", server.addr))
