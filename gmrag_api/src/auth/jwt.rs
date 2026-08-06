@@ -370,6 +370,7 @@ fn required_http_url(name: &'static str) -> Result<String, JwtError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use jsonwebtoken::{EncodingKey, Header, encode};
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -411,6 +412,12 @@ mod tests {
             &EncodingKey::from_secret(secret),
         )
         .expect("token encoding")
+    }
+
+    fn none_token(claims: serde_json::Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("claims JSON"));
+        format!("{header}.{payload}.")
     }
 
     #[tokio::test]
@@ -491,7 +498,9 @@ mod tests {
             "userid": "employee-1",
             "sub": "untrusted-sub",
             "iss": "restaurant-access",
-            "exp": now_seconds() + 3600
+            "exp": now_seconds() + 3600,
+            "role": "EMPLOYEE",
+            "permissions": ["CHATBOT_USE", "DOCUMENT_READ"]
         });
         let missing_claims = json!({
             "sub": "employee-1",
@@ -499,20 +508,47 @@ mod tests {
             "exp": now_seconds() + 3600
         });
 
-        assert_eq!(
-            validator
-                .validate(&token(Algorithm::HS512, secret, valid_claims))
-                .await
-                .expect("userid claim")
-                .sub,
-            "employee-1"
-        );
+        let claims = validator
+            .validate(&token(Algorithm::HS512, secret, valid_claims))
+            .await
+            .expect("userid claim");
+        assert_eq!(claims.sub, "employee-1");
+        assert_eq!(claims.role.as_deref(), Some("EMPLOYEE"));
+        assert_eq!(claims.permissions, ["CHATBOT_USE", "DOCUMENT_READ"]);
         assert_eq!(
             validator
                 .validate(&token(Algorithm::HS512, secret, missing_claims))
                 .await,
             Err(JwtError::InvalidToken)
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_none_header_and_invalid_hrm_roles() {
+        let secret = b"phase2-test-secret";
+        let validator = hs512_validator_with_subject(secret, false, "userid");
+        let claims = json!({
+            "userid": "employee-1",
+            "iss": "restaurant-access",
+            "exp": now_seconds() + 3600
+        });
+
+        assert_eq!(
+            validator.validate(&none_token(claims.clone())).await,
+            Err(JwtError::InvalidToken)
+        );
+
+        for role in [Some(json!("ADMIN")), Some(json!("")), Some(json!(42)), None] {
+            let mut role_claims = claims.clone();
+            if let Some(role) = role {
+                role_claims["role"] = role;
+            }
+            let parsed = validator
+                .validate(&token(Algorithm::HS512, secret, role_claims))
+                .await
+                .expect("signature and standard claims are valid");
+            assert!(crate::auth::hrm::HrmConfig::role_relation(parsed.role.as_deref()).is_err());
+        }
     }
 
     #[test]

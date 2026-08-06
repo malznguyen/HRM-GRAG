@@ -72,6 +72,12 @@ pub enum HrmProvisionError {
     Authz(AuthzError),
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TupleSyncPlan {
+    pub writes: Vec<TupleKey>,
+    pub deletes: Vec<TupleKey>,
+}
+
 impl fmt::Display for HrmProvisionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -156,15 +162,13 @@ pub async fn provision_identity(
         .await
         .map_err(HrmProvisionError::Database)?;
 
-    let user = format!("user:{}", claims.sub);
-    let object = Object::Workspace(config.workspace_id);
-    let desired_tuple = tuple_key(&user, desired_relation, &object);
     let other_relation = match desired_relation {
         Relation::Member => Relation::Admin,
         Relation::Admin => Relation::Member,
         _ => unreachable!("HRM role relation is restricted to member/admin"),
     };
-    let other_tuple = tuple_key(&user, other_relation, &object);
+    let user = format!("user:{}", claims.sub);
+    let object = Object::Workspace(config.workspace_id);
 
     let desired_present = authz
         .check_fga(&user, desired_relation, &object)
@@ -175,16 +179,40 @@ pub async fn provision_identity(
         .await
         .map_err(HrmProvisionError::Authz)?;
 
-    let writes = (!desired_present).then_some(vec![desired_tuple]).unwrap_or_default();
-    let deletes = other_present.then_some(vec![other_tuple]).unwrap_or_default();
-    if !writes.is_empty() || !deletes.is_empty() {
+    let plan = plan_tuple_sync(
+        &user,
+        &object,
+        desired_relation,
+        other_relation,
+        desired_present,
+        other_present,
+    );
+    if !plan.writes.is_empty() || !plan.deletes.is_empty() {
         authz
-            .write_tuples(writes, deletes)
+            .write_tuples(plan.writes, plan.deletes)
             .await
             .map_err(HrmProvisionError::Authz)?;
     }
 
     Ok(())
+}
+
+pub fn plan_tuple_sync(
+    user: &str,
+    object: &Object,
+    desired_relation: Relation,
+    other_relation: Relation,
+    desired_present: bool,
+    other_present: bool,
+) -> TupleSyncPlan {
+    TupleSyncPlan {
+        writes: (!desired_present)
+            .then_some(vec![tuple_key(user, desired_relation, object)])
+            .unwrap_or_default(),
+        deletes: other_present
+            .then_some(vec![tuple_key(user, other_relation, object)])
+            .unwrap_or_default(),
+    }
 }
 
 fn tuple_key(user: &str, relation: Relation, object: &Object) -> TupleKey {
@@ -299,5 +327,53 @@ mod tests {
 
         claims.permissions.push("CHATBOT_USE".to_string());
         assert!(has_chatbot_permission(&claims));
+    }
+
+    #[test]
+    fn tuple_plan_is_idempotent_and_updates_role_relation() {
+        let workspace_id = Uuid::parse_str("fa76881f-6367-4b80-a89e-a3e01206a806").unwrap();
+        let object = Object::Workspace(workspace_id);
+
+        let employee_plan = plan_tuple_sync(
+            "user:employee-1",
+            &object,
+            Relation::Member,
+            Relation::Admin,
+            false,
+            false,
+        );
+        assert_eq!(employee_plan.writes[0].relation, "member");
+        assert!(employee_plan.deletes.is_empty());
+
+        let manager_plan = plan_tuple_sync(
+            "user:manager-1",
+            &object,
+            Relation::Admin,
+            Relation::Member,
+            false,
+            false,
+        );
+        assert_eq!(manager_plan.writes[0].relation, "admin");
+
+        let repeated_plan = plan_tuple_sync(
+            "user:employee-1",
+            &object,
+            Relation::Member,
+            Relation::Admin,
+            true,
+            false,
+        );
+        assert_eq!(repeated_plan, TupleSyncPlan::default());
+
+        let role_change_plan = plan_tuple_sync(
+            "user:employee-1",
+            &object,
+            Relation::Admin,
+            Relation::Member,
+            false,
+            true,
+        );
+        assert_eq!(role_change_plan.writes[0].relation, "admin");
+        assert_eq!(role_change_plan.deletes[0].relation, "member");
     }
 }
