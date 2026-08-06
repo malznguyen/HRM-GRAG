@@ -53,13 +53,17 @@ async fn main() {
         .expect("Failed to run migrations");
 
     let jwt = auth::jwt::JwtValidator::from_env()
-        .expect("JWT_ISSUER, JWT_AUDIENCE, and JWT_JWKS_URL must be configured for JWT validation");
+        .expect("Failed to initialize JWT validator from env");
 
     let authz_client =
         auth::authz::AuthzClient::from_env().expect("Failed to initialize AuthzClient from env");
 
-    let keycloak_client = auth::keycloak::KeycloakClient::from_env()
-        .expect("Failed to initialize KeycloakClient from env");
+    let keycloak_client = if jwt.hrm_mode() {
+        auth::keycloak::KeycloakClient::disabled()
+    } else {
+        auth::keycloak::KeycloakClient::from_env()
+            .expect("Failed to initialize KeycloakClient from env")
+    };
 
     let storage_config =
         StorageConfig::from_env().expect("Failed to load storage configuration from env");

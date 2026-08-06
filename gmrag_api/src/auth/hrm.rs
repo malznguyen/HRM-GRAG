@@ -169,15 +169,15 @@ pub async fn provision_identity(
     };
     let user = format!("user:{}", claims.sub);
     let object = Object::Workspace(config.workspace_id);
+    let desired_tuple = tuple_key(&user, desired_relation, &object);
+    let other_tuple = tuple_key(&user, other_relation, &object);
 
-    let desired_present = authz
-        .check_fga(&user, desired_relation, &object)
+    let tuples = authz
+        .list_all_tuples()
         .await
         .map_err(HrmProvisionError::Authz)?;
-    let other_present = authz
-        .check_fga(&user, other_relation, &object)
-        .await
-        .map_err(HrmProvisionError::Authz)?;
+    let desired_present = tuples.iter().any(|tuple| tuple == &desired_tuple);
+    let other_present = tuples.iter().any(|tuple| tuple == &other_tuple);
 
     let plan = plan_tuple_sync(
         &user,
