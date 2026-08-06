@@ -14,6 +14,7 @@ const DEFAULT_JWKS_CONNECT_TIMEOUT_SECS: u64 = 3;
 /// Request timeout mặc định khi fetch JWKS (giây). Ít khi chạy (key được cache) nhưng
 /// vẫn phải bounded để không treo request đầu tiên sau khi key xoay vòng.
 const DEFAULT_JWKS_REQUEST_TIMEOUT_SECS: u64 = 5;
+const JWT_CLOCK_LEEWAY_SECS: u64 = 60;
 
 /// Dựng HTTP client cho JWKS fetch với connect + request timeout (đọc từ env, có default).
 fn build_jwks_client() -> Client {
@@ -68,9 +69,12 @@ struct OidcClaims {
 }
 
 pub struct JwtValidator {
+    algorithm: Algorithm,
     issuer: Option<String>,
     audience: Option<String>,
+    verify_audience: bool,
     jwks_url: Option<String>,
+    hmac_key: Option<DecodingKey>,
     client: Client,
     keys: Arc<RwLock<HashMap<String, DecodingKey>>>,
 }
@@ -79,25 +83,45 @@ impl JwtValidator {
     pub fn from_env() -> Result<Arc<Self>, JwtError> {
         if test_bypass_enabled("TEST_BYPASS_JWT") {
             return Ok(Arc::new(Self {
+                algorithm: Algorithm::RS256,
                 issuer: None,
                 audience: None,
+                verify_audience: true,
                 jwks_url: None,
+                hmac_key: None,
                 client: build_jwks_client(),
                 keys: Arc::new(RwLock::new(HashMap::new())),
             }));
         }
 
+        let algorithm = configured_algorithm()?;
         let issuer = required_env("JWT_ISSUER")?;
         if issuer == "http://test-bypass-jwt" {
             return Err(JwtError::InvalidConfig("JWT_ISSUER"));
         }
-        let audience = required_env("JWT_AUDIENCE")?;
-        let jwks_url = required_http_url("JWT_JWKS_URL")?;
+        let verify_audience = optional_bool("JWT_VERIFY_AUDIENCE", true)?;
+        let audience = if verify_audience {
+            Some(required_env("JWT_AUDIENCE")?)
+        } else {
+            optional_env("JWT_AUDIENCE")?
+        };
+
+        let (jwks_url, hmac_key) = match algorithm {
+            Algorithm::RS256 => (Some(required_http_url("JWT_JWKS_URL")?), None),
+            Algorithm::HS512 => {
+                let secret = required_env("JWT_HMAC_SECRET")?;
+                (None, Some(DecodingKey::from_secret(secret.as_bytes())))
+            }
+            _ => return Err(JwtError::InvalidConfig("JWT_ALG")),
+        };
 
         Ok(Arc::new(Self {
+            algorithm,
             issuer: Some(issuer),
-            audience: Some(audience),
-            jwks_url: Some(jwks_url),
+            audience,
+            verify_audience,
+            jwks_url,
+            hmac_key,
             client: build_jwks_client(),
             keys: Arc::new(RwLock::new(HashMap::new())),
         }))
@@ -120,27 +144,58 @@ impl JwtValidator {
             error!(%err, "JWT header decode failed");
             JwtError::InvalidToken
         })?;
-        let kid = header.kid.ok_or_else(|| {
-            error!("JWT header missing kid");
-            JwtError::UnknownKeyId
-        })?;
-        let key = self.decoding_key_for(&kid).await?;
+        if header.alg != self.algorithm {
+            warn!(
+                configured_algorithm = ?self.algorithm,
+                token_algorithm = ?header.alg,
+                "JWT algorithm mismatch"
+            );
+            return Err(JwtError::InvalidToken);
+        }
+
+        let (key, kid) = match self.algorithm {
+            Algorithm::HS512 => (
+                self.hmac_key
+                    .as_ref()
+                    .ok_or(JwtError::MissingConfig("JWT_HMAC_SECRET"))?
+                    .clone(),
+                None,
+            ),
+            Algorithm::RS256 => {
+                let kid = header.kid.ok_or_else(|| {
+                    error!("JWT header missing kid");
+                    JwtError::UnknownKeyId
+                })?;
+                let key = self.decoding_key_for(&kid).await?;
+                (key, Some(kid))
+            }
+            _ => return Err(JwtError::InvalidToken),
+        };
 
         let issuer = self
             .issuer
             .as_deref()
             .ok_or(JwtError::MissingConfig("JWT_ISSUER"))?;
-        let audience = self
-            .audience
-            .as_deref()
-            .ok_or(JwtError::MissingConfig("JWT_AUDIENCE"))?;
-        let mut validation = Validation::new(Algorithm::RS256);
+        let mut validation = Validation::new(self.algorithm);
         validation.set_issuer(&[issuer]);
-        validation.set_audience(&[audience]);
+        if self.verify_audience {
+            let audience = self
+                .audience
+                .as_deref()
+                .ok_or(JwtError::MissingConfig("JWT_AUDIENCE"))?;
+            validation.set_audience(&[audience]);
+        } else {
+            validation.validate_aud = false;
+        }
         validation.validate_exp = true;
+        validation.leeway = JWT_CLOCK_LEEWAY_SECS;
 
         let token_data = decode::<OidcClaims>(token, &key, &validation).map_err(|err| {
-            error!(%err, issuer = %issuer, kid = %kid, "JWT decode/validation failed");
+            if let Some(kid) = kid.as_deref() {
+                error!(%err, issuer = %issuer, %kid, "JWT decode/validation failed");
+            } else {
+                error!(%err, issuer = %issuer, "JWT decode/validation failed");
+            }
             JwtError::InvalidToken
         })?;
         let sub = token_data.claims.sub.trim();
@@ -221,12 +276,36 @@ impl JwtValidator {
     }
 }
 
+fn configured_algorithm() -> Result<Algorithm, JwtError> {
+    match optional_env("JWT_ALG")?.as_deref().unwrap_or("RS256") {
+        "RS256" => Ok(Algorithm::RS256),
+        "HS512" => Ok(Algorithm::HS512),
+        _ => Err(JwtError::InvalidConfig("JWT_ALG")),
+    }
+}
+
+fn optional_bool(name: &'static str, default: bool) -> Result<bool, JwtError> {
+    match optional_env(name)?.as_deref() {
+        None => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => Err(JwtError::InvalidConfig(name)),
+    }
+}
+
+fn optional_env(name: &'static str) -> Result<Option<String>, JwtError> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = value.to_string_lossy().trim().to_string();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
 fn required_env(name: &'static str) -> Result<String, JwtError> {
-    let value = std::env::var(name).map_err(|_| JwtError::MissingConfig(name))?;
-    let value = value.trim();
-    (!value.is_empty())
-        .then(|| value.trim_end_matches('/').to_string())
-        .ok_or(JwtError::MissingConfig(name))
+    optional_env(name)?.ok_or(JwtError::MissingConfig(name))
 }
 
 fn required_http_url(name: &'static str) -> Result<String, JwtError> {
@@ -240,13 +319,116 @@ fn required_http_url(name: &'static str) -> Result<String, JwtError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonwebtoken::{EncodingKey, Header, encode};
+    use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn hs512_validator(secret: &[u8], verify_audience: bool) -> JwtValidator {
+        JwtValidator {
+            algorithm: Algorithm::HS512,
+            issuer: Some("restaurant-access".to_string()),
+            audience: verify_audience.then(|| "gmrag-api".to_string()),
+            verify_audience,
+            jwks_url: None,
+            hmac_key: Some(DecodingKey::from_secret(secret)),
+            client: build_jwks_client(),
+            keys: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn now_seconds() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_secs()
+    }
+
+    fn token(algorithm: Algorithm, secret: &[u8], claims: serde_json::Value) -> String {
+        encode(
+            &Header::new(algorithm),
+            &claims,
+            &EncodingKey::from_secret(secret),
+        )
+        .expect("token encoding")
+    }
+
+    #[tokio::test]
+    async fn accepts_hs512_with_issuer_audience_and_expiry() {
+        let secret = b"phase2-test-secret";
+        let validator = hs512_validator(secret, true);
+        let claims = json!({
+            "sub": "employee-1",
+            "iss": "restaurant-access",
+            "aud": "gmrag-api",
+            "exp": now_seconds() + 3600
+        });
+
+        let result = validator.validate(&token(Algorithm::HS512, secret, claims)).await;
+
+        assert_eq!(
+            result.expect("valid token").sub,
+            "employee-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_secret_and_algorithm_mismatch() {
+        let validator = hs512_validator(b"correct-secret", false);
+        let claims = json!({
+            "sub": "employee-1",
+            "iss": "restaurant-access",
+            "exp": now_seconds() + 3600
+        });
+
+        assert_eq!(
+            validator
+                .validate(&token(Algorithm::HS512, b"wrong-secret", claims.clone()))
+                .await,
+            Err(JwtError::InvalidToken)
+        );
+        assert_eq!(
+            validator
+                .validate(&token(Algorithm::HS256, b"correct-secret", claims))
+                .await,
+            Err(JwtError::InvalidToken)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_expired_and_wrong_issuer_tokens() {
+        let secret = b"phase2-test-secret";
+        let validator = hs512_validator(secret, false);
+
+        let expired = json!({
+            "sub": "employee-1",
+            "iss": "restaurant-access",
+            "exp": now_seconds().saturating_sub(61)
+        });
+        let wrong_issuer = json!({
+            "sub": "employee-1",
+            "iss": "wrong-issuer",
+            "exp": now_seconds() + 3600
+        });
+
+        assert_eq!(
+            validator.validate(&token(Algorithm::HS512, secret, expired)).await,
+            Err(JwtError::InvalidToken)
+        );
+        assert_eq!(
+            validator
+                .validate(&token(Algorithm::HS512, secret, wrong_issuer))
+                .await,
+            Err(JwtError::InvalidToken)
+        );
+    }
 
     #[test]
-    fn rejects_missing_or_unsafe_runtime_jwt_configuration() {
+    fn rejects_invalid_algorithm_and_audience_configuration() {
+        assert_eq!(configured_algorithm(), Ok(Algorithm::RS256));
+        assert_eq!(optional_bool("JWT_VERIFY_AUDIENCE_MISSING", true), Ok(true));
         assert_eq!(
-            required_http_url("JWT_JWKS_URL_MISSING"),
-            Err(JwtError::MissingConfig("JWT_JWKS_URL_MISSING"))
+            reqwest::Url::parse("not-a-url").is_err(),
+            true
         );
-        assert_eq!(reqwest::Url::parse("not-a-url").is_err(), true);
     }
 }
