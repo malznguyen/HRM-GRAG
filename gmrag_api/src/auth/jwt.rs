@@ -7,6 +7,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, warn};
 
+use crate::auth::hrm::{HrmConfig, HrmConfigError};
 use crate::auth::test_bypass_enabled;
 
 /// Connect timeout mặc định khi fetch JWKS (giây). JWKS fetch nằm trên request path
@@ -45,6 +46,8 @@ pub struct JwtClaims {
     pub sub: String,
     pub email: Option<String>,
     pub email_verified: bool,
+    pub role: Option<String>,
+    pub permissions: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -68,6 +71,7 @@ pub struct JwtValidator {
     audience: Option<String>,
     verify_audience: bool,
     subject_claim: String,
+    hrm: Option<HrmConfig>,
     jwks_url: Option<String>,
     hmac_key: Option<DecodingKey>,
     client: Client,
@@ -76,6 +80,7 @@ pub struct JwtValidator {
 
 impl JwtValidator {
     pub fn from_env() -> Result<Arc<Self>, JwtError> {
+        let hrm = HrmConfig::from_env().map_err(hrm_config_error)?;
         if test_bypass_enabled("TEST_BYPASS_JWT") {
             return Ok(Arc::new(Self {
                 algorithm: Algorithm::RS256,
@@ -83,6 +88,7 @@ impl JwtValidator {
                 audience: None,
                 verify_audience: true,
                 subject_claim: "sub".to_string(),
+                hrm,
                 jwks_url: None,
                 hmac_key: None,
                 client: build_jwks_client(),
@@ -118,6 +124,7 @@ impl JwtValidator {
             audience,
             verify_audience,
             subject_claim,
+            hrm,
             jwks_url,
             hmac_key,
             client: build_jwks_client(),
@@ -135,6 +142,8 @@ impl JwtValidator {
                 sub: sub.to_string(),
                 email: None,
                 email_verified: false,
+                role: None,
+                permissions: Vec::new(),
             });
         }
 
@@ -216,7 +225,32 @@ impl JwtValidator {
                 .get("email_verified")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            role: token_data
+                .claims
+                .get("role")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            permissions: token_data
+                .claims
+                .get("permissions")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
+    }
+
+    pub fn hrm_config(&self) -> Option<&HrmConfig> {
+        self.hrm.as_ref()
+    }
+
+    pub fn hrm_mode(&self) -> bool {
+        self.hrm.is_some()
     }
 
     async fn decoding_key_for(&self, kid: &str) -> Result<DecodingKey, JwtError> {
@@ -293,6 +327,14 @@ fn configured_algorithm() -> Result<Algorithm, JwtError> {
     }
 }
 
+fn hrm_config_error(error: HrmConfigError) -> JwtError {
+    if error.invalid {
+        JwtError::InvalidConfig(error.key)
+    } else {
+        JwtError::MissingConfig(error.key)
+    }
+}
+
 fn optional_bool(name: &'static str, default: bool) -> Result<bool, JwtError> {
     match optional_env(name)?.as_deref() {
         None => Ok(default),
@@ -347,6 +389,7 @@ mod tests {
             audience: verify_audience.then(|| "gmrag-api".to_string()),
             verify_audience,
             subject_claim: subject_claim.to_string(),
+            hrm: None,
             jwks_url: None,
             hmac_key: Some(DecodingKey::from_secret(secret)),
             client: build_jwks_client(),
