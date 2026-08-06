@@ -1,6 +1,7 @@
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use reqwest::Client;
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -61,18 +62,12 @@ struct Jwk {
     e: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct OidcClaims {
-    sub: String,
-    email: Option<String>,
-    email_verified: Option<bool>,
-}
-
 pub struct JwtValidator {
     algorithm: Algorithm,
     issuer: Option<String>,
     audience: Option<String>,
     verify_audience: bool,
+    subject_claim: String,
     jwks_url: Option<String>,
     hmac_key: Option<DecodingKey>,
     client: Client,
@@ -87,6 +82,7 @@ impl JwtValidator {
                 issuer: None,
                 audience: None,
                 verify_audience: true,
+                subject_claim: "sub".to_string(),
                 jwks_url: None,
                 hmac_key: None,
                 client: build_jwks_client(),
@@ -100,6 +96,7 @@ impl JwtValidator {
             return Err(JwtError::InvalidConfig("JWT_ISSUER"));
         }
         let verify_audience = optional_bool("JWT_VERIFY_AUDIENCE", true)?;
+        let subject_claim = optional_env("JWT_SUBJECT_CLAIM")?.unwrap_or_else(|| "sub".to_string());
         let audience = if verify_audience {
             Some(required_env("JWT_AUDIENCE")?)
         } else {
@@ -120,6 +117,7 @@ impl JwtValidator {
             issuer: Some(issuer),
             audience,
             verify_audience,
+            subject_claim,
             jwks_url,
             hmac_key,
             client: build_jwks_client(),
@@ -190,7 +188,7 @@ impl JwtValidator {
         validation.validate_exp = true;
         validation.leeway = JWT_CLOCK_LEEWAY_SECS;
 
-        let token_data = decode::<OidcClaims>(token, &key, &validation).map_err(|err| {
+        let token_data = decode::<Value>(token, &key, &validation).map_err(|err| {
             if let Some(kid) = kid.as_deref() {
                 error!(%err, issuer = %issuer, %kid, "JWT decode/validation failed");
             } else {
@@ -198,15 +196,26 @@ impl JwtValidator {
             }
             JwtError::InvalidToken
         })?;
-        let sub = token_data.claims.sub.trim();
-        if sub.is_empty() {
-            return Err(JwtError::InvalidToken);
-        }
+        let sub = token_data
+            .claims
+            .get(&self.subject_claim)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or(JwtError::InvalidToken)?;
 
         Ok(JwtClaims {
             sub: sub.to_string(),
-            email: token_data.claims.email,
-            email_verified: token_data.claims.email_verified.unwrap_or(false),
+            email: token_data
+                .claims
+                .get("email")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            email_verified: token_data
+                .claims
+                .get("email_verified")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         })
     }
 
@@ -324,11 +333,20 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn hs512_validator(secret: &[u8], verify_audience: bool) -> JwtValidator {
+        hs512_validator_with_subject(secret, verify_audience, "sub")
+    }
+
+    fn hs512_validator_with_subject(
+        secret: &[u8],
+        verify_audience: bool,
+        subject_claim: &str,
+    ) -> JwtValidator {
         JwtValidator {
             algorithm: Algorithm::HS512,
             issuer: Some("restaurant-access".to_string()),
             audience: verify_audience.then(|| "gmrag-api".to_string()),
             verify_audience,
+            subject_claim: subject_claim.to_string(),
             jwks_url: None,
             hmac_key: Some(DecodingKey::from_secret(secret)),
             client: build_jwks_client(),
@@ -417,6 +435,38 @@ mod tests {
         assert_eq!(
             validator
                 .validate(&token(Algorithm::HS512, secret, wrong_issuer))
+                .await,
+            Err(JwtError::InvalidToken)
+        );
+    }
+
+    #[tokio::test]
+    async fn uses_configured_subject_claim_without_sub_fallback() {
+        let secret = b"phase2-test-secret";
+        let validator = hs512_validator_with_subject(secret, false, "userid");
+        let valid_claims = json!({
+            "userid": "employee-1",
+            "sub": "untrusted-sub",
+            "iss": "restaurant-access",
+            "exp": now_seconds() + 3600
+        });
+        let missing_claims = json!({
+            "sub": "employee-1",
+            "iss": "restaurant-access",
+            "exp": now_seconds() + 3600
+        });
+
+        assert_eq!(
+            validator
+                .validate(&token(Algorithm::HS512, secret, valid_claims))
+                .await
+                .expect("userid claim")
+                .sub,
+            "employee-1"
+        );
+        assert_eq!(
+            validator
+                .validate(&token(Algorithm::HS512, secret, missing_claims))
                 .await,
             Err(JwtError::InvalidToken)
         );
