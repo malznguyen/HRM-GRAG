@@ -1,6 +1,12 @@
 use crate::auth::authz::{AuthzClient, AuthzError, Object, Relation, TupleKey};
 use crate::auth::jwt::JwtClaims;
+use crate::api_error::ApiError;
 use crate::invite::normalize_email;
+use crate::state::AppState;
+use axum::{
+    extract::FromRequestParts,
+    http::{StatusCode, request::Parts},
+};
 use sqlx::PgPool;
 use std::fmt;
 use uuid::Uuid;
@@ -101,6 +107,42 @@ pub fn ensure_scope(path: &str, config: &HrmConfig) -> Result<(), HrmScopeError>
 pub enum HrmScopeError {
     Tenant(Uuid),
     Workspace(Uuid),
+}
+
+pub struct HrmChatPermission;
+
+pub fn has_chatbot_permission(claims: &JwtClaims) -> bool {
+    claims
+        .permissions
+        .iter()
+        .any(|permission| permission == "CHATBOT_USE")
+}
+
+impl FromRequestParts<AppState> for HrmChatPermission {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if !state.jwt.hrm_mode() {
+            return Ok(Self);
+        }
+
+        let allowed = parts
+            .extensions
+            .get::<JwtClaims>()
+            .is_some_and(has_chatbot_permission);
+        if allowed {
+            Ok(Self)
+        } else {
+            Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "CHATBOT_PERMISSION_REQUIRED",
+                "CHATBOT_USE permission is required",
+            ))
+        }
+    }
 }
 
 pub async fn provision_identity(
@@ -242,5 +284,20 @@ mod tests {
             ensure_scope("/tenants/00000000-0000-0000-0000-000000000001/workspaces", &config),
             Err(HrmScopeError::Tenant(_))
         ));
+    }
+
+    #[test]
+    fn chat_permission_requires_exact_permission_string() {
+        let mut claims = JwtClaims {
+            sub: "employee-1".to_string(),
+            email: None,
+            email_verified: false,
+            role: Some(HRM_EMPLOYEE_ROLE.to_string()),
+            permissions: vec!["DOCUMENT_READ".to_string()],
+        };
+        assert!(!has_chatbot_permission(&claims));
+
+        claims.permissions.push("CHATBOT_USE".to_string());
+        assert!(has_chatbot_permission(&claims));
     }
 }

@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::api_error::ApiError;
 use crate::auth::authz::{Authz, AuthzClient, Object, Relation};
+use crate::auth::hrm::HrmChatPermission;
 use crate::chat::deepseek::{DeepseekTokenParser, deepseek_stream_idle_timeout, next_stream_token};
 use crate::chat::retrieval::{StoredChatMessage, fetch_session_chat_messages};
 use crate::chat::{
@@ -510,6 +511,7 @@ impl Drop for PersistAssistantOnDrop {
 pub async fn workspace_chat(
     State(state): State<AppState>,
     authz: Authz,
+    _chat_permission: HrmChatPermission,
     Path(workspace_id): Path<Uuid>,
     Json(body): Json<ChatRequest>,
 ) -> impl IntoResponse {
