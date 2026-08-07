@@ -40,9 +40,9 @@ use routes::chat::{
     workspace_chat_history,
 };
 use routes::documents::{
-    delete_document, get_document_chunk, get_document_preview, get_document_shares, list_documents,
-    patch_document_access_mode, put_document_permissions, retry_document_ingestion,
-    revoke_document_share, share_document, upload_document,
+    delete_document, get_document_chunk, get_document_preview, get_document_shares,
+    get_document_status, list_documents, patch_document_access_mode, put_document_permissions,
+    retry_document_ingestion, revoke_document_share, share_document, upload_document,
 };
 use routes::graph::get_workspace_graph;
 use routes::members::{
@@ -285,7 +285,7 @@ pub fn app_router(state: AppState) -> Router {
         )
         .route(
             "/workspaces/{workspace_id}/documents/{document_id}",
-            delete(delete_document),
+            get(get_document_status).delete(delete_document),
         )
         .route(
             "/workspaces/{workspace_id}/documents/{document_id}/retry",

@@ -22,7 +22,8 @@ use crate::auth::document_acl::{
 };
 use crate::auth::resource_cleanup::capture_document_delete_plan;
 use crate::document_directory::{
-    DocumentDirectoryPage, get_document_permissions, list_documents as list_document_directory,
+    DocumentDirectoryItem, DocumentDirectoryPage, get_document as get_document_directory,
+    get_document_permissions, list_documents as list_document_directory,
 };
 use crate::document_format::{DocumentFormat, document_max_upload_bytes};
 use crate::ingestion::jobs::{IngestionWorkerConfig, enqueue_job_tx, retry_failed_document};
@@ -54,6 +55,37 @@ pub struct WorkspaceDocumentsResponse {
     #[serde(flatten)]
     pub page: DocumentDirectoryPage,
     pub caller: WorkspaceDocumentCallerCapabilities,
+}
+
+#[derive(Serialize)]
+pub struct DocumentStatusResponse {
+    pub document_id: Uuid,
+    pub filename: String,
+    pub status: String,
+    pub processing_stage: String,
+    pub failure_code: Option<String>,
+    pub failure_message: Option<String>,
+    pub access_mode: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    pub chunk_count: i64,
+}
+
+impl From<DocumentDirectoryItem> for DocumentStatusResponse {
+    fn from(document: DocumentDirectoryItem) -> Self {
+        Self {
+            document_id: document.id,
+            filename: document.filename,
+            status: document.status,
+            processing_stage: document.processing_stage,
+            failure_code: document.failure_code,
+            failure_message: document.failure_message,
+            access_mode: document.access_mode,
+            created_at: document.created_at,
+            updated_at: document.updated_at,
+            chunk_count: document.chunk_count,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -473,6 +505,84 @@ pub async fn list_documents(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+pub async fn get_document_status(
+    State(state): State<AppState>,
+    authz: Authz,
+    Path((workspace_id, document_id)): Path<(Uuid, Uuid)>,
+) -> impl IntoResponse {
+    if let Err(err) = authz
+        .require_relation(Relation::Member, &Object::Workspace(workspace_id))
+        .await
+    {
+        return if err.status.is_server_error() {
+            err.into_response()
+        } else {
+            StatusCode::NOT_FOUND.into_response()
+        };
+    }
+
+    let document = match get_document_directory(&state.pool, workspace_id, document_id).await {
+        Ok(Some(document)) => document,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to read document status"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let access_mode = match DocumentAccessMode::parse(&document.access_mode) {
+        Some(access_mode) => access_mode,
+        None => {
+            error!(
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Document status read found an invalid access mode"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let can_view = match can_user_view_document(
+        &state.authz_client,
+        &authz.user_id,
+        document_id,
+        access_mode,
+    )
+    .await
+    {
+        Ok(can_view) => can_view,
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to apply document ACL while reading status"
+            );
+            return match err {
+                DocumentAclError::Authz(_) => ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "AUTHZ_ERROR",
+                    "Authorization service unavailable",
+                )
+                .into_response(),
+                _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+        }
+    };
+    if !can_view {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    Json(DocumentStatusResponse::from(document)).into_response()
 }
 
 pub async fn get_document_shares(
@@ -1576,4 +1686,50 @@ async fn fetch_workspace_tenant_id(
     .bind(workspace_id)
     .fetch_optional(pool)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn document_status_response_contains_the_required_schema() {
+        let document_id = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let created_at =
+            NaiveDateTime::parse_from_str("2026-08-07 08:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let updated_at =
+            NaiveDateTime::parse_from_str("2026-08-07 08:05:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let response = DocumentStatusResponse::from(DocumentDirectoryItem {
+            id: document_id,
+            filename: "policy.pdf".to_string(),
+            status: "COMPLETED".to_string(),
+            processing_stage: "DONE".to_string(),
+            failure_code: None,
+            failure_message: None,
+            created_at,
+            updated_at,
+            chunk_count: 3,
+            size_bytes: Some(1024),
+            access_mode: "workspace_default".to_string(),
+            uploaded_by: "employee-1".to_string(),
+            uploaded_by_email: None,
+            content_type: Some("application/pdf".to_string()),
+        });
+
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({
+                "document_id": document_id,
+                "filename": "policy.pdf",
+                "status": "COMPLETED",
+                "processing_stage": "DONE",
+                "failure_code": null,
+                "failure_message": null,
+                "access_mode": "workspace_default",
+                "created_at": "2026-08-07T08:00:00",
+                "updated_at": "2026-08-07T08:05:00",
+                "chunk_count": 3
+            })
+        );
+    }
 }
