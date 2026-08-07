@@ -191,6 +191,7 @@ impl JwtValidator {
                 .as_deref()
                 .ok_or(JwtError::MissingConfig("JWT_AUDIENCE"))?;
             validation.set_audience(&[audience]);
+            validation.required_spec_claims.insert("aud".to_string());
         } else {
             validation.validate_aud = false;
         }
@@ -436,6 +437,30 @@ mod tests {
         assert_eq!(
             result.expect("valid token").sub,
             "employee-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn audience_verification_can_be_disabled_for_hrm_tokens() {
+        let secret = b"phase3-test-secret";
+        let claims_without_audience = json!({
+            "sub": "employee-1",
+            "iss": "restaurant-access",
+            "exp": now_seconds() + 3600
+        });
+        let token_without_audience = token(Algorithm::HS512, secret, claims_without_audience);
+
+        assert!(
+            hs512_validator(secret, false)
+                .validate(&token_without_audience)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            hs512_validator(secret, true)
+                .validate(&token_without_audience)
+                .await,
+            Err(JwtError::InvalidToken)
         );
     }
 
