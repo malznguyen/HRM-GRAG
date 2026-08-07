@@ -1,4 +1,7 @@
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, Validation, decode, decode_header,
+    errors::ErrorKind,
+};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
@@ -147,34 +150,30 @@ impl JwtValidator {
             });
         }
 
-        let header = decode_header(token).map_err(|err| {
-            error!(%err, "JWT header decode failed");
+        let header = decode_header(token).map_err(|_| {
+            warn!("JWT rejected: malformed header");
             JwtError::InvalidToken
         })?;
         if header.alg != self.algorithm {
             warn!(
-                configured_algorithm = ?self.algorithm,
-                token_algorithm = ?header.alg,
-                "JWT algorithm mismatch"
+                "JWT rejected: algorithm mismatch (configured={:?}, token header={:?})",
+                self.algorithm, header.alg
             );
             return Err(JwtError::InvalidToken);
         }
 
-        let (key, kid) = match self.algorithm {
-            Algorithm::HS512 => (
-                self.hmac_key
-                    .as_ref()
-                    .ok_or(JwtError::MissingConfig("JWT_HMAC_SECRET"))?
-                    .clone(),
-                None,
-            ),
+        let key = match self.algorithm {
+            Algorithm::HS512 => self
+                .hmac_key
+                .as_ref()
+                .ok_or(JwtError::MissingConfig("JWT_HMAC_SECRET"))?
+                .clone(),
             Algorithm::RS256 => {
                 let kid = header.kid.ok_or_else(|| {
-                    error!("JWT header missing kid");
+                    warn!("JWT rejected: missing key id");
                     JwtError::UnknownKeyId
                 })?;
-                let key = self.decoding_key_for(&kid).await?;
-                (key, Some(kid))
+                self.decoding_key_for(&kid).await?
             }
             _ => return Err(JwtError::InvalidToken),
         };
@@ -199,11 +198,8 @@ impl JwtValidator {
         validation.leeway = JWT_CLOCK_LEEWAY_SECS;
 
         let token_data = decode::<Value>(token, &key, &validation).map_err(|err| {
-            if let Some(kid) = kid.as_deref() {
-                error!(%err, issuer = %issuer, %kid, "JWT decode/validation failed");
-            } else {
-                error!(%err, issuer = %issuer, "JWT decode/validation failed");
-            }
+            let reason = validation_rejection_reason(err.kind());
+            warn!("JWT rejected: {reason}");
             JwtError::InvalidToken
         })?;
         let sub = token_data
@@ -212,7 +208,10 @@ impl JwtValidator {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or(JwtError::InvalidToken)?;
+            .ok_or_else(|| {
+                warn!("JWT rejected: missing or invalid subject claim");
+                JwtError::InvalidToken
+            })?;
 
         Ok(JwtClaims {
             sub: sub.to_string(),
@@ -317,6 +316,17 @@ impl JwtValidator {
         }
         *self.keys.write().await = next;
         Ok(())
+    }
+}
+
+fn validation_rejection_reason(error: &ErrorKind) -> &'static str {
+    match error {
+        ErrorKind::ExpiredSignature => "token expired",
+        ErrorKind::InvalidIssuer => "issuer mismatch",
+        ErrorKind::InvalidAudience => "audience mismatch",
+        ErrorKind::MissingRequiredClaim(claim) if claim == "aud" => "audience claim missing",
+        ErrorKind::InvalidSignature => "signature mismatch",
+        _ => "validation failed",
     }
 }
 
@@ -588,6 +598,26 @@ mod tests {
         assert_eq!(
             reqwest::Url::parse("not-a-url").is_err(),
             true
+        );
+    }
+
+    #[test]
+    fn validation_rejection_reasons_do_not_include_claim_values() {
+        assert_eq!(
+            validation_rejection_reason(&ErrorKind::ExpiredSignature),
+            "token expired"
+        );
+        assert_eq!(
+            validation_rejection_reason(&ErrorKind::InvalidIssuer),
+            "issuer mismatch"
+        );
+        assert_eq!(
+            validation_rejection_reason(&ErrorKind::MissingRequiredClaim("aud".to_string())),
+            "audience claim missing"
+        );
+        assert_eq!(
+            validation_rejection_reason(&ErrorKind::InvalidSignature),
+            "signature mismatch"
         );
     }
 }
