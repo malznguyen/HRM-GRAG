@@ -13,6 +13,8 @@ use uuid::Uuid;
 
 pub const HRM_EMPLOYEE_ROLE: &str = "EMPLOYEE";
 pub const HRM_MANAGER_ROLE: &str = "MANAGER";
+pub const HRM_ADMIN_ROLE: &str = "ADMIN";
+pub const HRM_HR_ROLE: &str = "HR";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HrmConfig {
@@ -59,7 +61,7 @@ impl HrmConfig {
     pub fn role_relation(role: Option<&str>) -> Result<Relation, HrmProvisionError> {
         match role {
             Some(HRM_EMPLOYEE_ROLE) => Ok(Relation::Member),
-            Some(HRM_MANAGER_ROLE) => Ok(Relation::Admin),
+            Some(HRM_ADMIN_ROLE | HRM_HR_ROLE | HRM_MANAGER_ROLE) => Ok(Relation::Admin),
             _ => Err(HrmProvisionError::InvalidRole),
         }
     }
@@ -274,20 +276,20 @@ mod tests {
 
     #[test]
     fn role_mapping_is_fail_closed_and_exact() {
-        assert_eq!(
-            HrmConfig::role_relation(Some(HRM_EMPLOYEE_ROLE)).unwrap(),
-            Relation::Member
-        );
-        assert_eq!(
-            HrmConfig::role_relation(Some(HRM_MANAGER_ROLE)).unwrap(),
-            Relation::Admin
-        );
+        for (role, relation) in [
+            (HRM_ADMIN_ROLE, Relation::Admin),
+            (HRM_HR_ROLE, Relation::Admin),
+            (HRM_MANAGER_ROLE, Relation::Admin),
+            (HRM_EMPLOYEE_ROLE, Relation::Member),
+        ] {
+            assert_eq!(HrmConfig::role_relation(Some(role)).unwrap(), relation);
+        }
         assert!(matches!(
             HrmConfig::role_relation(None),
             Err(HrmProvisionError::InvalidRole)
         ));
         assert!(matches!(
-            HrmConfig::role_relation(Some("ADMIN")),
+            HrmConfig::role_relation(Some("SUPERVISOR")),
             Err(HrmProvisionError::InvalidRole)
         ));
         assert!(matches!(
@@ -365,10 +367,11 @@ mod tests {
         );
         assert_eq!(repeated_plan, TupleSyncPlan::default());
 
+        let hr_relation = HrmConfig::role_relation(Some(HRM_HR_ROLE)).unwrap();
         let role_change_plan = plan_tuple_sync(
             "user:employee-1",
             &object,
-            Relation::Admin,
+            hr_relation,
             Relation::Member,
             false,
             true,

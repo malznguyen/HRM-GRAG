@@ -538,7 +538,12 @@ mod tests {
             Err(JwtError::InvalidToken)
         );
 
-        for role in [Some(json!("ADMIN")), Some(json!("")), Some(json!(42)), None] {
+        for role in [
+            Some(json!("SUPERVISOR")),
+            Some(json!("")),
+            Some(json!(42)),
+            None,
+        ] {
             let mut role_claims = claims.clone();
             if let Some(role) = role {
                 role_claims["role"] = role;
