@@ -148,6 +148,8 @@ pub enum HrmScopeError {
 
 pub struct HrmChatPermission;
 
+pub struct HrmDocumentUploadPermission;
+
 pub fn has_chatbot_permission(claims: &JwtClaims) -> bool {
     claims
         .permissions
@@ -179,6 +181,43 @@ impl FromRequestParts<AppState> for HrmChatPermission {
                 "CHATBOT_USE permission is required",
             ))
         }
+    }
+}
+
+pub fn has_document_upload_permission(claims: &JwtClaims) -> bool {
+    claims
+        .permissions
+        .iter()
+        .any(|permission| permission == "CHATBOT_UPLOAD_DOCUMENT")
+}
+
+fn require_document_upload_permission(
+    hrm_mode: bool,
+    claims: Option<&JwtClaims>,
+) -> Result<(), ApiError> {
+    if !hrm_mode || claims.is_some_and(has_document_upload_permission) {
+        return Ok(());
+    }
+
+    Err(ApiError::new(
+        StatusCode::FORBIDDEN,
+        "CHATBOT_UPLOAD_PERMISSION_REQUIRED",
+        "CHATBOT_UPLOAD_DOCUMENT permission is required",
+    ))
+}
+
+impl FromRequestParts<AppState> for HrmDocumentUploadPermission {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        require_document_upload_permission(
+            state.jwt.hrm_mode(),
+            parts.extensions.get::<JwtClaims>(),
+        )?;
+        Ok(Self)
     }
 }
 
@@ -302,6 +341,52 @@ fn required_uuid(name: &'static str) -> Result<Uuid, HrmConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn claims_with_permissions(permissions: &[&str]) -> JwtClaims {
+        JwtClaims {
+            sub: "test-user".to_string(),
+            email: None,
+            email_verified: false,
+            role: None,
+            permissions: permissions
+                .iter()
+                .map(|permission| (*permission).to_string())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn document_upload_permission_requires_exact_permission_string() {
+        let exact = claims_with_permissions(&["CHATBOT_UPLOAD_DOCUMENT"]);
+        assert!(has_document_upload_permission(&exact));
+        assert!(require_document_upload_permission(true, Some(&exact)).is_ok());
+
+        for permissions in [
+            Vec::<&str>::new(),
+            vec!["CHATBOT_UPLOAD"],
+            vec!["chatbot_upload_document"],
+        ] {
+            let error = require_document_upload_permission(
+                true,
+                Some(&claims_with_permissions(&permissions)),
+            )
+            .expect_err("near or missing permissions must be rejected");
+            assert_eq!(error.status, StatusCode::FORBIDDEN);
+            assert_eq!(error.code, "CHATBOT_UPLOAD_PERMISSION_REQUIRED");
+        }
+    }
+
+    #[test]
+    fn document_upload_permission_is_noop_outside_hrm_mode() {
+        assert!(require_document_upload_permission(false, None).is_ok());
+        assert!(
+            require_document_upload_permission(
+                false,
+                Some(&claims_with_permissions(&["CHATBOT_UPLOAD"]))
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn role_mapping_is_fail_closed_and_exact() {

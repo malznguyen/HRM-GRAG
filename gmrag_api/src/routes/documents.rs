@@ -20,6 +20,7 @@ use crate::auth::document_acl::{
     grant_document_explicit_viewer, replace_document_permissions, revoke_document_explicit_viewer,
     set_document_access_mode,
 };
+use crate::auth::hrm::HrmDocumentUploadPermission;
 use crate::auth::resource_cleanup::capture_document_delete_plan;
 use crate::document_directory::{
     DocumentDirectoryItem, DocumentDirectoryPage, get_document as get_document_directory,
@@ -1428,6 +1429,7 @@ async fn fetch_document_preview(
 pub async fn upload_document(
     State(state): State<AppState>,
     authz: Authz,
+    _upload_permission: HrmDocumentUploadPermission,
     Path(workspace_id): Path<Uuid>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
