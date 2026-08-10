@@ -144,7 +144,7 @@ UNAUTHORIZED`.
 |---|---|---|---|
 | `userid` | string | **Có** | ID người dùng chuẩn. Rỗng/thiếu/không phải string → `401`. |
 | `role` | string | **Có** | Quyết định quyền admin hay member. |
-| `permissions` | array of string | Có, nếu dùng chat | Phải chứa `CHATBOT_USE`. |
+| `permissions` | array of string | Có, nếu dùng chat/upload | Chat cần `CHATBOT_USE`; upload cần `CHATBOT_UPLOAD_DOCUMENT`. |
 | `email` | string | Không | Dùng để tạo user row. |
 | `exp` | number | Có | Hết hạn → `401`. Cho phép lệch đồng hồ 60 giây. |
 | `iss` | string | Có | Phải khớp `JWT_ISSUER` cấu hình phía RAG. |
@@ -162,8 +162,8 @@ Ví dụ payload token hợp lệ:
 ```json
 {
   "userid": "employee-1",
-  "role": "EMPLOYEE",
-  "permissions": ["CHATBOT_USE", "DOCUMENT_READ"],
+  "role": "HR",
+  "permissions": ["CHATBOT_USE", "CHATBOT_UPLOAD_DOCUMENT"],
   "email": "nhanvien@congty.vn",
   "iss": "<issuer HRM đã cấu hình>",
   "exp": 1786000000
@@ -174,10 +174,10 @@ Ví dụ payload token hợp lệ:
 
 | `role` trong token | Quyền phía RAG | Làm được gì |
 |---|---|---|
-| `ADMIN` | admin | Upload, xóa, xem trạng thái, chat |
-| `HR` | admin | Upload, xóa, xem trạng thái, chat |
-| `MANAGER` | admin | Upload, xóa, xem trạng thái, chat |
-| `EMPLOYEE` | member | Xem trạng thái, chat. **Không** upload, **không** xóa |
+| `ADMIN` | admin | Upload khi token có `CHATBOT_UPLOAD_DOCUMENT`; xóa, xem trạng thái, chat |
+| `HR` | admin | Upload khi token có `CHATBOT_UPLOAD_DOCUMENT`; xóa, xem trạng thái, chat |
+| `MANAGER` | admin | Xóa, xem trạng thái, chat. Seed mặc định thiếu `CHATBOT_UPLOAD_DOCUMENT`, nên **không upload** |
+| `EMPLOYEE` | member | Xem trạng thái, chat. **Không** upload kể cả khi được cấp riêng permission; **không** xóa |
 | Bất kỳ giá trị nào khác | — | `403 HRM_ROLE_REQUIRED` |
 | Thiếu / rỗng / không phải string | — | `403 HRM_ROLE_REQUIRED` |
 
@@ -198,6 +198,12 @@ Endpoint chat còn kiểm tra thêm: mảng `permissions` phải chứa **đúng
 Kiểm tra này chạy **rất sớm**, trước cả khi server đọc body request. Hệ quả cần
 biết khi debug: nếu bạn gửi body JSON sai *và* token thiếu `CHATBOT_USE`, bạn sẽ
 nhận `403`, không phải `400`. Đừng tưởng body của mình đúng.
+
+Upload kiểm tra thêm mảng `permissions` phải chứa **đúng chuỗi**
+`CHATBOT_UPLOAD_DOCUMENT`. Thiếu → `403 CHATBOT_UPLOAD_PERMISSION_REQUIRED`.
+Gate này cũng chạy trước khi đọc multipart body, nhưng **không thay thế** OpenFGA:
+caller có permission mà chỉ là workspace `member` vẫn nhận
+`403 WORKSPACE_ADMIN_REQUIRED`. Gate không áp dụng cho `DELETE`.
 
 ### 2.5 Caller KHÔNG gửi tenant / workspace
 
@@ -257,6 +263,7 @@ Gửi UUID **khác** hai giá trị này → `400 HRM_SCOPE_MISMATCH`.
 | 400 | `HRM_SCOPE_MISMATCH` | `{workspace_id}` trong URL không khớp cấu hình | Bug phía HRM: sai config workspace |
 | 403 | `HRM_ROLE_REQUIRED` | `role` không thuộc 4 giá trị hợp lệ | Kiểm tra HRM có nhét `role` vào token chưa |
 | 403 | `CHATBOT_PERMISSION_REQUIRED` | Thiếu `CHATBOT_USE` (chỉ endpoint chat) | Cấp quyền cho user, hoặc ẩn tính năng chat |
+| 403 | `CHATBOT_UPLOAD_PERMISSION_REQUIRED` | Thiếu exact permission `CHATBOT_UPLOAD_DOCUMENT` (chỉ endpoint upload) | Cấp quyền upload, hoặc ẩn chức năng upload |
 | 500 | `INTERNAL_ERROR` | Không tạo được user row | Lỗi server, retry với backoff |
 | 500 | `AUTHZ_ERROR` | Dịch vụ phân quyền chết/timeout | Lỗi server, retry với backoff |
 
@@ -273,8 +280,15 @@ Gửi UUID **khác** hai giá trị này → `400 HRM_SCOPE_MISMATCH`.
 POST /workspaces/hrm/documents/upload
 ```
 
-Yêu cầu role admin (`ADMIN` / `HR` / `MANAGER`). Token `EMPLOYEE` → `403
-WORKSPACE_ADMIN_REQUIRED`.
+Yêu cầu đồng thời:
+
+1. Token có exact permission `CHATBOT_UPLOAD_DOCUMENT`. Thiếu permission →
+   `403 CHATBOT_UPLOAD_PERMISSION_REQUIRED` trước khi server đọc multipart body.
+2. Caller có relation OpenFGA `admin` trên workspace. Có permission nhưng chỉ là
+   `member` → `403 WORKSPACE_ADMIN_REQUIRED`.
+
+Seed HRM mặc định chỉ cấp permission upload cho `ADMIN` và `HR`; `MANAGER` không
+được upload trừ khi HRM cấp riêng permission này. Gate không áp dụng cho DELETE.
 
 ### 3.1 Định dạng request
 
@@ -1174,6 +1188,7 @@ Toàn bộ mã lỗi có thể gặp trên 6 endpoint trong tài liệu này:
 | 403 | `WORKSPACE_ADMIN_REQUIRED` | Cần role admin (upload). **Xóa** thiếu quyền ra `404`, không phải mã này | **Không retry**. Chặn ở UI |
 | 403 | `HRM_ROLE_REQUIRED` | `role` không hợp lệ | **Không retry**. Sửa cách phát hành token |
 | 403 | `CHATBOT_PERMISSION_REQUIRED` | Thiếu `CHATBOT_USE` | **Không retry**. Cấp quyền hoặc ẩn chat |
+| 403 | `CHATBOT_UPLOAD_PERMISSION_REQUIRED` | Upload thiếu exact permission `CHATBOT_UPLOAD_DOCUMENT` | **Không retry**. Cấp quyền hoặc ẩn upload |
 | 404 | `RESOURCE_NOT_FOUND` | Không tồn tại / workspace khác / không có quyền (xem *hoặc* xóa) / URL sai | **Không retry**. Với `DELETE`: coi như đã xong |
 | 405 | `METHOD_NOT_ALLOWED` | Sai HTTP method | Bug phía HRM. **Không retry** |
 | 413 | `PAYLOAD_TOO_LARGE` | Body vượt 50 MiB | Chia nhỏ. **Không retry** |
@@ -1325,6 +1340,7 @@ Tick dần khi làm.
 - [ ] Token HRM có claim `userid`, giá trị ổn định vĩnh viễn theo nhân viên
 - [ ] Token có claim `role` ∈ {`ADMIN`, `HR`, `MANAGER`, `EMPLOYEE`} — **đúng hoa thường**
 - [ ] Token có `permissions` chứa `CHATBOT_USE` cho user được phép chat
+- [ ] Token có `permissions` chứa `CHATBOT_UPLOAD_DOCUMENT` cho user được phép upload
 - [ ] Đã thử token **hết hạn** → nhận `401 INVALID_TOKEN`
 - [ ] Đã thử role sai (ví dụ `SUPERVISOR`) → nhận `403 HRM_ROLE_REQUIRED`
 
@@ -1337,7 +1353,8 @@ Tick dần khi làm.
 
 - [ ] Upload một PDF có text → nhận `202` kèm `document_id`
 - [ ] **Đã lưu `document_id` vào database của HRM**
-- [ ] Upload bằng token `EMPLOYEE` → nhận `403 WORKSPACE_ADMIN_REQUIRED`
+- [ ] Upload bằng token thiếu `CHATBOT_UPLOAD_DOCUMENT` → nhận `403 CHATBOT_UPLOAD_PERMISSION_REQUIRED`
+- [ ] Upload bằng token `EMPLOYEE` có `CHATBOT_UPLOAD_DOCUMENT` → vẫn nhận `403 WORKSPACE_ADMIN_REQUIRED`
 - [ ] Upload file không hỗ trợ (ví dụ `.xlsx`) → nhận `400 INVALID_REQUEST`,
       `error.details.rejected[0].reason_code = UNSUPPORTED_MEDIA_TYPE`
 - [ ] Upload lô hỗn hợp (1 file tốt + 1 file `.xlsx`) → `202`, `documents` có 1 phần tử

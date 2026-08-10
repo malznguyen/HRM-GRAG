@@ -210,8 +210,8 @@ Content-Type: text/plain
 
 {"session_id":"{{sessionId}}","message":"xin chao"}
 
-### E8. Upload bang token EMPLOYEE -> 403 WORKSPACE_ADMIN_REQUIRED
-# Doi employeeToken trong http-client.env.json thanh token role EMPLOYEE.
+### E8. Upload bang token EMPLOYEE seed mac dinh -> 403 CHATBOT_UPLOAD_PERMISSION_REQUIRED
+# Token EMPLOYEE seed mac dinh khong co CHATBOT_UPLOAD_DOCUMENT.
 POST {{baseUrl}}/workspaces/{{workspaceId}}/documents/upload
 Authorization: Bearer {{employeeToken}}
 Content-Type: multipart/form-data; boundary=RagBoundary

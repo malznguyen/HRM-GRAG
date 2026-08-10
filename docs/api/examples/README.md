@@ -41,7 +41,7 @@ Chạy tuần tự cả 5 việc và kiểm tra kết quả từng bước. Dùn
 
 ```bash
 export RAG_BASE_URL="http://127.0.0.1:18083"
-export RAG_TOKEN="<access token role ADMIN/HR/MANAGER, có CHATBOT_USE>"
+export RAG_TOKEN="<token ADMIN/HR có CHATBOT_USE + CHATBOT_UPLOAD_DOCUMENT>"
 
 # Tuỳ chọn. Mặc định là alias "hrm"; đặt UUID đầy đủ nếu muốn gọi tường minh.
 export RAG_WORKSPACE_ID="hrm"

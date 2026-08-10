@@ -95,9 +95,14 @@ paths:
       operationId: uploadDocuments
       summary: Upload one or more documents for asynchronous indexing
       description: |
-        Accepts `multipart/form-data`. Requires the `admin` relation on the
-        workspace (HRM roles `ADMIN` / `HR` / `MANAGER`; an `EMPLOYEE` token is
-        rejected with `403 WORKSPACE_ADMIN_REQUIRED`).
+        Accepts `multipart/form-data`. Requires both the exact
+        `CHATBOT_UPLOAD_DOCUMENT` entry in the token's `permissions` array and
+        the `admin` relation on the workspace. The permission check runs before
+        multipart parsing; missing permission returns
+        `403 CHATBOT_UPLOAD_PERMISSION_REQUIRED`. The default HRM seed grants
+        this permission to `ADMIN` and `HR`, but not to `MANAGER` or `EMPLOYEE`.
+        A caller with the permission but without the `admin` relation is still
+        rejected with `403 WORKSPACE_ADMIN_REQUIRED`.
 
         **Processing is asynchronous.** A `202` only means the row was created
         and an ingestion job was enqueued (`status=PROCESSING`,
@@ -198,12 +203,19 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403":
           description: |
+            `CHATBOT_UPLOAD_PERMISSION_REQUIRED` — `permissions` does not
+            contain the exact `CHATBOT_UPLOAD_DOCUMENT` entry.
             `WORKSPACE_ADMIN_REQUIRED` — the caller is not a workspace admin.
             `HRM_ROLE_REQUIRED` — the token carries no recognised HRM `role`.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
               examples:
+                uploadPermissionRequired:
+                  value:
+                    error:
+                      code: CHATBOT_UPLOAD_PERMISSION_REQUIRED
+                      message: CHATBOT_UPLOAD_DOCUMENT permission is required
                 adminRequired:
                   value:
                     error:
@@ -727,7 +739,9 @@ components:
             string, a non-string, or a missing claim gives
             `403 HRM_ROLE_REQUIRED`.
           * `permissions` — array of strings. Must contain `CHATBOT_USE` to call
-            the chat endpoint. Non-array or missing is treated as empty.
+            the chat endpoint and `CHATBOT_UPLOAD_DOCUMENT` to call the upload
+            endpoint. Both checks are exact and case-sensitive. Non-array or
+            missing is treated as empty.
           * `email` — optional. Used to populate the user row; absent means a
             synthetic `<userid>@hrm.local` placeholder is stored.
           * `exp` — verified, with 60 seconds of clock leeway.
@@ -875,6 +889,7 @@ components:
                 - WORKSPACE_ADMIN_REQUIRED
                 - HRM_ROLE_REQUIRED
                 - CHATBOT_PERMISSION_REQUIRED
+                - CHATBOT_UPLOAD_PERMISSION_REQUIRED
                 - RESOURCE_NOT_FOUND
                 - METHOD_NOT_ALLOWED
                 - PAYLOAD_TOO_LARGE
