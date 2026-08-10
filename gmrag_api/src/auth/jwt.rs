@@ -456,7 +456,7 @@ mod tests {
     ) -> JwtValidator {
         JwtValidator {
             algorithm: Algorithm::HS512,
-            issuer: Some("restaurant-access".to_string()),
+            issuer: Some("hrm-gm-group-access".to_string()),
             audience: verify_audience.then(|| "gmrag-api".to_string()),
             verify_audience,
             subject_claim: subject_claim.to_string(),
@@ -496,7 +496,7 @@ mod tests {
         let validator = hs512_validator(secret, true);
         let claims = json!({
             "sub": "employee-1",
-            "iss": "restaurant-access",
+            "iss": "hrm-gm-group-access",
             "aud": "gmrag-api",
             "exp": now_seconds() + 3600
         });
@@ -514,7 +514,7 @@ mod tests {
         let secret = b"phase3-test-secret";
         let claims_without_audience = json!({
             "sub": "employee-1",
-            "iss": "restaurant-access",
+            "iss": "hrm-gm-group-access",
             "exp": now_seconds() + 3600
         });
         let token_without_audience = token(Algorithm::HS512, secret, claims_without_audience);
@@ -538,7 +538,7 @@ mod tests {
         let validator = hs512_validator(b"correct-secret", false);
         let claims = json!({
             "sub": "employee-1",
-            "iss": "restaurant-access",
+            "iss": "hrm-gm-group-access",
             "exp": now_seconds() + 3600
         });
 
@@ -563,7 +563,7 @@ mod tests {
 
         let expired = json!({
             "sub": "employee-1",
-            "iss": "restaurant-access",
+            "iss": "hrm-gm-group-access",
             "exp": now_seconds().saturating_sub(61)
         });
         let wrong_issuer = json!({
@@ -591,14 +591,14 @@ mod tests {
         let valid_claims = json!({
             "userid": "employee-1",
             "sub": "untrusted-sub",
-            "iss": "restaurant-access",
+            "iss": "hrm-gm-group-access",
             "exp": now_seconds() + 3600,
             "role": "EMPLOYEE",
             "permissions": ["CHATBOT_USE", "DOCUMENT_READ"]
         });
         let missing_claims = json!({
             "sub": "employee-1",
-            "iss": "restaurant-access",
+            "iss": "hrm-gm-group-access",
             "exp": now_seconds() + 3600
         });
 
@@ -623,7 +623,7 @@ mod tests {
         let validator = hs512_validator_with_subject(secret, false, "userid");
         let claims = json!({
             "userid": "employee-1",
-            "iss": "restaurant-access",
+            "iss": "hrm-gm-group-access",
             "exp": now_seconds() + 3600
         });
 
@@ -672,7 +672,7 @@ mod tests {
         let summary = validator.startup_summary();
         assert!(summary.hrm_mode);
         assert_eq!(summary.algorithm, "HS512");
-        assert_eq!(summary.issuer.as_deref(), Some("restaurant-access"));
+        assert_eq!(summary.issuer.as_deref(), Some("hrm-gm-group-access"));
         assert_eq!(summary.subject_claim, "userid");
         assert!(!summary.verify_audience);
         assert_eq!(
