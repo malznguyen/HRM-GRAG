@@ -8,7 +8,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::auth::hrm::{HrmConfig, HrmConfigError};
 use crate::auth::test_bypass_enabled;
@@ -253,6 +254,37 @@ impl JwtValidator {
         self.hrm.is_some()
     }
 
+    /// Ảnh chụp cấu hình xác thực đã đọc từ env, dùng để log lúc khởi động.
+    ///
+    /// Chỉ chứa mode / thuật toán / claim / scope id — cố tình KHÔNG chứa
+    /// `JWT_HMAC_SECRET` hay bất kỳ material ký nào, vì giá trị này đi thẳng ra log.
+    pub fn startup_summary(&self) -> AuthStartupSummary {
+        AuthStartupSummary {
+            hrm_mode: self.hrm_mode(),
+            algorithm: algorithm_name(self.algorithm),
+            issuer: self.issuer.clone(),
+            subject_claim: self.subject_claim.clone(),
+            verify_audience: self.verify_audience,
+            hrm_tenant_id: self.hrm.as_ref().map(|config| config.tenant_id),
+            hrm_workspace_id: self.hrm.as_ref().map(|config| config.workspace_id),
+        }
+    }
+
+    /// Một dòng INFO lúc khởi động xác nhận service đã đọc đúng cấu hình HRM từ `.env`.
+    pub fn log_auth_config_on_startup(&self) {
+        let summary = self.startup_summary();
+        info!(
+            hrm_mode = summary.hrm_mode,
+            jwt_alg = summary.algorithm,
+            jwt_issuer = summary.issuer.as_deref().unwrap_or(UNSET),
+            jwt_subject_claim = %summary.subject_claim,
+            jwt_verify_audience = summary.verify_audience,
+            hrm_tenant_id = %optional_uuid(summary.hrm_tenant_id),
+            hrm_workspace_id = %optional_uuid(summary.hrm_workspace_id),
+            "Auth configuration loaded"
+        );
+    }
+
     async fn decoding_key_for(&self, kid: &str) -> Result<DecodingKey, JwtError> {
         {
             let cache = self.keys.read().await;
@@ -317,6 +349,33 @@ impl JwtValidator {
         *self.keys.write().await = next;
         Ok(())
     }
+}
+
+/// Giá trị hiển thị khi một trường cấu hình không được đặt (tránh log chuỗi rỗng khó đọc).
+const UNSET: &str = "<unset>";
+
+/// Cấu hình xác thực đã resolve, an toàn để log (không chứa secret).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthStartupSummary {
+    pub hrm_mode: bool,
+    pub algorithm: &'static str,
+    pub issuer: Option<String>,
+    pub subject_claim: String,
+    pub verify_audience: bool,
+    pub hrm_tenant_id: Option<Uuid>,
+    pub hrm_workspace_id: Option<Uuid>,
+}
+
+fn algorithm_name(algorithm: Algorithm) -> &'static str {
+    match algorithm {
+        Algorithm::RS256 => "RS256",
+        Algorithm::HS512 => "HS512",
+        _ => "unsupported",
+    }
+}
+
+fn optional_uuid(value: Option<Uuid>) -> String {
+    value.map_or_else(|| UNSET.to_string(), |id| id.to_string())
 }
 
 fn validation_rejection_reason(error: &ErrorKind) -> &'static str {
@@ -599,6 +658,40 @@ mod tests {
             reqwest::Url::parse("not-a-url").is_err(),
             true
         );
+    }
+
+    #[test]
+    fn startup_summary_reports_hrm_config_without_leaking_the_secret() {
+        let secret = b"phase5-startup-secret-must-not-be-logged";
+        let mut validator = hs512_validator_with_subject(secret, false, "userid");
+        validator.hrm = Some(HrmConfig {
+            tenant_id: Uuid::parse_str("a47ab6d6-bf77-4c8c-a22d-a4f1997eb18d").unwrap(),
+            workspace_id: Uuid::parse_str("fa76881f-6367-4b80-a89e-a3e01206a806").unwrap(),
+        });
+
+        let summary = validator.startup_summary();
+        assert!(summary.hrm_mode);
+        assert_eq!(summary.algorithm, "HS512");
+        assert_eq!(summary.issuer.as_deref(), Some("restaurant-access"));
+        assert_eq!(summary.subject_claim, "userid");
+        assert!(!summary.verify_audience);
+        assert_eq!(
+            summary.hrm_workspace_id,
+            Some(Uuid::parse_str("fa76881f-6367-4b80-a89e-a3e01206a806").unwrap())
+        );
+
+        // Dòng log khởi động dựng từ summary; secret không được xuất hiện ở đó.
+        let rendered = format!("{summary:?}");
+        assert!(!rendered.contains(&String::from_utf8_lossy(secret).to_string()));
+    }
+
+    #[test]
+    fn startup_summary_reports_disabled_hrm_mode() {
+        let summary = hs512_validator(b"phase5-secret", true).startup_summary();
+        assert!(!summary.hrm_mode);
+        assert_eq!(summary.hrm_tenant_id, None);
+        assert_eq!(summary.hrm_workspace_id, None);
+        assert_eq!(optional_uuid(summary.hrm_workspace_id), UNSET);
     }
 
     #[test]

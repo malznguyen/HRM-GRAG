@@ -54,6 +54,8 @@ async fn main() {
 
     let jwt = auth::jwt::JwtValidator::from_env()
         .expect("Failed to initialize JWT validator from env");
+    // Phase 5.1: xác nhận ngay ở log khởi động rằng cấu hình HRM được đọc từ `.env`.
+    jwt.log_auth_config_on_startup();
 
     let authz_client =
         auth::authz::AuthzClient::from_env().expect("Failed to initialize AuthzClient from env");
