@@ -40,9 +40,9 @@ use routes::chat::{
     workspace_chat_history,
 };
 use routes::documents::{
-    delete_document, get_document_chunk, get_document_preview, get_document_shares, list_documents,
-    patch_document_access_mode, put_document_permissions, retry_document_ingestion,
-    revoke_document_share, share_document, upload_document,
+    delete_document, get_document_chunk, get_document_preview, get_document_shares,
+    get_document_status, list_documents, patch_document_access_mode, put_document_permissions,
+    retry_document_ingestion, revoke_document_share, share_document, upload_document,
 };
 use routes::graph::get_workspace_graph;
 use routes::members::{
@@ -261,7 +261,59 @@ async fn check_dependency(
     }
 }
 
+/// Resolve alias `hrm` ở vị trí `{workspace_id}` **trước khi routing**, một lần cho
+/// toàn bộ router.
+///
+/// Đặt ở đây thay vì trong từng handler là có chủ đích: alias chạy ở route này mà
+/// không chạy ở route kia là thứ khó hiểu nhất đối với người tích hợp, và mọi handler
+/// vẫn giữ nguyên `Path<Uuid>` — chúng không cần biết alias tồn tại. Vì URI được viết
+/// lại trước khi match route, `ensure_scope`, rate limit, metrics và log đều nhìn thấy
+/// UUID thật.
+///
+/// Khi `HRM_MODE=false` thì `hrm_config()` là `None` và request đi qua nguyên trạng:
+/// `hrm` lại chỉ là một chuỗi không parse được thành UUID, đúng như hành vi cũ.
+async fn resolve_hrm_workspace_alias(
+    State(state): State<AppState>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(config) = state.jwt.hrm_config() {
+        if let Some(path) = auth::hrm::resolve_workspace_alias_path(request.uri().path(), config) {
+            if let Some(uri) = replace_uri_path(request.uri(), &path) {
+                *request.uri_mut() = uri;
+            }
+        }
+    }
+
+    next.run(request).await
+}
+
+/// Thay path của URI, giữ nguyên query. Trả `None` nếu ghép lại không ra URI hợp lệ —
+/// khi đó request đi tiếp với URI gốc thay vì bị từ chối bởi một lỗi nội bộ.
+fn replace_uri_path(uri: &axum::http::Uri, path: &str) -> Option<axum::http::Uri> {
+    let path_and_query = match uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    };
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(path_and_query.parse().ok()?);
+    axum::http::Uri::from_parts(parts).ok()
+}
+
 pub fn app_router(state: AppState) -> Router {
+    let hrm_alias_layer =
+        axum::middleware::from_fn_with_state(state.clone(), resolve_hrm_workspace_alias);
+
+    // `Router::layer` chạy **sau** khi axum đã match route và bóc `Path<Uuid>`, nên
+    // viết lại URI ở đó là quá muộn — alias đã fail parse từ trước. Router ngoài này
+    // không có route nào, chỉ có fallback_service, nên request luôn đi qua middleware
+    // rồi mới tới bước routing thật bên trong.
+    Router::new()
+        .fallback_service(routed_app(state))
+        .layer(hrm_alias_layer)
+}
+
+fn routed_app(state: AppState) -> Router {
     let cors = cors_layer();
     let rate_limit_layer = axum::middleware::from_fn(rate_limit::enforce_rate_limits);
     telemetry::init_metrics_recorder();
@@ -285,7 +337,7 @@ pub fn app_router(state: AppState) -> Router {
         )
         .route(
             "/workspaces/{workspace_id}/documents/{document_id}",
-            delete(delete_document),
+            get(get_document_status).delete(delete_document),
         )
         .route(
             "/workspaces/{workspace_id}/documents/{document_id}/retry",

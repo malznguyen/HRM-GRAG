@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::api_error::ApiError;
 use crate::auth::authz::{Authz, AuthzClient, Object, Relation};
+use crate::auth::hrm::HrmChatPermission;
 use crate::chat::deepseek::{DeepseekTokenParser, deepseek_stream_idle_timeout, next_stream_token};
 use crate::chat::retrieval::{StoredChatMessage, fetch_session_chat_messages};
 use crate::chat::{
@@ -79,6 +80,25 @@ pub struct ResolvedCitation {
     pub document_name: String,
     pub snippet: String,
     pub chunk_index: i32,
+}
+
+#[derive(Serialize)]
+struct StreamCitationsResponse {
+    citations: Vec<StreamCitation>,
+}
+
+#[derive(Serialize)]
+struct StreamCitation {
+    index: usize,
+    chunk_id: Uuid,
+    document_id: Uuid,
+    document_name: String,
+    snippet: String,
+}
+
+struct SseEventPayload {
+    event: &'static str,
+    data: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -268,6 +288,48 @@ fn truncate_citation_snippet(text: &str) -> String {
     let mut snippet = prefix.into_iter().collect::<String>();
     snippet.push('…');
     snippet
+}
+
+fn build_stream_citations(
+    chunk_ids: &[Uuid],
+    citations: Vec<ResolvedCitation>,
+) -> Vec<StreamCitation> {
+    let mut citation_by_chunk = citations
+        .into_iter()
+        .map(|citation| (citation.chunk_id, citation))
+        .collect::<HashMap<_, _>>();
+
+    chunk_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(position, chunk_id)| {
+            citation_by_chunk
+                .remove(chunk_id)
+                .map(|citation| StreamCitation {
+                    index: position + 1,
+                    chunk_id: citation.chunk_id,
+                    document_id: citation.document_id,
+                    document_name: citation.document_name,
+                    snippet: citation.snippet,
+                })
+        })
+        .collect()
+}
+
+fn terminal_sse_events(citations: Vec<StreamCitation>, session_id: Uuid) -> [SseEventPayload; 2] {
+    let citation_data = serde_json::to_string(&StreamCitationsResponse { citations })
+        .expect("stream citation payload contains only infallible JSON values");
+
+    [
+        SseEventPayload {
+            event: "citations",
+            data: citation_data,
+        },
+        SseEventPayload {
+            event: "done",
+            data: session_id.to_string(),
+        },
+    ]
 }
 
 pub async fn list_workspace_chat_sessions(
@@ -510,6 +572,7 @@ impl Drop for PersistAssistantOnDrop {
 pub async fn workspace_chat(
     State(state): State<AppState>,
     authz: Authz,
+    _chat_permission: HrmChatPermission,
     Path(workspace_id): Path<Uuid>,
     Json(body): Json<ChatRequest>,
 ) -> impl IntoResponse {
@@ -597,6 +660,9 @@ pub async fn workspace_chat(
     let workspace_id_for_acl = workspace_id;
     let session_id = body.session_id;
     let chunk_ids = context.chunk_ids;
+    let citation_chunk_ids = chunk_ids.clone();
+    let citation_state = state.clone();
+    let citation_user_id = authz.user_id.clone();
     let byte_stream = deepseek_response.bytes_stream();
     let idle_timeout = deepseek_stream_idle_timeout();
 
@@ -657,9 +723,30 @@ pub async fn workspace_chat(
         // Persistence nằm trong Drop của `_persist_guard` (xem PersistAssistantOnDrop):
         // đặt ở đây thì đường client-disconnect không bao giờ chạy tới.
 
-        yield Ok::<Event, Infallible>(
-            Event::default().event("done").data(session_id.to_string()),
-        );
+        // `citation_chunk_ids` comes from the ACL-rechecked chat context.
+        let hydrated_citations = match hydrate_citations(
+            &citation_state,
+            workspace_id_for_acl,
+            &citation_user_id,
+            citation_chunk_ids.clone(),
+        )
+        .await
+        {
+            Ok(citations) => citations,
+            Err(_) => {
+                tracing::warn!(
+                    %session_id,
+                    "Failed to hydrate SSE citations; sending an empty citation list"
+                );
+                Vec::new()
+            }
+        };
+        let stream_citations = build_stream_citations(&citation_chunk_ids, hydrated_citations);
+        for payload in terminal_sse_events(stream_citations, session_id) {
+            yield Ok::<Event, Infallible>(
+                Event::default().event(payload.event).data(payload.data),
+            );
+        }
     };
 
     Sse::new(event_stream)
@@ -726,10 +813,12 @@ fn chat_pipeline_error_response(err: ChatPipelineError) -> axum::response::Respo
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use futures::StreamExt;
+    use serde_json::Value;
 
     struct DropFlag(Arc<AtomicBool>);
 
@@ -769,5 +858,40 @@ mod tests {
             fired.load(Ordering::SeqCst),
             "Drop phải chạy khi generator bị huỷ giữa chừng — nếu fail, cơ chế persist đã hỏng"
         );
+    }
+
+    #[test]
+    fn citations_event_precedes_done_and_uses_prompt_marker_index() {
+        let first_chunk = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let second_chunk = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let document_id = Uuid::parse_str("99999999-8888-7777-6666-555555555555").unwrap();
+        let session_id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
+        let citations = vec![ResolvedCitation {
+            chunk_id: second_chunk,
+            document_id,
+            document_name: "policy.pdf".to_string(),
+            snippet: "Second retrieved passage".to_string(),
+            chunk_index: 8,
+        }];
+
+        let stream_citations = build_stream_citations(&[first_chunk, second_chunk], citations);
+        let events = terminal_sse_events(stream_citations, session_id);
+
+        assert_eq!(events[0].event, "citations");
+        assert_eq!(events[1].event, "done");
+        let payload: Value = serde_json::from_str(&events[0].data).unwrap();
+        assert_eq!(payload["citations"][0]["index"], 2);
+        assert_eq!(payload["citations"][0]["chunk_id"], second_chunk.to_string());
+        assert_eq!(events[1].data, session_id.to_string());
+    }
+
+    #[test]
+    fn citations_event_is_present_with_an_empty_array_when_no_chunks_exist() {
+        let session_id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
+        let events = terminal_sse_events(build_stream_citations(&[], Vec::new()), session_id);
+
+        assert_eq!(events[0].event, "citations");
+        assert_eq!(events[0].data, r#"{"citations":[]}"#);
+        assert_eq!(events[1].event, "done");
     }
 }

@@ -1,11 +1,17 @@
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, Validation, decode, decode_header,
+    errors::ErrorKind,
+};
 use reqwest::Client;
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
+use uuid::Uuid;
 
+use crate::auth::hrm::{HrmConfig, HrmConfigError};
 use crate::auth::test_bypass_enabled;
 
 /// Connect timeout mặc định khi fetch JWKS (giây). JWKS fetch nằm trên request path
@@ -14,6 +20,7 @@ const DEFAULT_JWKS_CONNECT_TIMEOUT_SECS: u64 = 3;
 /// Request timeout mặc định khi fetch JWKS (giây). Ít khi chạy (key được cache) nhưng
 /// vẫn phải bounded để không treo request đầu tiên sau khi key xoay vòng.
 const DEFAULT_JWKS_REQUEST_TIMEOUT_SECS: u64 = 5;
+const JWT_CLOCK_LEEWAY_SECS: u64 = 60;
 
 /// Dựng HTTP client cho JWKS fetch với connect + request timeout (đọc từ env, có default).
 fn build_jwks_client() -> Client {
@@ -43,6 +50,8 @@ pub struct JwtClaims {
     pub sub: String,
     pub email: Option<String>,
     pub email_verified: bool,
+    pub role: Option<String>,
+    pub permissions: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -60,44 +69,68 @@ struct Jwk {
     e: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct OidcClaims {
-    sub: String,
-    email: Option<String>,
-    email_verified: Option<bool>,
-}
-
 pub struct JwtValidator {
+    algorithm: Algorithm,
     issuer: Option<String>,
     audience: Option<String>,
+    verify_audience: bool,
+    subject_claim: String,
+    hrm: Option<HrmConfig>,
     jwks_url: Option<String>,
+    hmac_key: Option<DecodingKey>,
     client: Client,
     keys: Arc<RwLock<HashMap<String, DecodingKey>>>,
 }
 
 impl JwtValidator {
     pub fn from_env() -> Result<Arc<Self>, JwtError> {
+        let hrm = HrmConfig::from_env().map_err(hrm_config_error)?;
         if test_bypass_enabled("TEST_BYPASS_JWT") {
             return Ok(Arc::new(Self {
+                algorithm: Algorithm::RS256,
                 issuer: None,
                 audience: None,
+                verify_audience: true,
+                subject_claim: "sub".to_string(),
+                hrm,
                 jwks_url: None,
+                hmac_key: None,
                 client: build_jwks_client(),
                 keys: Arc::new(RwLock::new(HashMap::new())),
             }));
         }
 
+        let algorithm = configured_algorithm()?;
         let issuer = required_env("JWT_ISSUER")?;
         if issuer == "http://test-bypass-jwt" {
             return Err(JwtError::InvalidConfig("JWT_ISSUER"));
         }
-        let audience = required_env("JWT_AUDIENCE")?;
-        let jwks_url = required_http_url("JWT_JWKS_URL")?;
+        let verify_audience = optional_bool("JWT_VERIFY_AUDIENCE", true)?;
+        let subject_claim = optional_env("JWT_SUBJECT_CLAIM")?.unwrap_or_else(|| "sub".to_string());
+        let audience = if verify_audience {
+            Some(required_env("JWT_AUDIENCE")?)
+        } else {
+            optional_env("JWT_AUDIENCE")?
+        };
+
+        let (jwks_url, hmac_key) = match algorithm {
+            Algorithm::RS256 => (Some(required_http_url("JWT_JWKS_URL")?), None),
+            Algorithm::HS512 => {
+                let secret = required_env("JWT_HMAC_SECRET")?;
+                (None, Some(DecodingKey::from_secret(secret.as_bytes())))
+            }
+            _ => return Err(JwtError::InvalidConfig("JWT_ALG")),
+        };
 
         Ok(Arc::new(Self {
+            algorithm,
             issuer: Some(issuer),
-            audience: Some(audience),
-            jwks_url: Some(jwks_url),
+            audience,
+            verify_audience,
+            subject_claim,
+            hrm,
+            jwks_url,
+            hmac_key,
             client: build_jwks_client(),
             keys: Arc::new(RwLock::new(HashMap::new())),
         }))
@@ -113,46 +146,143 @@ impl JwtValidator {
                 sub: sub.to_string(),
                 email: None,
                 email_verified: false,
+                role: None,
+                permissions: Vec::new(),
             });
         }
 
-        let header = decode_header(token).map_err(|err| {
-            error!(%err, "JWT header decode failed");
+        let header = decode_header(token).map_err(|_| {
+            warn!("JWT rejected: malformed header");
             JwtError::InvalidToken
         })?;
-        let kid = header.kid.ok_or_else(|| {
-            error!("JWT header missing kid");
-            JwtError::UnknownKeyId
-        })?;
-        let key = self.decoding_key_for(&kid).await?;
+        if header.alg != self.algorithm {
+            warn!(
+                "JWT rejected: algorithm mismatch (configured={:?}, token header={:?})",
+                self.algorithm, header.alg
+            );
+            return Err(JwtError::InvalidToken);
+        }
+
+        let key = match self.algorithm {
+            Algorithm::HS512 => self
+                .hmac_key
+                .as_ref()
+                .ok_or(JwtError::MissingConfig("JWT_HMAC_SECRET"))?
+                .clone(),
+            Algorithm::RS256 => {
+                let kid = header.kid.ok_or_else(|| {
+                    warn!("JWT rejected: missing key id");
+                    JwtError::UnknownKeyId
+                })?;
+                self.decoding_key_for(&kid).await?
+            }
+            _ => return Err(JwtError::InvalidToken),
+        };
 
         let issuer = self
             .issuer
             .as_deref()
             .ok_or(JwtError::MissingConfig("JWT_ISSUER"))?;
-        let audience = self
-            .audience
-            .as_deref()
-            .ok_or(JwtError::MissingConfig("JWT_AUDIENCE"))?;
-        let mut validation = Validation::new(Algorithm::RS256);
+        let mut validation = Validation::new(self.algorithm);
         validation.set_issuer(&[issuer]);
-        validation.set_audience(&[audience]);
+        if self.verify_audience {
+            let audience = self
+                .audience
+                .as_deref()
+                .ok_or(JwtError::MissingConfig("JWT_AUDIENCE"))?;
+            validation.set_audience(&[audience]);
+            validation.required_spec_claims.insert("aud".to_string());
+        } else {
+            validation.validate_aud = false;
+        }
         validation.validate_exp = true;
+        validation.leeway = JWT_CLOCK_LEEWAY_SECS;
 
-        let token_data = decode::<OidcClaims>(token, &key, &validation).map_err(|err| {
-            error!(%err, issuer = %issuer, kid = %kid, "JWT decode/validation failed");
+        let token_data = decode::<Value>(token, &key, &validation).map_err(|err| {
+            let reason = validation_rejection_reason(err.kind());
+            warn!("JWT rejected: {reason}");
             JwtError::InvalidToken
         })?;
-        let sub = token_data.claims.sub.trim();
-        if sub.is_empty() {
-            return Err(JwtError::InvalidToken);
-        }
+        let sub = token_data
+            .claims
+            .get(&self.subject_claim)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                warn!("JWT rejected: missing or invalid subject claim");
+                JwtError::InvalidToken
+            })?;
 
         Ok(JwtClaims {
             sub: sub.to_string(),
-            email: token_data.claims.email,
-            email_verified: token_data.claims.email_verified.unwrap_or(false),
+            email: token_data
+                .claims
+                .get("email")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            email_verified: token_data
+                .claims
+                .get("email_verified")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            role: token_data
+                .claims
+                .get("role")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            permissions: token_data
+                .claims
+                .get("permissions")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })
+    }
+
+    pub fn hrm_config(&self) -> Option<&HrmConfig> {
+        self.hrm.as_ref()
+    }
+
+    pub fn hrm_mode(&self) -> bool {
+        self.hrm.is_some()
+    }
+
+    /// Ảnh chụp cấu hình xác thực đã đọc từ env, dùng để log lúc khởi động.
+    ///
+    /// Chỉ chứa mode / thuật toán / claim / scope id — cố tình KHÔNG chứa
+    /// `JWT_HMAC_SECRET` hay bất kỳ material ký nào, vì giá trị này đi thẳng ra log.
+    pub fn startup_summary(&self) -> AuthStartupSummary {
+        AuthStartupSummary {
+            hrm_mode: self.hrm_mode(),
+            algorithm: algorithm_name(self.algorithm),
+            issuer: self.issuer.clone(),
+            subject_claim: self.subject_claim.clone(),
+            verify_audience: self.verify_audience,
+            hrm_tenant_id: self.hrm.as_ref().map(|config| config.tenant_id),
+            hrm_workspace_id: self.hrm.as_ref().map(|config| config.workspace_id),
+        }
+    }
+
+    /// Một dòng INFO lúc khởi động xác nhận service đã đọc đúng cấu hình HRM từ `.env`.
+    pub fn log_auth_config_on_startup(&self) {
+        let summary = self.startup_summary();
+        info!(
+            hrm_mode = summary.hrm_mode,
+            jwt_alg = summary.algorithm,
+            jwt_issuer = summary.issuer.as_deref().unwrap_or(UNSET),
+            jwt_subject_claim = %summary.subject_claim,
+            jwt_verify_audience = summary.verify_audience,
+            hrm_tenant_id = %optional_uuid(summary.hrm_tenant_id),
+            hrm_workspace_id = %optional_uuid(summary.hrm_workspace_id),
+            "Auth configuration loaded"
+        );
     }
 
     async fn decoding_key_for(&self, kid: &str) -> Result<DecodingKey, JwtError> {
@@ -221,12 +351,82 @@ impl JwtValidator {
     }
 }
 
+/// Giá trị hiển thị khi một trường cấu hình không được đặt (tránh log chuỗi rỗng khó đọc).
+const UNSET: &str = "<unset>";
+
+/// Cấu hình xác thực đã resolve, an toàn để log (không chứa secret).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthStartupSummary {
+    pub hrm_mode: bool,
+    pub algorithm: &'static str,
+    pub issuer: Option<String>,
+    pub subject_claim: String,
+    pub verify_audience: bool,
+    pub hrm_tenant_id: Option<Uuid>,
+    pub hrm_workspace_id: Option<Uuid>,
+}
+
+fn algorithm_name(algorithm: Algorithm) -> &'static str {
+    match algorithm {
+        Algorithm::RS256 => "RS256",
+        Algorithm::HS512 => "HS512",
+        _ => "unsupported",
+    }
+}
+
+fn optional_uuid(value: Option<Uuid>) -> String {
+    value.map_or_else(|| UNSET.to_string(), |id| id.to_string())
+}
+
+fn validation_rejection_reason(error: &ErrorKind) -> &'static str {
+    match error {
+        ErrorKind::ExpiredSignature => "token expired",
+        ErrorKind::InvalidIssuer => "issuer mismatch",
+        ErrorKind::InvalidAudience => "audience mismatch",
+        ErrorKind::MissingRequiredClaim(claim) if claim == "aud" => "audience claim missing",
+        ErrorKind::InvalidSignature => "signature mismatch",
+        _ => "validation failed",
+    }
+}
+
+fn configured_algorithm() -> Result<Algorithm, JwtError> {
+    match optional_env("JWT_ALG")?.as_deref().unwrap_or("RS256") {
+        "RS256" => Ok(Algorithm::RS256),
+        "HS512" => Ok(Algorithm::HS512),
+        _ => Err(JwtError::InvalidConfig("JWT_ALG")),
+    }
+}
+
+fn hrm_config_error(error: HrmConfigError) -> JwtError {
+    if error.invalid {
+        JwtError::InvalidConfig(error.key)
+    } else {
+        JwtError::MissingConfig(error.key)
+    }
+}
+
+fn optional_bool(name: &'static str, default: bool) -> Result<bool, JwtError> {
+    match optional_env(name)?.as_deref() {
+        None => Ok(default),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(_) => Err(JwtError::InvalidConfig(name)),
+    }
+}
+
+fn optional_env(name: &'static str) -> Result<Option<String>, JwtError> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let value = value.to_string_lossy().trim().to_string();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
 fn required_env(name: &'static str) -> Result<String, JwtError> {
-    let value = std::env::var(name).map_err(|_| JwtError::MissingConfig(name))?;
-    let value = value.trim();
-    (!value.is_empty())
-        .then(|| value.trim_end_matches('/').to_string())
-        .ok_or(JwtError::MissingConfig(name))
+    optional_env(name)?.ok_or(JwtError::MissingConfig(name))
 }
 
 fn required_http_url(name: &'static str) -> Result<String, JwtError> {
@@ -240,13 +440,277 @@ fn required_http_url(name: &'static str) -> Result<String, JwtError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use jsonwebtoken::{EncodingKey, Header, encode};
+    use serde_json::json;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn hs512_validator(secret: &[u8], verify_audience: bool) -> JwtValidator {
+        hs512_validator_with_subject(secret, verify_audience, "sub")
+    }
+
+    fn hs512_validator_with_subject(
+        secret: &[u8],
+        verify_audience: bool,
+        subject_claim: &str,
+    ) -> JwtValidator {
+        JwtValidator {
+            algorithm: Algorithm::HS512,
+            issuer: Some("hrm-gm-group-access".to_string()),
+            audience: verify_audience.then(|| "gmrag-api".to_string()),
+            verify_audience,
+            subject_claim: subject_claim.to_string(),
+            hrm: None,
+            jwks_url: None,
+            hmac_key: Some(DecodingKey::from_secret(secret)),
+            client: build_jwks_client(),
+            keys: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn now_seconds() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_secs()
+    }
+
+    fn token(algorithm: Algorithm, secret: &[u8], claims: serde_json::Value) -> String {
+        encode(
+            &Header::new(algorithm),
+            &claims,
+            &EncodingKey::from_secret(secret),
+        )
+        .expect("token encoding")
+    }
+
+    fn none_token(claims: serde_json::Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("claims JSON"));
+        format!("{header}.{payload}.")
+    }
+
+    #[tokio::test]
+    async fn accepts_hs512_with_issuer_audience_and_expiry() {
+        let secret = b"phase2-test-secret";
+        let validator = hs512_validator(secret, true);
+        let claims = json!({
+            "sub": "employee-1",
+            "iss": "hrm-gm-group-access",
+            "aud": "gmrag-api",
+            "exp": now_seconds() + 3600
+        });
+
+        let result = validator.validate(&token(Algorithm::HS512, secret, claims)).await;
+
+        assert_eq!(
+            result.expect("valid token").sub,
+            "employee-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn audience_verification_can_be_disabled_for_hrm_tokens() {
+        let secret = b"phase3-test-secret";
+        let claims_without_audience = json!({
+            "sub": "employee-1",
+            "iss": "hrm-gm-group-access",
+            "exp": now_seconds() + 3600
+        });
+        let token_without_audience = token(Algorithm::HS512, secret, claims_without_audience);
+
+        assert!(
+            hs512_validator(secret, false)
+                .validate(&token_without_audience)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            hs512_validator(secret, true)
+                .validate(&token_without_audience)
+                .await,
+            Err(JwtError::InvalidToken)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_wrong_secret_and_algorithm_mismatch() {
+        let validator = hs512_validator(b"correct-secret", false);
+        let claims = json!({
+            "sub": "employee-1",
+            "iss": "hrm-gm-group-access",
+            "exp": now_seconds() + 3600
+        });
+
+        assert_eq!(
+            validator
+                .validate(&token(Algorithm::HS512, b"wrong-secret", claims.clone()))
+                .await,
+            Err(JwtError::InvalidToken)
+        );
+        assert_eq!(
+            validator
+                .validate(&token(Algorithm::HS256, b"correct-secret", claims))
+                .await,
+            Err(JwtError::InvalidToken)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_expired_and_wrong_issuer_tokens() {
+        let secret = b"phase2-test-secret";
+        let validator = hs512_validator(secret, false);
+
+        let expired = json!({
+            "sub": "employee-1",
+            "iss": "hrm-gm-group-access",
+            "exp": now_seconds().saturating_sub(61)
+        });
+        let wrong_issuer = json!({
+            "sub": "employee-1",
+            "iss": "wrong-issuer",
+            "exp": now_seconds() + 3600
+        });
+
+        assert_eq!(
+            validator.validate(&token(Algorithm::HS512, secret, expired)).await,
+            Err(JwtError::InvalidToken)
+        );
+        assert_eq!(
+            validator
+                .validate(&token(Algorithm::HS512, secret, wrong_issuer))
+                .await,
+            Err(JwtError::InvalidToken)
+        );
+    }
+
+    #[tokio::test]
+    async fn uses_configured_subject_claim_without_sub_fallback() {
+        let secret = b"phase2-test-secret";
+        let validator = hs512_validator_with_subject(secret, false, "userid");
+        let valid_claims = json!({
+            "userid": "employee-1",
+            "sub": "untrusted-sub",
+            "iss": "hrm-gm-group-access",
+            "exp": now_seconds() + 3600,
+            "role": "EMPLOYEE",
+            "permissions": ["CHATBOT_USE", "DOCUMENT_READ"]
+        });
+        let missing_claims = json!({
+            "sub": "employee-1",
+            "iss": "hrm-gm-group-access",
+            "exp": now_seconds() + 3600
+        });
+
+        let claims = validator
+            .validate(&token(Algorithm::HS512, secret, valid_claims))
+            .await
+            .expect("userid claim");
+        assert_eq!(claims.sub, "employee-1");
+        assert_eq!(claims.role.as_deref(), Some("EMPLOYEE"));
+        assert_eq!(claims.permissions, ["CHATBOT_USE", "DOCUMENT_READ"]);
+        assert_eq!(
+            validator
+                .validate(&token(Algorithm::HS512, secret, missing_claims))
+                .await,
+            Err(JwtError::InvalidToken)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_none_header_and_invalid_hrm_roles() {
+        let secret = b"phase2-test-secret";
+        let validator = hs512_validator_with_subject(secret, false, "userid");
+        let claims = json!({
+            "userid": "employee-1",
+            "iss": "hrm-gm-group-access",
+            "exp": now_seconds() + 3600
+        });
+
+        assert_eq!(
+            validator.validate(&none_token(claims.clone())).await,
+            Err(JwtError::InvalidToken)
+        );
+
+        for role in [
+            Some(json!("SUPERVISOR")),
+            Some(json!("")),
+            Some(json!(42)),
+            None,
+        ] {
+            let mut role_claims = claims.clone();
+            if let Some(role) = role {
+                role_claims["role"] = role;
+            }
+            let parsed = validator
+                .validate(&token(Algorithm::HS512, secret, role_claims))
+                .await
+                .expect("signature and standard claims are valid");
+            assert!(crate::auth::hrm::HrmConfig::role_relation(parsed.role.as_deref()).is_err());
+        }
+    }
 
     #[test]
-    fn rejects_missing_or_unsafe_runtime_jwt_configuration() {
+    fn rejects_invalid_algorithm_and_audience_configuration() {
+        assert_eq!(configured_algorithm(), Ok(Algorithm::RS256));
+        assert_eq!(optional_bool("JWT_VERIFY_AUDIENCE_MISSING", true), Ok(true));
         assert_eq!(
-            required_http_url("JWT_JWKS_URL_MISSING"),
-            Err(JwtError::MissingConfig("JWT_JWKS_URL_MISSING"))
+            reqwest::Url::parse("not-a-url").is_err(),
+            true
         );
-        assert_eq!(reqwest::Url::parse("not-a-url").is_err(), true);
+    }
+
+    #[test]
+    fn startup_summary_reports_hrm_config_without_leaking_the_secret() {
+        let secret = b"phase5-startup-secret-must-not-be-logged";
+        let mut validator = hs512_validator_with_subject(secret, false, "userid");
+        validator.hrm = Some(HrmConfig {
+            tenant_id: Uuid::parse_str("a47ab6d6-bf77-4c8c-a22d-a4f1997eb18d").unwrap(),
+            workspace_id: Uuid::parse_str("fa76881f-6367-4b80-a89e-a3e01206a806").unwrap(),
+        });
+
+        let summary = validator.startup_summary();
+        assert!(summary.hrm_mode);
+        assert_eq!(summary.algorithm, "HS512");
+        assert_eq!(summary.issuer.as_deref(), Some("hrm-gm-group-access"));
+        assert_eq!(summary.subject_claim, "userid");
+        assert!(!summary.verify_audience);
+        assert_eq!(
+            summary.hrm_workspace_id,
+            Some(Uuid::parse_str("fa76881f-6367-4b80-a89e-a3e01206a806").unwrap())
+        );
+
+        // Dòng log khởi động dựng từ summary; secret không được xuất hiện ở đó.
+        let rendered = format!("{summary:?}");
+        assert!(!rendered.contains(&String::from_utf8_lossy(secret).to_string()));
+    }
+
+    #[test]
+    fn startup_summary_reports_disabled_hrm_mode() {
+        let summary = hs512_validator(b"phase5-secret", true).startup_summary();
+        assert!(!summary.hrm_mode);
+        assert_eq!(summary.hrm_tenant_id, None);
+        assert_eq!(summary.hrm_workspace_id, None);
+        assert_eq!(optional_uuid(summary.hrm_workspace_id), UNSET);
+    }
+
+    #[test]
+    fn validation_rejection_reasons_do_not_include_claim_values() {
+        assert_eq!(
+            validation_rejection_reason(&ErrorKind::ExpiredSignature),
+            "token expired"
+        );
+        assert_eq!(
+            validation_rejection_reason(&ErrorKind::InvalidIssuer),
+            "issuer mismatch"
+        );
+        assert_eq!(
+            validation_rejection_reason(&ErrorKind::MissingRequiredClaim("aud".to_string())),
+            "audience claim missing"
+        );
+        assert_eq!(
+            validation_rejection_reason(&ErrorKind::InvalidSignature),
+            "signature mismatch"
+        );
     }
 }

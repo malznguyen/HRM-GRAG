@@ -1,6 +1,7 @@
 pub mod authz;
 pub mod document_acl;
 pub mod extractor;
+pub mod hrm;
 pub mod jwt;
 pub mod keycloak;
 pub mod outbox;

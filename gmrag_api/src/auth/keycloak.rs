@@ -31,6 +31,7 @@ fn build_keycloak_client() -> Client {
 #[derive(Clone)]
 pub struct KeycloakClient {
     client: Client,
+    disabled: bool,
     admin_url: String,
     realm: String,
     client_id: String,
@@ -54,10 +55,23 @@ pub struct KeycloakUser {
 }
 
 impl KeycloakClient {
+    pub fn disabled() -> Self {
+        Self {
+            client: build_keycloak_client(),
+            disabled: true,
+            admin_url: String::new(),
+            realm: String::new(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            token_cache: Arc::new(RwLock::new(None)),
+        }
+    }
+
     pub fn from_env() -> Result<Self, String> {
         if test_bypass_enabled("TEST_BYPASS_KEYCLOAK") {
             return Ok(Self {
                 client: build_keycloak_client(),
+                disabled: false,
                 admin_url: "http://test-bypass-keycloak".to_string(),
                 realm: "test".to_string(),
                 client_id: "test".to_string(),
@@ -72,6 +86,7 @@ impl KeycloakClient {
         let client_secret = required_env("KEYCLOAK_CLIENT_SECRET")?;
         Ok(Self {
             client: build_keycloak_client(),
+            disabled: false,
             admin_url: admin_url.trim_end_matches('/').to_string(),
             realm,
             client_id,
@@ -129,6 +144,9 @@ impl KeycloakClient {
         &self,
         email: &str,
     ) -> Result<Option<KeycloakUser>, reqwest::Error> {
+        if self.disabled {
+            return Ok(None);
+        }
         if test_bypass_enabled("TEST_BYPASS_KEYCLOAK") {
             // Map email cố định cho integration test (tenant owner + member add)
             let bypass_user: Option<(String, String)> = match email {
@@ -208,6 +226,9 @@ impl KeycloakClient {
         &self,
         user_id: &str,
     ) -> Result<Option<KeycloakUser>, reqwest::Error> {
+        if self.disabled {
+            return Ok(None);
+        }
         if test_bypass_enabled("TEST_BYPASS_KEYCLOAK") {
             return Ok(Some(KeycloakUser {
                 id: user_id.to_string(),
@@ -238,6 +259,9 @@ impl KeycloakClient {
         &self,
         email: &str,
     ) -> Result<Vec<KeycloakUser>, reqwest::Error> {
+        if self.disabled {
+            return Ok(Vec::new());
+        }
         if test_bypass_enabled("TEST_BYPASS_KEYCLOAK") {
             return Ok(Vec::new());
         }

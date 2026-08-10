@@ -1634,6 +1634,10 @@ async fn documents_list_fields_search_pagination_and_acl_total() {
         .unwrap();
     assert_eq!(member_retry.status(), reqwest::StatusCode::FORBIDDEN);
 
+    // 5.3: DELETE giấu sự tồn tại giống GET — không quyền và không tồn tại đều 404.
+    // `/documents/{id}` dùng chung path cho GET và DELETE; nếu DELETE trả 403 thì chỉ
+    // cần đổi method là dò ra tài liệu có thật hay không, đúng thứ GET cố tình giấu.
+    // Khác `retry` ở trên: đó là path riêng nên vẫn giữ 403.
     let member_delete = client
         .delete(format!(
             "{}/workspaces/{workspace_id}/documents/{public_alpha}",
@@ -1643,7 +1647,13 @@ async fn documents_list_fields_search_pagination_and_acl_total() {
         .send()
         .await
         .unwrap();
-    assert_eq!(member_delete.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(member_delete.status(), reqwest::StatusCode::NOT_FOUND);
+    let member_delete_body: Value = member_delete.json().await.unwrap();
+    assert_eq!(
+        member_delete_body["error"]["code"],
+        json!("RESOURCE_NOT_FOUND"),
+        "DELETE bị từ chối phải dùng đúng error code như GET một tài liệu không tồn tại"
+    );
 
     let viewer_response = client
         .get(format!(

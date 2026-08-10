@@ -177,6 +177,14 @@ function Get-MinioObjectCount {
     return [int](@($output)[-1].Trim())
 }
 
+# Compose chạy OpenFGA với OPENFGA_AUTHN_METHOD=preshared, nên mọi lời gọi API phải
+# kèm bearer token; thiếu là 401 "bearer_token_missing". Trả về hashtable rỗng khi
+# không cấu hình token, để stack chạy authn=none vẫn dùng được các hàm này.
+function Get-OpenFgaHeaders {
+    if ([string]::IsNullOrWhiteSpace($env:OPENFGA_API_TOKEN)) { return @{} }
+    return @{ Authorization = "Bearer $($env:OPENFGA_API_TOKEN)" }
+}
+
 function Get-OpenFgaStores {
     param([Parameter(Mandatory)][string]$ApiUrl)
 
@@ -186,7 +194,7 @@ function Get-OpenFgaStores {
     do {
         $uri = "$base/stores?page_size=100"
         if ($token) { $uri += "&continuation_token=$([Uri]::EscapeDataString($token))" }
-        $response = Invoke-RestMethod -Method Get -Uri $uri
+        $response = Invoke-RestMethod -Method Get -Uri $uri -Headers (Get-OpenFgaHeaders)
         $stores += @($response.stores)
         $token = $response.continuation_token
     } while ($token)
@@ -202,9 +210,9 @@ function Get-OpenFgaModel {
 
     $base = $ApiUrl.TrimEnd('/')
     if ($ModelId) {
-        return (Invoke-RestMethod -Method Get -Uri "$base/stores/$StoreId/authorization-models/$ModelId").authorization_model
+        return (Invoke-RestMethod -Method Get -Uri "$base/stores/$StoreId/authorization-models/$ModelId" -Headers (Get-OpenFgaHeaders)).authorization_model
     }
-    $response = Invoke-RestMethod -Method Get -Uri "$base/stores/$StoreId/authorization-models?page_size=1"
+    $response = Invoke-RestMethod -Method Get -Uri "$base/stores/$StoreId/authorization-models?page_size=1" -Headers (Get-OpenFgaHeaders)
     $models = @($response.authorization_models)
     if ($models.Count -ne 1) { throw "Could not resolve exactly one source OpenFGA model." }
     return $models[0]
@@ -220,7 +228,7 @@ function New-TestOpenFgaStore {
 
     if ($StoreName -notmatch '^gmrag-test-[a-z0-9-]+$') { throw "Refusing unsafe test OpenFGA store name: $StoreName" }
     $base = $ApiUrl.TrimEnd('/')
-    $store = Invoke-RestMethod -Method Post -Uri "$base/stores" -ContentType "application/json" -Body (@{ name = $StoreName } | ConvertTo-Json -Compress)
+    $store = Invoke-RestMethod -Method Post -Uri "$base/stores" -Headers (Get-OpenFgaHeaders) -ContentType "application/json" -Body (@{ name = $StoreName } | ConvertTo-Json -Compress)
     try {
         $sourceModel = Get-OpenFgaModel -ApiUrl $base -StoreId $SourceStoreId -ModelId $SourceModelId
         $modelBody = @{
@@ -228,7 +236,7 @@ function New-TestOpenFgaStore {
             type_definitions = @($sourceModel.type_definitions)
             conditions = $sourceModel.conditions
         }
-        $model = Invoke-RestMethod -Method Post -Uri "$base/stores/$($store.id)/authorization-models" -ContentType "application/json" -Body ($modelBody | ConvertTo-Json -Depth 100 -Compress)
+        $model = Invoke-RestMethod -Method Post -Uri "$base/stores/$($store.id)/authorization-models" -Headers (Get-OpenFgaHeaders) -ContentType "application/json" -Body ($modelBody | ConvertTo-Json -Depth 100 -Compress)
         return [pscustomobject]@{
             StoreId = $store.id
             StoreName = $store.name
@@ -236,7 +244,7 @@ function New-TestOpenFgaStore {
         }
     }
     catch {
-        try { Invoke-RestMethod -Method Delete -Uri "$base/stores/$($store.id)" | Out-Null } catch {}
+        try { Invoke-RestMethod -Method Delete -Uri "$base/stores/$($store.id)" -Headers (Get-OpenFgaHeaders) | Out-Null } catch {}
         throw
     }
 }
@@ -250,12 +258,12 @@ function Remove-TestOpenFgaStore {
 
     if ($ExpectedName -notmatch '^gmrag-test-[a-z0-9-]+$') { throw "Refusing unsafe test OpenFGA store name: $ExpectedName" }
     $base = $ApiUrl.TrimEnd('/')
-    try { $store = Invoke-RestMethod -Method Get -Uri "$base/stores/$StoreId" } catch {
+    try { $store = Invoke-RestMethod -Method Get -Uri "$base/stores/$StoreId" -Headers (Get-OpenFgaHeaders) } catch {
         if ($_.Exception.Response.StatusCode -eq 404) { return }
         throw
     }
     if ($store.name -ne $ExpectedName) { throw "Refusing to delete OpenFGA store $StoreId because its name is '$($store.name)', not '$ExpectedName'." }
-    Invoke-RestMethod -Method Delete -Uri "$base/stores/$StoreId" | Out-Null
+    Invoke-RestMethod -Method Delete -Uri "$base/stores/$StoreId" -Headers (Get-OpenFgaHeaders) | Out-Null
 }
 
 function Get-OpenFgaTuples {
@@ -270,7 +278,7 @@ function Get-OpenFgaTuples {
     do {
         $body = @{ page_size = 100 }
         if ($token) { $body.continuation_token = $token }
-        $response = Invoke-RestMethod -Method Post -Uri "$base/stores/$StoreId/read" -ContentType "application/json" -Body ($body | ConvertTo-Json -Compress)
+        $response = Invoke-RestMethod -Method Post -Uri "$base/stores/$StoreId/read" -Headers (Get-OpenFgaHeaders) -ContentType "application/json" -Body ($body | ConvertTo-Json -Compress)
         $tuples += @($response.tuples)
         $token = $response.continuation_token
     } while ($token)
@@ -290,7 +298,7 @@ function Remove-AllOpenFgaTuples {
         $keys = @($tuples[$offset..$last] | ForEach-Object {
             @{ user = $_.key.user; relation = $_.key.relation; object = $_.key.object }
         })
-        Invoke-RestMethod -Method Post -Uri "$base/stores/$StoreId/write" -ContentType "application/json" -Body (@{ deletes = @{ tuple_keys = $keys } } | ConvertTo-Json -Depth 8 -Compress) | Out-Null
+        Invoke-RestMethod -Method Post -Uri "$base/stores/$StoreId/write" -Headers (Get-OpenFgaHeaders) -ContentType "application/json" -Body (@{ deletes = @{ tuple_keys = $keys } } | ConvertTo-Json -Depth 8 -Compress) | Out-Null
     }
     return $tuples.Count
 }
@@ -312,6 +320,11 @@ printf '%s\r\n' '__METHOD__ __PATH__ HTTP/1.1' 'Host: localhost' 'Content-Type: 
 cat <&3
 '@
     $command = $template.Replace('__BODY__', $Body).Replace('__METHOD__', $Method).Replace('__PATH__', $Path)
+    # Trên Windows file này được checkout dạng CRLF, nên here-string mang theo `\r` ở
+    # cuối mỗi dòng. bash trong container coi `\r` là một phần của token: cổng thành
+    # "6333\r" và `exec 3<>/dev/tcp/...` chết bằng "Servname not supported for
+    # ai_socktype". Chuẩn hoá về LF trước khi đưa sang bash.
+    $command = $command.Replace("`r`n", "`n").Replace("`r", "`n")
     Push-Location $Root
     try {
         $output = @(& docker compose exec -T qdrant bash -lc $command 2>&1)

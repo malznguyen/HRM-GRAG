@@ -1,29 +1,31 @@
+name: hrm-rag
+
 services:
-  # DB chính cho ứng dụng GMRAG
+  # DB chính cho ứng dụng HRM-RAG
   postgres:
     image: pgvector/pgvector:pg16
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:15432:5432"
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-gmrag_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
-      POSTGRES_DB: ${POSTGRES_DB:-gmrag}
+      POSTGRES_USER: ${POSTGRES_USER:-hrm_rag_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hrm-rag-db-local}
+      POSTGRES_DB: ${POSTGRES_DB:-hrm_rag}
     volumes:
-      - ./.docker_data/postgres:/var/lib/postgresql/data
+      - ./.docker_data/hrm_rag/postgres:/var/lib/postgresql/data
 
   # DB riêng cho OpenFGA (không dùng chung DB với ứng dụng chính)
   openfga-postgres:
     image: postgres:16
     ports:
-      - "127.0.0.1:5433:5432"
+      - "127.0.0.1:15433:5432"
     environment:
-      POSTGRES_USER: ${OPENFGA_DB_USER:-fga_user}
-      POSTGRES_PASSWORD: ${OPENFGA_DB_PASSWORD:-fga_password}
-      POSTGRES_DB: ${OPENFGA_DB_NAME:-openfga}
+      POSTGRES_USER: ${OPENFGA_DB_USER:-hrm_fga_user}
+      POSTGRES_PASSWORD: ${OPENFGA_DB_PASSWORD:-hrm-fga-db-local}
+      POSTGRES_DB: ${OPENFGA_DB_NAME:-hrm_rag_openfga}
     volumes:
-      - ./.docker_data/openfga_postgres:/var/lib/postgresql/data
+      - ./.docker_data/hrm_rag/openfga_postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U fga_user -d openfga"]
+      test: ["CMD-SHELL", "pg_isready -U ${OPENFGA_DB_USER:-hrm_fga_user} -d ${OPENFGA_DB_NAME:-hrm_rag_openfga}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -34,7 +36,7 @@ services:
     command: migrate
     environment:
       - OPENFGA_DATASTORE_ENGINE=postgres
-      - OPENFGA_DATASTORE_URI=postgres://fga_user:fga_password@openfga-postgres:5432/openfga?sslmode=disable
+      - OPENFGA_DATASTORE_URI=postgres://${OPENFGA_DB_USER:-hrm_fga_user}:${OPENFGA_DB_PASSWORD:-hrm-fga-db-local}@openfga-postgres:5432/${OPENFGA_DB_NAME:-hrm_rag_openfga}?sslmode=disable
     depends_on:
       openfga-postgres:
         condition: service_healthy
@@ -44,11 +46,11 @@ services:
     image: openfga/openfga:v1.5.0
     command: run
     ports:
-      - "127.0.0.1:8081:8080" # Map cổng 8081 trên host để tránh xung đột với cổng 8080 của API backend GMRAG
-      - "127.0.0.1:8082:8081" # Cổng gRPC
+      - "127.0.0.1:18081:8080"
+      - "127.0.0.1:18082:8081" # Cổng gRPC
     environment:
       - OPENFGA_DATASTORE_ENGINE=postgres
-      - OPENFGA_DATASTORE_URI=postgres://fga_user:fga_password@openfga-postgres:5432/openfga?sslmode=disable
+      - OPENFGA_DATASTORE_URI=postgres://${OPENFGA_DB_USER:-hrm_fga_user}:${OPENFGA_DB_PASSWORD:-hrm-fga-db-local}@openfga-postgres:5432/${OPENFGA_DB_NAME:-hrm_rag_openfga}?sslmode=disable
       # OpenFGA là gốc tin cậy của toàn hệ thống: ai gọi được API này là ghi thẳng
       # tuple, tự cấp admin trên mọi workspace. Bắt buộc preshared token.
       - OPENFGA_AUTHN_METHOD=preshared
@@ -65,13 +67,13 @@ services:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
     ports:
-      - "127.0.0.1:9000:9000"
-      - "127.0.0.1:9001:9001"
+      - "127.0.0.1:19000:9000"
+      - "127.0.0.1:19001:9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
     volumes:
-      - ./.docker_data/minio:/data
+      - ./.docker_data/hrm_rag/minio:/data
 
   # Tạo bucket mặc định cho local dev
   minio-init:
@@ -81,7 +83,7 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
-      S3_BUCKET: ${S3_BUCKET:-gmrag-documents}
+      S3_BUCKET: ${S3_BUCKET:-hrm-rag-documents}
     entrypoint: >
       /bin/sh -c "
       until /usr/bin/mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD; do
@@ -96,9 +98,9 @@ services:
   qdrant:
     image: qdrant/qdrant:v1.18.2
     ports:
-      - "127.0.0.1:6333:6333"
+      - "127.0.0.1:16333:6333"
     volumes:
-      - ./.docker_data/qdrant:/qdrant/storage
+      - ./.docker_data/hrm_rag/qdrant:/qdrant/storage
 
   # Ollama local cho embedding ADR-21. Model được operator import từ GGUF q8_0.
   ollama:
@@ -111,9 +113,9 @@ services:
               count: all
               capabilities: [gpu]
     ports:
-      - "127.0.0.1:11434:11434"
+      - "127.0.0.1:11435:11434"
     volumes:
-      - ./.docker_data/ollama:/root/.ollama
+      - ./.docker_data/hrm_rag/ollama:/root/.ollama
       - ./docker/ollama:/models:ro
     healthcheck:
       test: ["CMD", "ollama", "list"]
@@ -128,7 +130,7 @@ services:
     image: quay.io/keycloak/keycloak:26.6.4
     command: ["start-dev", "--import-realm"]
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:18080:8080"
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
@@ -141,7 +143,7 @@ services:
     build:
       context: ./gmrag_api
       dockerfile: ../docker/outbox-workers.Dockerfile
-    image: gmrag/outbox-workers:local
+    image: hrm-rag/outbox-workers:local
     restart: unless-stopped
     depends_on:
       postgres:
@@ -153,16 +155,16 @@ services:
       ollama:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-gmrag_user}:${POSTGRES_PASSWORD:-change_me}@postgres:5432/${POSTGRES_DB:-gmrag}
+      DATABASE_URL: postgres://${POSTGRES_USER:-hrm_rag_user}:${POSTGRES_PASSWORD:-hrm-rag-db-local}@postgres:5432/${POSTGRES_DB:-hrm_rag}
       S3_ENDPOINT_URL: http://minio:9000
       S3_REGION: ${S3_REGION:-us-east-1}
-      S3_BUCKET: ${S3_BUCKET:-gmrag-documents}
+      S3_BUCKET: ${S3_BUCKET:-hrm-rag-documents}
       S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
       S3_PRESIGN_EXPIRY_SECS: ${S3_PRESIGN_EXPIRY_SECS:-900}
       QDRANT_URL: http://qdrant:6333
-      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-gmrag_document_chunks}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-hrm_rag_document_chunks}
       QDRANT_VECTOR_SIZE: ${QDRANT_VECTOR_SIZE:-1024}
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       OLLAMA_EMBED_URL: http://ollama:11434/api/embed
@@ -170,7 +172,7 @@ services:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
       DEEPSEEK_API_URL: ${DEEPSEEK_API_URL:-https://api.deepseek.com/chat/completions}
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-flash}
-      GMRAG_GRAPH_EXTRACTION_ENABLED: ${GMRAG_GRAPH_EXTRACTION_ENABLED:-true}
+      GMRAG_GRAPH_EXTRACTION_ENABLED: ${GMRAG_GRAPH_EXTRACTION_ENABLED:-false}
       GMRAG_GRAPH_EXTRACTION_TIMEOUT_SECS: ${GMRAG_GRAPH_EXTRACTION_TIMEOUT_SECS:-60}
       GMRAG_GRAPH_EXTRACTION_STAGE_TIMEOUT_SECS: ${GMRAG_GRAPH_EXTRACTION_STAGE_TIMEOUT_SECS:-300}
       INGESTION_WORKER_POLL_INTERVAL_MS: ${INGESTION_WORKER_POLL_INTERVAL_MS:-1000}
@@ -193,13 +195,13 @@ services:
     build:
       context: ./gmrag_api
       dockerfile: ../docker/outbox-workers.Dockerfile
-    image: gmrag/outbox-workers:local
+    image: hrm-rag/outbox-workers:local
     restart: unless-stopped
     depends_on:
       - postgres
       - openfga
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-gmrag_user}:${POSTGRES_PASSWORD:-change_me}@postgres:5432/${POSTGRES_DB:-gmrag}
+      DATABASE_URL: postgres://${POSTGRES_USER:-hrm_rag_user}:${POSTGRES_PASSWORD:-hrm-rag-db-local}@postgres:5432/${POSTGRES_DB:-hrm_rag}
       OPENFGA_API_URL: http://openfga:8080
       OPENFGA_STORE_ID: ${OPENFGA_STORE_ID:-}
       OPENFGA_MODEL_ID: ${OPENFGA_MODEL_ID:-}
@@ -216,15 +218,15 @@ services:
     build:
       context: ./gmrag_api
       dockerfile: ../docker/outbox-workers.Dockerfile
-    image: gmrag/outbox-workers:local
+    image: hrm-rag/outbox-workers:local
     restart: unless-stopped
     depends_on:
       - postgres
       - qdrant
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-gmrag_user}:${POSTGRES_PASSWORD:-change_me}@postgres:5432/${POSTGRES_DB:-gmrag}
+      DATABASE_URL: postgres://${POSTGRES_USER:-hrm_rag_user}:${POSTGRES_PASSWORD:-hrm-rag-db-local}@postgres:5432/${POSTGRES_DB:-hrm_rag}
       QDRANT_URL: http://qdrant:6333
-      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-gmrag_document_chunks}
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-hrm_rag_document_chunks}
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       QDRANT_OUTBOX_BATCH_SIZE: ${QDRANT_OUTBOX_BATCH_SIZE:-50}
       QDRANT_OUTBOX_MAX_RETRIES: ${QDRANT_OUTBOX_MAX_RETRIES:-5}
@@ -242,7 +244,7 @@ services:
     build:
       context: ./gmrag_api
       dockerfile: ../docker/outbox-workers.Dockerfile
-    image: gmrag/outbox-workers:local
+    image: hrm-rag/outbox-workers:local
     restart: unless-stopped
     depends_on:
       postgres:
@@ -250,10 +252,10 @@ services:
       minio-init:
         condition: service_completed_successfully
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER:-gmrag_user}:${POSTGRES_PASSWORD:-change_me}@postgres:5432/${POSTGRES_DB:-gmrag}
+      DATABASE_URL: postgres://${POSTGRES_USER:-hrm_rag_user}:${POSTGRES_PASSWORD:-hrm-rag-db-local}@postgres:5432/${POSTGRES_DB:-hrm_rag}
       S3_ENDPOINT_URL: http://minio:9000
       S3_REGION: ${S3_REGION:-us-east-1}
-      S3_BUCKET: ${S3_BUCKET:-gmrag-documents}
+      S3_BUCKET: ${S3_BUCKET:-hrm-rag-documents}
       S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
       S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
       S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}

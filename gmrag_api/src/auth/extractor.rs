@@ -1,4 +1,5 @@
 use crate::api_error::ApiError;
+use crate::auth::hrm::{HrmProvisionError, HrmScopeError, ensure_scope, provision_identity};
 use crate::auth::jwt::JwtError;
 use crate::state::AppState;
 use axum::{
@@ -29,11 +30,58 @@ impl FromRequestParts<AppState> for AuthUser {
 
         let claims = state.jwt.validate(token).await.map_err(jwt_rejection)?;
 
+        if let Some(config) = state.jwt.hrm_config() {
+            ensure_scope(parts.uri.path(), config).map_err(hrm_scope_rejection)?;
+            provision_identity(&state.pool, &state.authz_client, config, &claims)
+                .await
+                .map_err(hrm_provision_rejection)?;
+        }
+
+        parts.extensions.insert(claims.clone());
+
         Ok(AuthUser {
             user_id: claims.sub,
             email: claims.email,
             email_verified: claims.email_verified,
         })
+    }
+}
+
+fn hrm_scope_rejection(error: HrmScopeError) -> ApiError {
+    let message = match error {
+        HrmScopeError::Tenant(tenant_id) => {
+            format!("HRM token is scoped to a different tenant: {tenant_id}")
+        }
+        HrmScopeError::Workspace(workspace_id) => {
+            format!("HRM token is scoped to a different workspace: {workspace_id}")
+        }
+    };
+    ApiError::new(StatusCode::BAD_REQUEST, "HRM_SCOPE_MISMATCH", message)
+}
+
+fn hrm_provision_rejection(error: HrmProvisionError) -> ApiError {
+    match error {
+        HrmProvisionError::InvalidRole => ApiError::new(
+            StatusCode::FORBIDDEN,
+            "HRM_ROLE_REQUIRED",
+            "A valid HRM role is required",
+        ),
+        HrmProvisionError::Database(error) => {
+            tracing::error!(%error, "Failed to provision HRM user");
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "INTERNAL_ERROR",
+                "Authentication provisioning failed",
+            )
+        }
+        HrmProvisionError::Authz(error) => {
+            tracing::error!(%error, "Failed to synchronize HRM authorization");
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "AUTHZ_ERROR",
+                "Authorization service unavailable",
+            )
+        }
     }
 }
 

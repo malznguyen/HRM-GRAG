@@ -122,7 +122,7 @@ if ($devBucket -like "gmrag-test-*") { throw "Configured dev bucket uses the res
 $fgaUrl = Get-RequiredEnvironmentValue -Name "OPENFGA_API_URL"
 Assert-LocalUrl -Name "OPENFGA_API_URL" -Value $fgaUrl | Out-Null
 $devStoreId = Get-RequiredEnvironmentValue -Name "OPENFGA_STORE_ID"
-$devStore = Invoke-RestMethod -Method Get -Uri "$($fgaUrl.TrimEnd('/'))/stores/$devStoreId"
+$devStore = Invoke-RestMethod -Method Get -Uri "$($fgaUrl.TrimEnd('/'))/stores/$devStoreId" -Headers (Get-OpenFgaHeaders)
 if ($devStore.name -like "gmrag-test-*") { throw "Configured dev OpenFGA store uses the reserved test prefix." }
 
 $lockPath = Join-Path ([IO.Path]::GetTempPath()) "gmrag-test-isolation.lock"
@@ -209,6 +209,18 @@ try {
     $env:TEST_OPENFGA_STORE_NAME = $storeName
     $env:OPENFGA_STORE_ID = $fgaNamespace.StoreId
     $env:OPENFGA_MODEL_ID = $fgaNamespace.ModelId
+    # Import-GmragEnvironment kéo cả `.env` vào process env, nên cấu hình auth của máy
+    # dev sẽ chảy thẳng vào test process. Ghim cả nhóm về mặc định để suite luôn chạy
+    # trên một cấu hình auth cố định, không phụ thuộc `.env` của người chạy:
+    #   HRM_MODE          — HrmConfig::from_env() được đọc trước cả nhánh TEST_BYPASS_JWT,
+    #                       nếu để `true` thì mọi integration test bị ensure_scope từ chối
+    #                       bằng HRM_SCOPE_MISMATCH.
+    #   JWT_ALG           — configured_algorithm() đọc trực tiếp biến này; `.env` đặt HS512
+    #                       cho HRM sẽ làm unit test khẳng định mặc định RS256 fail.
+    #   JWT_SUBJECT_CLAIM — cùng lý do, mặc định của code là `sub`.
+    $env:HRM_MODE = "false"
+    $env:JWT_ALG = "RS256"
+    $env:JWT_SUBJECT_CLAIM = "sub"
     $env:CARGO_INCREMENTAL = "0"
     $env:RUST_TEST_THREADS = "1"
 
@@ -225,7 +237,10 @@ try {
         }
         else {
             Remove-Item Env:GMRAG_TEST_FORCE_PANIC -ErrorAction SilentlyContinue
-            & cargo test --locked
+            # --no-fail-fast: cargo mặc định dừng ngay ở test target đầu tiên fail, nên một
+            # target hỏng che mất kết quả của tất cả target còn lại. Vẫn trả exit code khác 0
+            # khi có test đỏ — chỉ là báo cáo đầy đủ thay vì dừng giữa chừng.
+            & cargo test --locked --no-fail-fast
             $testExitCode = $LASTEXITCODE
         }
     }

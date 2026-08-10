@@ -1,0 +1,1324 @@
+openapi: 3.1.0
+
+info:
+  title: HRM RAG API — HRM integration surface
+  version: "0.1.0-phase4"
+  summary: The five endpoints the HRM backend needs to upload, track, delete documents and run grounded chat.
+  description: |
+    This specification documents **only** the endpoints the HRM backend consumes.
+    The running service registers more routes (members, tenants, sharing, graph,
+    chat sessions, preview, metrics, ...). They are intentionally excluded — see
+    `docs/PHASE4_RESULT.md` for the exclusion list and the reasons.
+
+    Everything here was derived from the Rust source in `gmrag_api/src`:
+    `lib.rs` (router), `routes/documents.rs`, `routes/chat.rs`,
+    `document_directory.rs`, `document_format.rs`, `api_error.rs`,
+    `auth/extractor.rs`, `auth/hrm.rs`, `auth/authz.rs`, `ingestion/jobs.rs`
+    and `ingestion/processor.rs`.
+
+    IMPORTANT — read `docs/api/INTEGRATION_GUIDE.md` before writing a client.
+    OpenAPI cannot express the framing of a Server-Sent Events stream, and the
+    chat endpoint has a token-splitting behaviour that WILL break a naive
+    consumer. The guide documents it with a verbatim captured stream.
+
+    There is no `/v1` prefix. Paths are exactly as registered in
+    `gmrag_api/src/lib.rs`.
+  contact:
+    name: HRM RAG backend team
+    url: https://example.invalid/replace-with-real-contact
+  license:
+    name: Proprietary — internal use only
+    identifier: LicenseRef-Proprietary
+
+servers:
+  - url: http://{host}:{port}
+    description: >-
+      Bind address comes from `API_BIND_ADDR`. Code default is `127.0.0.1:8083`;
+      the value shipped in `gmrag_api/.env.example` is `127.0.0.1:18083`.
+      TODO: the production base URL for HRM has not been decided yet.
+    variables:
+      host:
+        default: "127.0.0.1"
+      port:
+        default: "18083"
+
+tags:
+  - name: Health
+    description: Unauthenticated liveness probe.
+  - name: Documents
+    description: Upload, processing status and deletion of source documents.
+  - name: Chat
+    description: Grounded question answering, streamed as Server-Sent Events.
+
+security:
+  - HrmBearerAuth: []
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      operationId: getHealth
+      summary: Liveness probe
+      description: |
+        Runs `SELECT 1` against PostgreSQL. No authentication, no authorization.
+        This does **not** check Qdrant, object storage, OpenFGA, the embedding
+        provider or the LLM provider — a `200` here does not mean chat or
+        ingestion will succeed.
+      security: []
+      responses:
+        "200":
+          description: The API process is up and PostgreSQL answered.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              examples:
+                ok:
+                  value:
+                    status: ok
+                    db: connected
+        "500":
+          description: The `SELECT 1` probe failed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                internal:
+                  value:
+                    error:
+                      code: INTERNAL_ERROR
+                      message: Internal server error
+
+  /workspaces/{workspace_id}/documents/upload:
+    post:
+      tags: [Documents]
+      operationId: uploadDocuments
+      summary: Upload one or more documents for asynchronous indexing
+      description: |
+        Accepts `multipart/form-data`. Requires both the exact
+        `CHATBOT_UPLOAD_DOCUMENT` entry in the token's `permissions` array and
+        the `admin` relation on the workspace. The permission check runs before
+        multipart parsing; missing permission returns
+        `403 CHATBOT_UPLOAD_PERMISSION_REQUIRED`. The default HRM seed grants
+        this permission to `ADMIN` and `HR`, but not to `MANAGER` or `EMPLOYEE`.
+        A caller with the permission but without the `admin` relation is still
+        rejected with `403 WORKSPACE_ADMIN_REQUIRED`.
+
+        **Processing is asynchronous.** A `202` only means the row was created
+        and an ingestion job was enqueued (`status=PROCESSING`,
+        `processing_stage=QUEUED`). The document is not searchable until
+        `status=COMPLETED` and `processing_stage=DONE`. Poll
+        `GET /workspaces/{workspace_id}/documents/{document_id}`.
+
+        **Format detection ignores the declared part content type.** The server
+        sniffs the bytes: a structurally loadable PDF, or a ZIP containing both
+        `[Content_Types].xml` and `word/document.xml` (DOCX). Anything else must
+        be valid non-empty UTF-8 with no NUL byte *and* carry a `.txt` or `.md`
+        extension. Everything else is rejected.
+
+        **Partial success is reported, not silent.** Every `file` part that is
+        oversized, undetectable, or fails to store is listed in `rejected` with
+        a machine-readable `reason_code`. Read `rejected` — do not infer failure
+        by comparing the length of `documents` against the number of parts you
+        sent. If *every* part is rejected the call returns `400 INVALID_REQUEST`
+        and the same list is carried in `error.details.rejected`.
+
+        Uploading the same bytes twice creates two independent documents — there
+        is no idempotency key and no checksum-based deduplication.
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/UploadDocumentsRequest"
+            encoding:
+              file:
+                contentType: application/pdf, application/vnd.openxmlformats-officedocument.wordprocessingml.document, text/plain, text/markdown
+              access_mode:
+                contentType: text/plain
+      responses:
+        "202":
+          description: |
+            At least one part was accepted, stored and enqueued. Persist every
+            returned `document_id` — it is the only handle for polling status
+            and for deletion.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UploadDocumentsResponse" }
+              examples:
+                single:
+                  summary: One accepted file
+                  value:
+                    documents:
+                      - document_id: 69f56ad1-f379-4705-9eb4-f58cbd269420
+                        filename: noi-quy-cong-ty-smoke.md
+                    rejected: []
+                partial:
+                  summary: Three parts sent, one accepted and two rejected
+                  value:
+                    documents:
+                      - document_id: 69f56ad1-f379-4705-9eb4-f58cbd269420
+                        filename: quy-dinh.md
+                    rejected:
+                      - filename: bang-luong.xlsx
+                        reason_code: UNSUPPORTED_MEDIA_TYPE
+                        message: File content is not a supported document format (PDF, DOCX, TXT, MD)
+                      - filename: anh.bin
+                        reason_code: UNSUPPORTED_MEDIA_TYPE
+                        message: File content is not a supported document format (PDF, DOCX, TXT, MD)
+        "400":
+          description: |
+            `INVALID_ACCESS_MODE` — the `access_mode` part is present but is not
+            `workspace_default` or `restricted`.
+            `INVALID_REQUEST` — no part survived validation. `error.details.rejected`
+            carries the same per-file reason list as the `202` response.
+            `HRM_SCOPE_MISMATCH` — the `{workspace_id}` in the path is not the
+            workspace this deployment is pinned to (HRM mode only).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                noAcceptableFile:
+                  value:
+                    error:
+                      code: INVALID_REQUEST
+                      message: Request did not contain an acceptable file
+                      details:
+                        rejected:
+                          - filename: bang-luong.xlsx
+                            reason_code: UNSUPPORTED_MEDIA_TYPE
+                            message: File content is not a supported document format (PDF, DOCX, TXT, MD)
+                invalidAccessMode:
+                  value:
+                    error:
+                      code: INVALID_ACCESS_MODE
+                      message: access_mode must be workspace_default or restricted
+                scopeMismatch:
+                  value:
+                    error:
+                      code: HRM_SCOPE_MISMATCH
+                      message: "HRM token is scoped to a different workspace: 00000000-0000-0000-0000-000000000001"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            `CHATBOT_UPLOAD_PERMISSION_REQUIRED` — `permissions` does not
+            contain the exact `CHATBOT_UPLOAD_DOCUMENT` entry.
+            `WORKSPACE_ADMIN_REQUIRED` — the caller is not a workspace admin.
+            `HRM_ROLE_REQUIRED` — the token carries no recognised HRM `role`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                uploadPermissionRequired:
+                  value:
+                    error:
+                      code: CHATBOT_UPLOAD_PERMISSION_REQUIRED
+                      message: CHATBOT_UPLOAD_DOCUMENT permission is required
+                adminRequired:
+                  value:
+                    error:
+                      code: WORKSPACE_ADMIN_REQUIRED
+                      message: Workspace admin access required
+                roleRequired:
+                  value:
+                    error:
+                      code: HRM_ROLE_REQUIRED
+                      message: A valid HRM role is required
+        "404":
+          description: The workspace does not exist.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                notFound: { $ref: "#/components/examples/ResourceNotFound" }
+        "413":
+          description: |
+            The whole request body exceeded `DOCUMENT_MAX_UPLOAD_BYTES`
+            (default 52428800 bytes = 50 MiB). This is a limit on the entire
+            multipart body, not per part.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                tooLarge:
+                  value:
+                    error:
+                      code: PAYLOAD_TOO_LARGE
+                      message: Request payload is too large
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspace_id}/documents/{document_id}:
+    get:
+      tags: [Documents]
+      operationId: getDocumentStatus
+      summary: Read the processing status of one document
+      description: |
+        Requires the `member` relation on the workspace, plus per-document ACL.
+        Poll this after an upload until `status` leaves `PROCESSING`.
+
+        **Every negative outcome collapses to `404`**, deliberately: a document
+        that does not exist, a document that belongs to a different workspace,
+        and a document the caller may not view are indistinguishable. A denied
+        authorization decision is also returned as `404` — only an authorization
+        *infrastructure* failure surfaces as `500 AUTHZ_ERROR`.
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - $ref: "#/components/parameters/DocumentId"
+      responses:
+        "200":
+          description: Current status of the document.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentStatusResponse" }
+              examples:
+                completed:
+                  summary: Verbatim capture from docs/PHASE3_RESULT.md
+                  value:
+                    document_id: 69f56ad1-f379-4705-9eb4-f58cbd269420
+                    filename: noi-quy-cong-ty-smoke.md
+                    status: COMPLETED
+                    processing_stage: DONE
+                    failure_code: null
+                    failure_message: null
+                    access_mode: workspace_default
+                    created_at: "2026-08-06T03:22:57.106555"
+                    updated_at: "2026-08-06T03:23:18.856347"
+                    chunk_count: 1
+                processing:
+                  summary: Immediately after upload (constructed from the INSERT in routes/documents.rs)
+                  value:
+                    document_id: 69f56ad1-f379-4705-9eb4-f58cbd269420
+                    filename: noi-quy-cong-ty-smoke.md
+                    status: PROCESSING
+                    processing_stage: QUEUED
+                    failure_code: null
+                    failure_message: null
+                    access_mode: workspace_default
+                    created_at: "2026-08-06T03:22:57.106555"
+                    updated_at: "2026-08-06T03:22:57.106555"
+                    chunk_count: 0
+                needsOcr:
+                  summary: Scanned PDF, terminal failure (code/message from ingestion/processor.rs)
+                  value:
+                    document_id: 69f56ad1-f379-4705-9eb4-f58cbd269420
+                    filename: hop-dong-scan.pdf
+                    status: FAILED
+                    processing_stage: FAILED
+                    failure_code: NEEDS_OCR
+                    failure_message: Document requires OCR and no OCR provider is available
+                    access_mode: workspace_default
+                    created_at: "2026-08-06T03:22:57.106555"
+                    updated_at: "2026-08-06T03:23:05.221904"
+                    chunk_count: 0
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: "`HRM_ROLE_REQUIRED` — the token carries no recognised HRM `role`. Note that a *workspace* authorization denial is reported as `404`, not `403`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                roleRequired:
+                  value:
+                    error:
+                      code: HRM_ROLE_REQUIRED
+                      message: A valid HRM role is required
+        "404":
+          description: Unknown document, foreign workspace, or not viewable by this caller.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                notFound: { $ref: "#/components/examples/ResourceNotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+    delete:
+      tags: [Documents]
+      operationId: deleteDocument
+      summary: Permanently delete a document
+      description: |
+        Requires the `admin` relation on the workspace. This is a hard delete,
+        not a soft delete or an archive.
+
+        Removed synchronously, inside one transaction: the OpenFGA relationship
+        tuples (revoked *before* the SQL commit), the `documents` row, its
+        chunks by cascade, and the graph provenance rows. Two durable outbox
+        rows are committed in the same transaction so that the object-storage
+        object and the Qdrant vector points are removed even if the process dies
+        immediately afterwards.
+
+        Object-storage and Qdrant cleanup then runs best-effort after the
+        commit. If it fails the endpoint still returns `204`, and a background
+        worker drains the outbox. So a `204` guarantees the document is gone
+        from SQL and from authorization, and guarantees the vector/object
+        cleanup is *scheduled* — not that it has already finished.
+
+        `document_id` is the only accepted handle. There is no delete-by-filename
+        and no delete-by-external-id.
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - $ref: "#/components/parameters/DocumentId"
+      responses:
+        "204":
+          description: Deleted. Empty body — this response does not use the error envelope.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            `HRM_ROLE_REQUIRED` — the token carries no recognised HRM `role`.
+            An *authorization* denial is not reported here: a caller who is not a
+            workspace admin gets `404`, exactly like `GET` on this path.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                roleRequired:
+                  value:
+                    error:
+                      code: HRM_ROLE_REQUIRED
+                      message: A valid HRM role is required
+        "404":
+          description: |
+            Unknown document, the document belongs to another workspace, **or**
+            the caller lacks the `admin` relation. These three are deliberately
+            indistinguishable — the same rule `GET` on this path already applied.
+            Changing method must not reveal whether a document exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                notFound: { $ref: "#/components/examples/ResourceNotFound" }
+        "500":
+          description: |
+            `AUTHZ_REVOKE_FAILED` — OpenFGA tuples could not be revoked, so
+            nothing was deleted. Safe to retry.
+            `INTERNAL_ERROR` — the delete transaction failed and was rolled back.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                revokeFailed:
+                  value:
+                    error:
+                      code: AUTHZ_REVOKE_FAILED
+                      message: Failed to revoke document authorization before deletion
+                internal:
+                  value:
+                    error:
+                      code: INTERNAL_ERROR
+                      message: Internal server error
+
+  /workspaces/{workspace_id}/documents:
+    get:
+      tags: [Documents]
+      operationId: listDocuments
+      summary: List documents in the workspace (OPTIONAL for HRM)
+      description: |
+        **Optional.** Not required for any of the five HRM use cases. Documented
+        because it is the only way to reconcile HRM's own records against what
+        the RAG service actually holds — for example to find documents whose
+        `document_id` HRM lost, or to sweep for `FAILED` documents.
+
+        Requires the `member` relation. Results are filtered by per-document ACL.
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - name: limit
+          in: query
+          required: false
+          description: Page size. Must be between 0 and 100 inclusive.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          description: Number of rows to skip. Must be non-negative.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            default: 0
+        - name: q
+          in: query
+          required: false
+          description: Case-insensitive substring match on `filename`. Blank/whitespace is treated as absent.
+          schema: { type: string }
+        - name: status
+          in: query
+          required: false
+          description: Exact status filter. Any other value is rejected with `400 INVALID_REQUEST`.
+          schema:
+            type: string
+            enum: [PROCESSING, COMPLETED, FAILED]
+      responses:
+        "200":
+          description: One page of documents, newest first (`created_at DESC, id DESC`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspaceDocumentsResponse" }
+        "400":
+          description: "`limit` out of range, negative `offset`, or an unrecognised `status`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                badPaging:
+                  value:
+                    error:
+                      code: INVALID_REQUEST
+                      message: limit must be between 0 and 100 and offset must be non-negative
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: The caller is not a member of the workspace, or has no recognised HRM role.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                forbidden:
+                  value:
+                    error:
+                      code: FORBIDDEN
+                      message: Access denied
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspace_id}/chat:
+    post:
+      tags: [Chat]
+      operationId: workspaceChat
+      summary: Ask a grounded question — response is an SSE stream
+      description: |
+        Requires the `member` relation on the workspace and, in HRM mode, the
+        `CHATBOT_USE` entry in the token's `permissions` array.
+
+        **The success response is `text/event-stream`, not JSON.** OpenAPI cannot
+        describe event framing, so the schema below only names the payload shape
+        of the two *named* events. Read section 2.6 of
+        `docs/api/INTEGRATION_GUIDE.md` before implementing — it contains a
+        verbatim captured stream and the one mistake that will definitely break
+        a first implementation.
+
+        The three things that matter most, in short:
+
+        1. Answer text arrives as unnamed events (SSE default type `message`).
+           The two terminal events are named: `citations`, then `done`.
+        2. **A `[chunk:N]` citation marker is split across several events.** In
+           the captured stream, `[chunk:1]` arrived as six separate events:
+           `[`, `ch`, `unk`, `:`, `1`, `]`. Concatenate the full answer before
+           running any marker regex. Never parse per event.
+        3. `citations[].index` is the `N` in `[chunk:N]`, and it is 1-based.
+
+        Ordering is guaranteed: text events, then exactly one `citations` event
+        (with an empty array when nothing was retrieved), then exactly one
+        `done` event whose data is the session UUID.
+
+        If the upstream LLM stream breaks mid-answer, an `error` event is emitted
+        with data `Generation service unavailable`, and the stream still
+        terminates normally with `citations` and `done`. HTTP status stays `200`
+        because headers were already sent.
+
+        A comment line `:keep-alive` is emitted every 15 seconds of silence.
+        Standard SSE parsers drop comment lines; a hand-rolled parser must too.
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ChatRequest" }
+            examples:
+              firstTurn:
+                summary: First turn — the client mints the session UUID
+                value:
+                  session_id: df093a48-ed78-4109-ac96-a75be34ab35c
+                  message: Giờ làm việc của công ty là mấy giờ?
+              followUp:
+                summary: Follow-up turn — same session_id, server reloads history
+                value:
+                  session_id: df093a48-ed78-4109-ac96-a75be34ab35c
+                  message: Thế còn ngày thứ Bảy?
+      responses:
+        "200":
+          description: |
+            The stream opened successfully. Note that `200` is committed as soon
+            as the first byte is sent, so a mid-stream failure cannot change it.
+          headers:
+            Content-Type:
+              description: Always `text/event-stream`.
+              schema: { type: string, const: text/event-stream }
+            Cache-Control:
+              description: Set by the SSE layer.
+              schema: { type: string }
+          x-sse-events:
+            description: >-
+              OpenAPI has no vocabulary for per-event schemas inside a stream, so
+              the payload shape of each SSE event type is declared here instead.
+              These are the schemas to generate client models from.
+            message:
+              summary: >-
+                Unnamed event (SSE default type). Data is a raw text fragment of
+                the answer, NOT JSON. Concatenate the data of every such event in
+                arrival order to rebuild the answer.
+              schema: { type: string }
+            citations:
+              summary: Sent exactly once, after all text and before `done`.
+              schema: { $ref: "#/components/schemas/CitationsEvent" }
+            done:
+              summary: >-
+                Sent exactly once, last. Data is the bare session UUID as text,
+                not JSON and not quoted. It echoes the `session_id` that was sent
+                in the request; reuse it for the next turn.
+              schema: { type: string, format: uuid }
+            error:
+              summary: >-
+                Optional, at most once, emitted when the upstream generation
+                stream breaks mid-answer. Data is a plain-text message. The
+                stream still ends with `citations` and `done`, and the HTTP
+                status remains 200.
+              schema: { type: string, const: Generation service unavailable }
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: >-
+                  Raw SSE framing. Unnamed events carry answer text fragments;
+                  the named `citations` event carries a CitationsEvent JSON
+                  object; the named `done` event carries the bare session UUID
+                  as text (not JSON); a named `error` event may appear before
+                  them carrying a plain-text message.
+              examples:
+                verbatimStream:
+                  summary: Verbatim capture from docs/PHASE3_RESULT.md
+                  value: |
+                    data: 08
+
+                    data: :
+
+                    data: 00
+
+                    data: -
+
+                    data: 17
+
+                    data: :
+
+                    data: 00
+
+                    data: [
+
+                    data: ch
+
+                    data: unk
+
+                    data: :
+
+                    data: 1
+
+                    data: ]
+
+                    event: citations
+                    data: {"citations":[{"index":1,"chunk_id":"3f601309-1f9e-4f88-9f16-1077bb849460","document_id":"69f56ad1-f379-4705-9eb4-f58cbd269420","document_name":"noi-quy-cong-ty-smoke.md","snippet":"# NỘI QUY CÔNG TY HRM — TÀI LIỆU KIỂM THỬ\n\n## Chương I. Quy định chung\n\n### Điều 1. Phạm vi áp dụng\n1. Nội quy này áp dụng cho toàn bộ nhân viên đang làm việc tại công ty HRM.\n2. Nhân viên có trách nhiệm đọc, hiểu và tuân thủ các quy định trong tài liệu.\n\n### Điều 2. Nguyên tắc…"}]}
+
+                    event: done
+                    data: df093a48-ed78-4109-ac96-a75be34ab35c
+                noCitations:
+                  summary: Nothing retrieved — the citations event is still sent, with an empty array
+                  value: |
+                    data: Tôi không tìm thấy thông tin này trong tài liệu.
+
+                    event: citations
+                    data: {"citations":[]}
+
+                    event: done
+                    data: df093a48-ed78-4109-ac96-a75be34ab35c
+        "400":
+          description: |
+            `INVALID_REQUEST` — `message` is empty or whitespace-only, or the
+            request body is not syntactically valid JSON.
+            `HRM_SCOPE_MISMATCH` — the path workspace is not the pinned one.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                emptyMessage:
+                  value:
+                    error:
+                      code: INVALID_REQUEST
+                      message: The request is invalid
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            `CHATBOT_PERMISSION_REQUIRED` — `permissions` does not contain
+            `CHATBOT_USE`. This is checked as a request extractor, so it fires
+            **before** body validation and before the membership check: a
+            malformed body plus a missing permission yields this `403`, not a
+            `400`.
+            `FORBIDDEN` — the caller is not a member of the workspace.
+            `HRM_ROLE_REQUIRED` — no recognised HRM `role` claim.
+            A `403` with message `Access denied` is also returned when the
+            `session_id` exists but belongs to a different user.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                chatbotPermission:
+                  value:
+                    error:
+                      code: CHATBOT_PERMISSION_REQUIRED
+                      message: CHATBOT_USE permission is required
+                notMember:
+                  value:
+                    error:
+                      code: FORBIDDEN
+                      message: Access denied
+        "415":
+          description: The `Content-Type` request header was not `application/json`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                unsupported:
+                  value:
+                    error:
+                      code: UNSUPPORTED_MEDIA_TYPE
+                      message: Unsupported media type
+        "422":
+          description: The body was valid JSON but did not match `ChatRequest` (missing field, or `session_id` is not a UUID).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                unprocessable:
+                  value:
+                    error:
+                      code: UNPROCESSABLE_ENTITY
+                      message: Request cannot be processed
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+        "502":
+          description: |
+            `GENERATION_SERVICE_UNAVAILABLE` — the LLM provider, the embedding
+            provider or the vector store failed **before** the stream opened.
+            The client sees a normal JSON error, not a stream. The same class of
+            failure occurring *after* the stream opened arrives as an SSE
+            `error` event under HTTP `200` instead.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                generationDown:
+                  value:
+                    error:
+                      code: GENERATION_SERVICE_UNAVAILABLE
+                      message: Generation service unavailable
+
+components:
+
+  securitySchemes:
+    HrmBearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        `Authorization: Bearer <access token issued by HRM>`.
+
+        The RAG service does not issue tokens and has no login endpoint. It
+        verifies a token minted by the HRM identity provider, using the
+        algorithm in `JWT_ALG` and the key material in `JWT_HMAC_SECRET`
+        (HS256/HS384/HS512) or the JWKS at `JWT_JWKS_URL` (RS256).
+
+        Claims read by the server:
+          * subject — the claim named by `JWT_SUBJECT_CLAIM`. For HRM this is
+            `userid`, not `sub`. Its value becomes the canonical user id in both
+            SQL and OpenFGA. Must be a non-empty string.
+          * `role` — string. `ADMIN`, `HR` and `MANAGER` map to workspace admin;
+            `EMPLOYEE` maps to workspace member. Any other value, an empty
+            string, a non-string, or a missing claim gives
+            `403 HRM_ROLE_REQUIRED`.
+          * `permissions` — array of strings. Must contain `CHATBOT_USE` to call
+            the chat endpoint and `CHATBOT_UPLOAD_DOCUMENT` to call the upload
+            endpoint. Both checks are exact and case-sensitive. Non-array or
+            missing is treated as empty.
+          * `email` — optional. Used to populate the user row; absent means a
+            synthetic `<userid>@hrm.local` placeholder is stored.
+          * `exp` — verified, with 60 seconds of clock leeway.
+          * `iss` — verified against `JWT_ISSUER`.
+          * `aud` — verified against `JWT_AUDIENCE` only when
+            `JWT_VERIFY_AUDIENCE=true`. The HRM deployment sets it to `false`,
+            so a token with no `aud` is accepted.
+
+        Every rejection is reported to the client as a generic
+        `401 INVALID_TOKEN`; the specific reason (expired, algorithm mismatch,
+        bad signature, wrong issuer, missing subject) is written to the server
+        log only.
+
+  parameters:
+    WorkspaceId:
+      name: workspace_id
+      in: path
+      required: true
+      description: |
+        The workspace, either as a UUID or as the literal alias `hrm`.
+
+        This is **not** a free parameter: the server compares the resolved value
+        against `HRM_WORKSPACE_ID` and rejects any other workspace with
+        `400 HRM_SCOPE_MISMATCH`.
+
+        **Alias `hrm`** (HRM mode only) resolves to the configured
+        `HRM_WORKSPACE_ID` on every route in this specification, so HRM never has
+        to carry the UUID and a workspace change does not require an HRM deploy.
+        The alias is matched exactly and is case-sensitive: `HRM` and `Hrm` are
+        not aliases and fail UUID parsing with `400 INVALID_REQUEST`. When
+        `HRM_MODE=false` the alias is not resolved and behaves the same way.
+
+        The full UUID keeps working unchanged — the alias is additive.
+      schema:
+        oneOf:
+          - type: string
+            format: uuid
+          - type: string
+            enum: [hrm]
+      example: hrm
+
+    DocumentId:
+      name: document_id
+      in: path
+      required: true
+      description: The `document_id` returned by the upload endpoint. HRM must persist it.
+      schema:
+        type: string
+        format: uuid
+      example: 69f56ad1-f379-4705-9eb4-f58cbd269420
+
+  examples:
+    ResourceNotFound:
+      value:
+        error:
+          code: RESOURCE_NOT_FOUND
+          message: Resource not found
+
+  responses:
+    Unauthorized:
+      description: |
+        `UNAUTHORIZED` — the `Authorization` header is missing, is not a
+        `Bearer ` value, or the token part is empty.
+        `INVALID_TOKEN` — the token failed verification for any reason
+        (signature, expiry, issuer, audience, algorithm, unusable key, or a
+        missing/blank subject claim).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+          examples:
+            missingHeader:
+              value:
+                error:
+                  code: UNAUTHORIZED
+                  message: Missing or invalid Authorization header
+            invalidToken:
+              value:
+                error:
+                  code: INVALID_TOKEN
+                  message: Invalid token
+
+    RateLimited:
+      description: |
+        In-memory sliding window, keyed by the token subject. Defaults:
+        30 chat requests and 10 upload requests per 60-second window
+        (`RATE_LIMIT_CHAT_PER_WINDOW`, `RATE_LIMIT_UPLOAD_PER_WINDOW`,
+        `RATE_LIMIT_WINDOW_SECS`). No `Retry-After` header is sent.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+          examples:
+            limited:
+              value:
+                error:
+                  code: RATE_LIMITED
+                  message: Too many requests. Please retry later.
+
+    InternalError:
+      description: |
+        `INTERNAL_ERROR` — an unexpected server-side failure.
+        `AUTHZ_ERROR` — the authorization service (OpenFGA) was unreachable,
+        errored or timed out. The API fails closed: a dependency failure is
+        never treated as "allow".
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+          examples:
+            internal:
+              value:
+                error:
+                  code: INTERNAL_ERROR
+                  message: Internal server error
+            authzUnavailable:
+              value:
+                error:
+                  code: AUTHZ_ERROR
+                  message: Authorization service unavailable
+
+  schemas:
+
+    ErrorResponse:
+      type: object
+      description: |
+        The single error envelope for every non-2xx application response,
+        including framework-level rejections, unknown routes and wrong methods.
+        Successful `204` responses have an empty body and do not use it.
+      required: [error]
+      additionalProperties: false
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          additionalProperties: false
+          properties:
+            code:
+              type: string
+              description: Stable machine-readable code. Branch on this, never on `message`.
+              enum:
+                - INVALID_REQUEST
+                - INVALID_ACCESS_MODE
+                - HRM_SCOPE_MISMATCH
+                - UNAUTHORIZED
+                - INVALID_TOKEN
+                - FORBIDDEN
+                - WORKSPACE_ADMIN_REQUIRED
+                - HRM_ROLE_REQUIRED
+                - CHATBOT_PERMISSION_REQUIRED
+                - CHATBOT_UPLOAD_PERMISSION_REQUIRED
+                - RESOURCE_NOT_FOUND
+                - METHOD_NOT_ALLOWED
+                - PAYLOAD_TOO_LARGE
+                - UNSUPPORTED_MEDIA_TYPE
+                - UNPROCESSABLE_ENTITY
+                - RATE_LIMITED
+                - GENERATION_SERVICE_UNAVAILABLE
+                - AUTHZ_ERROR
+                - AUTHZ_REVOKE_FAILED
+                - INTERNAL_ERROR
+            message:
+              type: string
+              description: Human-readable, sanitized. Wording is not part of the contract.
+            details:
+              description: Omitted unless present. Not populated by any endpoint in this specification.
+
+    HealthResponse:
+      type: object
+      required: [status, db]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          const: ok
+        db:
+          type: string
+          const: connected
+
+    UploadDocumentsRequest:
+      type: object
+      required: [file]
+      properties:
+        file:
+          description: |
+            The document bytes. The part may be repeated to upload several
+            documents in one request. Any part not named `file` or `access_mode`
+            is ignored.
+          type: array
+          items:
+            type: string
+            format: binary
+        access_mode:
+          type: string
+          description: |
+            Optional; applies to every file in the request. Defaults to
+            `workspace_default`, which makes the document visible to every
+            workspace member. `restricted` hides it from everyone until explicit
+            viewers are granted through endpoints outside this specification —
+            HRM should leave this unset.
+          enum: [workspace_default, restricted]
+          default: workspace_default
+
+    UploadDocumentsResponse:
+      type: object
+      required: [documents, rejected]
+      additionalProperties: false
+      properties:
+        rejected:
+          type: array
+          description: |
+            Every `file` part that was NOT accepted, in the order the parts were
+            read. Always present; empty when nothing was rejected. Added in Phase
+            5.2 — a client written against the earlier schema keeps working by
+            ignoring this field, but then loses per-file failure information.
+          items:
+            $ref: "#/components/schemas/RejectedUpload"
+        documents:
+          type: array
+          description: Only the parts that were accepted. May be shorter than the number of parts sent; never empty (an empty result is a `400`).
+          minItems: 1
+          items:
+            type: object
+            required: [document_id, filename]
+            additionalProperties: false
+            properties:
+              document_id:
+                type: string
+                format: uuid
+                description: Server-generated v4 UUID. The only handle for status polling and deletion.
+              filename:
+                type: string
+                description: |
+                  The sanitized filename actually stored: path components, `/`,
+                  `\` and NUL are stripped and the result is truncated to 255
+                  characters. Falls back to `upload.pdf` when the part carries no
+                  usable filename. May differ from what was sent.
+                maxLength: 255
+
+    RejectedUpload:
+      type: object
+      required: [filename, reason_code, message]
+      additionalProperties: false
+      properties:
+        filename:
+          type: string
+          description: The sanitized filename of the rejected part, sanitized by the same rules as an accepted one.
+          maxLength: 255
+        reason_code:
+          $ref: "#/components/schemas/UploadRejectionReasonCode"
+        message:
+          type: string
+          description: Fixed English explanation for the `reason_code`. Intended for logs, not for end users — branch on `reason_code`.
+
+    UploadRejectionReasonCode:
+      type: string
+      description: |
+        Why a single `file` part was not accepted. Stable machine-readable code;
+        branch on this, never on `message`.
+          * `PAYLOAD_TOO_LARGE` — the part exceeds `DOCUMENT_MAX_UPLOAD_BYTES`.
+            In practice the whole request usually trips the body limit first and
+            the call fails with `413` before any part is inspected.
+          * `UNSUPPORTED_MEDIA_TYPE` — content sniffing found no supported format.
+            This is the code HRM will see in day-to-day use (`.xlsx`, images,
+            scanned binaries, a `.txt` that is not valid UTF-8).
+          * `FILE_READ_FAILED` — the multipart part could not be read to the end
+            (client aborted, malformed body).
+          * `STORAGE_WRITE_FAILED` — object storage rejected the write.
+          * `PERSIST_FAILED` — the document row or ingestion job could not be
+            written to Postgres. The stored object is cleaned up.
+          * `AUTHZ_SYNC_FAILED` — the document→workspace relation could not be
+            written to OpenFGA. The row and object are rolled back.
+        The last four are server-side faults: the part itself may be fine and the
+        upload is worth retrying. The first two are caller faults — retrying the
+        same bytes gives the same result.
+      enum:
+        - PAYLOAD_TOO_LARGE
+        - UNSUPPORTED_MEDIA_TYPE
+        - FILE_READ_FAILED
+        - STORAGE_WRITE_FAILED
+        - PERSIST_FAILED
+        - AUTHZ_SYNC_FAILED
+
+    DocumentStatus:
+      type: string
+      description: |
+        Coarse lifecycle state of the document.
+          * `PROCESSING` — accepted, work is queued or running. Not yet searchable.
+          * `COMPLETED` — indexed and searchable by chat.
+          * `FAILED` — terminal for this attempt. Read `failure_code`.
+      enum: [PROCESSING, COMPLETED, FAILED]
+
+    DocumentProcessingStage:
+      type: string
+      description: |
+        Fine-grained position within the ingestion pipeline. Purely
+        informational — branch on `status`, use this only for progress display.
+          * `QUEUED` — waiting for an ingestion worker.
+          * `PARSING` — extracting text from PDF/DOCX/TXT/MD.
+          * `EMBEDDING` — generating chunk embeddings.
+          * `GRAPH_EXTRACTION` — building the knowledge graph. Skipped unless
+            `GMRAG_GRAPH_EXTRACTION_ENABLED=true`; it is `false` by default.
+          * `SAVING` — writing chunks and embeddings to PostgreSQL.
+          * `INDEXING` — upserting vectors into Qdrant.
+          * `DONE` — pipeline finished. Pairs with `status=COMPLETED`.
+          * `FAILED` — pipeline aborted. Pairs with `status=FAILED`.
+      enum:
+        - QUEUED
+        - PARSING
+        - EMBEDDING
+        - GRAPH_EXTRACTION
+        - SAVING
+        - INDEXING
+        - DONE
+        - FAILED
+
+    DocumentFailureCode:
+      type: string
+      description: |
+        Set only when `status=FAILED`; `null` otherwise. Retryable codes are
+        already retried automatically up to `INGESTION_JOB_MAX_ATTEMPTS`
+        (default 5) with exponential backoff — a `FAILED` document has exhausted
+        those attempts.
+          * `NEEDS_OCR` — a scanned/image-only PDF. Not retryable: no OCR
+            provider is wired up. Re-uploading the same scan will fail the same way.
+          * `PDF_PARSE_FAILED` — the PDF is corrupt or could not be parsed in time.
+          * `DOCX_PARSE_FAILED` — the DOCX is corrupt or could not be parsed in time.
+          * `TEXT_DECODE_FAILED` — the text/markdown file is not decodable UTF-8.
+          * `DOCUMENT_OBJECT_MISSING` — the stored object disappeared. Server-side fault.
+          * `EMBEDDING_PROVIDER_UNAVAILABLE` — the embedding service failed.
+          * `GRAPH_EXTRACTION_FAILED` — graph extraction failed.
+          * `QDRANT_INDEX_FAILED` — vector indexing failed.
+          * `DATABASE_SAVE_FAILED` — persisting the results failed.
+          * `INTERNAL_INGESTION_ERROR` — unclassified ingestion fault.
+          * `INGESTION_JOB_MISSING` — the job row vanished while the document
+            was `PROCESSING`; written by the stale-job recovery task.
+      enum:
+        - NEEDS_OCR
+        - PDF_PARSE_FAILED
+        - DOCX_PARSE_FAILED
+        - TEXT_DECODE_FAILED
+        - DOCUMENT_OBJECT_MISSING
+        - EMBEDDING_PROVIDER_UNAVAILABLE
+        - GRAPH_EXTRACTION_FAILED
+        - QDRANT_INDEX_FAILED
+        - DATABASE_SAVE_FAILED
+        - INTERNAL_INGESTION_ERROR
+        - INGESTION_JOB_MISSING
+
+    DocumentAccessMode:
+      type: string
+      enum: [workspace_default, restricted]
+      description: >-
+        `workspace_default` — visible to every workspace member.
+        `restricted` — visible only to explicitly granted viewers.
+
+    NaiveDateTime:
+      type: string
+      description: |
+        Timestamp with **no timezone designator and no `Z` suffix** — the wire
+        format is `YYYY-MM-DDTHH:MM:SS.ffffff`, serialized from a PostgreSQL
+        `TIMESTAMP WITHOUT TIME ZONE`. It is UTC by convention. A strict
+        RFC 3339 / `OffsetDateTime` parser will reject it; parse it as a local
+        date-time (Java: `LocalDateTime.parse`) and attach UTC yourself.
+      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?$'
+      examples:
+        - "2026-08-06T03:22:57.106555"
+
+    DocumentStatusResponse:
+      type: object
+      required:
+        - document_id
+        - filename
+        - status
+        - processing_stage
+        - failure_code
+        - failure_message
+        - access_mode
+        - created_at
+        - updated_at
+        - chunk_count
+      additionalProperties: false
+      properties:
+        document_id:
+          type: string
+          format: uuid
+        filename:
+          type: string
+          description: The sanitized filename as stored.
+        status:
+          $ref: "#/components/schemas/DocumentStatus"
+        processing_stage:
+          $ref: "#/components/schemas/DocumentProcessingStage"
+        failure_code:
+          oneOf:
+            - $ref: "#/components/schemas/DocumentFailureCode"
+            - type: "null"
+          description: Always present in the payload; `null` unless `status=FAILED`.
+        failure_message:
+          type: [string, "null"]
+          description: |
+            English, human-readable, safe to log. Always present; `null` unless
+            `status=FAILED`. Do not show it to Vietnamese end users and do not
+            branch on it — branch on `failure_code`.
+        access_mode:
+          $ref: "#/components/schemas/DocumentAccessMode"
+        created_at:
+          allOf: [{ $ref: "#/components/schemas/NaiveDateTime" }]
+          description: When the document row was inserted, i.e. upload time.
+        updated_at:
+          allOf: [{ $ref: "#/components/schemas/NaiveDateTime" }]
+          description: |
+            `MAX(ingestion_jobs.updated_at)` for this document, falling back to
+            `created_at` when no job row exists. The `documents` table has no
+            `updated_at` column. It therefore tracks ingestion progress, not
+            edits to the document.
+        chunk_count:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Live count of rows in `document_chunks`. `0` while `PROCESSING` and
+            for every `FAILED` document. A `COMPLETED` document with
+            `chunk_count = 0` means nothing was extracted and the document will
+            never be cited.
+
+    WorkspaceDocumentsResponse:
+      type: object
+      description: A page of documents. The page fields are flattened into the top level by `#[serde(flatten)]`.
+      required: [documents, total, limit, offset, caller]
+      additionalProperties: false
+      properties:
+        documents:
+          type: array
+          items: { $ref: "#/components/schemas/DocumentDirectoryItem" }
+        total:
+          type: integer
+          format: int64
+          description: Total matching rows visible to the caller, ignoring `limit`/`offset`.
+        limit:
+          type: integer
+          format: int64
+          description: Echo of the effective limit.
+        offset:
+          type: integer
+          format: int64
+          description: Echo of the effective offset.
+        caller:
+          type: object
+          required: [can_manage_documents]
+          additionalProperties: false
+          properties:
+            can_manage_documents:
+              type: boolean
+              description: True when the caller holds the `admin` relation, i.e. may upload and delete.
+
+    DocumentDirectoryItem:
+      type: object
+      description: |
+        The list row. Carries the same status fields as `DocumentStatusResponse`
+        plus uploader metadata — but note the identifier is named `id` here and
+        `document_id` in the single-document response.
+      required:
+        - id
+        - filename
+        - status
+        - processing_stage
+        - failure_code
+        - failure_message
+        - created_at
+        - updated_at
+        - chunk_count
+        - size_bytes
+        - access_mode
+        - uploaded_by
+        - uploaded_by_email
+        - content_type
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Same value as `document_id` elsewhere. The field name differs.
+        filename: { type: string }
+        status: { $ref: "#/components/schemas/DocumentStatus" }
+        processing_stage: { $ref: "#/components/schemas/DocumentProcessingStage" }
+        failure_code:
+          oneOf:
+            - $ref: "#/components/schemas/DocumentFailureCode"
+            - type: "null"
+        failure_message:
+          type: [string, "null"]
+        created_at: { $ref: "#/components/schemas/NaiveDateTime" }
+        updated_at: { $ref: "#/components/schemas/NaiveDateTime" }
+        chunk_count:
+          type: integer
+          format: int64
+        size_bytes:
+          type: [integer, "null"]
+          format: int64
+          description: Size of the stored original in bytes.
+        access_mode: { $ref: "#/components/schemas/DocumentAccessMode" }
+        uploaded_by:
+          type: string
+          description: The canonical user id — for HRM tokens, the `userid` claim value.
+        uploaded_by_email:
+          type: [string, "null"]
+          description: Null when the uploader has no user row (should not normally happen).
+        content_type:
+          type: [string, "null"]
+          description: >-
+            The content type the server determined by sniffing the bytes, not
+            what the client declared. One of `application/pdf`,
+            `application/vnd.openxmlformats-officedocument.wordprocessingml.document`,
+            `text/plain`, `text/markdown`.
+
+    ChatRequest:
+      type: object
+      required: [session_id, message]
+      additionalProperties: false
+      properties:
+        session_id:
+          type: string
+          format: uuid
+          description: |
+            **Client-generated.** There is no create-session endpoint. Mint a
+            UUID v4 for a new conversation; the server creates the session row
+            on first use, titled from the first message. Reuse the same value to
+            continue the conversation — the server reloads that session's stored
+            history and sends it to the model, which is the entire multi-turn
+            mechanism. A session UUID already owned by a *different* user gives
+            `403`.
+        message:
+          type: string
+          minLength: 1
+          description: |
+            The user's question. Trimmed server-side; empty or whitespace-only
+            gives `400`. No maximum length is enforced by the API.
+
+    CitationsEvent:
+      type: object
+      description: |
+        Payload of the single named `citations` event. Always sent, even when the
+        array is empty. Entries appear in retrieval order and cover only the
+        chunks the caller is allowed to see, so an index present in the answer
+        text may be absent here.
+      required: [citations]
+      additionalProperties: false
+      properties:
+        citations:
+          type: array
+          items: { $ref: "#/components/schemas/StreamCitation" }
+
+    StreamCitation:
+      type: object
+      required: [index, chunk_id, document_id, document_name, snippet]
+      additionalProperties: false
+      properties:
+        index:
+          type: integer
+          minimum: 1
+          description: |
+            **1-based.** This is the `N` to match against `[chunk:N]` markers in
+            the concatenated answer text. It is the chunk's position in the
+            retrieval result, not an array index — do not use the position of
+            the entry within `citations`.
+        chunk_id:
+          type: string
+          format: uuid
+          description: Identifier of the retrieved chunk.
+        document_id:
+          type: string
+          format: uuid
+          description: The document the chunk came from. Use it to link back to HRM's own record.
+        document_name:
+          type: string
+          description: The stored filename of the source document.
+        snippet:
+          type: string
+          description: |
+            Raw chunk text truncated to 280 characters on a whitespace boundary,
+            with a single `…` appended when truncated. Contains the source
+            document's own newlines and markdown; it is not sanitized for HTML.

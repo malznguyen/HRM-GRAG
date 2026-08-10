@@ -20,9 +20,11 @@ use crate::auth::document_acl::{
     grant_document_explicit_viewer, replace_document_permissions, revoke_document_explicit_viewer,
     set_document_access_mode,
 };
+use crate::auth::hrm::HrmDocumentUploadPermission;
 use crate::auth::resource_cleanup::capture_document_delete_plan;
 use crate::document_directory::{
-    DocumentDirectoryPage, get_document_permissions, list_documents as list_document_directory,
+    DocumentDirectoryItem, DocumentDirectoryPage, get_document as get_document_directory,
+    get_document_permissions, list_documents as list_document_directory,
 };
 use crate::document_format::{DocumentFormat, document_max_upload_bytes};
 use crate::ingestion::jobs::{IngestionWorkerConfig, enqueue_job_tx, retry_failed_document};
@@ -56,6 +58,37 @@ pub struct WorkspaceDocumentsResponse {
     pub caller: WorkspaceDocumentCallerCapabilities,
 }
 
+#[derive(Serialize)]
+pub struct DocumentStatusResponse {
+    pub document_id: Uuid,
+    pub filename: String,
+    pub status: String,
+    pub processing_stage: String,
+    pub failure_code: Option<String>,
+    pub failure_message: Option<String>,
+    pub access_mode: String,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+    pub chunk_count: i64,
+}
+
+impl From<DocumentDirectoryItem> for DocumentStatusResponse {
+    fn from(document: DocumentDirectoryItem) -> Self {
+        Self {
+            document_id: document.id,
+            filename: document.filename,
+            status: document.status,
+            processing_stage: document.processing_stage,
+            failure_code: document.failure_code,
+            failure_message: document.failure_message,
+            access_mode: document.access_mode,
+            created_at: document.created_at,
+            updated_at: document.updated_at,
+            chunk_count: document.chunk_count,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct ReplaceDocumentPermissionsRequest {
     pub access_mode: String,
@@ -69,9 +102,77 @@ pub struct UploadedDocumentItem {
     pub filename: String,
 }
 
+/// Lý do một file bị loại khỏi lô upload.
+///
+/// Mọi nhánh `continue` trong `upload_document` phải map về đúng một biến thể ở đây —
+/// đó là điều kiện để client biết file nào hỏng thay vì đếm phần tử `documents`.
+/// Hai mã đầu tái dùng nguyên văn vocabulary lỗi sẵn có của API
+/// (`ApiError::from_status`) để cùng một điều kiện không có hai tên gọi.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadRejectionReason {
+    /// File vượt `DOCUMENT_MAX_UPLOAD_BYTES`.
+    PayloadTooLarge,
+    /// Nội dung không phải PDF/DOCX/TXT/MD hợp lệ (kiểm bằng nội dung, không tin đuôi file).
+    UnsupportedMediaType,
+    /// Không đọc hết được phần multipart của file (client ngắt giữa chừng, body hỏng).
+    FileReadFailed,
+    /// Ghi object gốc lên object storage thất bại.
+    StorageWriteFailed,
+    /// Ghi bản ghi tài liệu / job ingestion vào Postgres thất bại.
+    PersistFailed,
+    /// Đồng bộ quan hệ document→workspace sang OpenFGA thất bại (bản ghi đã được rollback).
+    AuthzSyncFailed,
+}
+
+impl UploadRejectionReason {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::PayloadTooLarge => "PAYLOAD_TOO_LARGE",
+            Self::UnsupportedMediaType => "UNSUPPORTED_MEDIA_TYPE",
+            Self::FileReadFailed => "FILE_READ_FAILED",
+            Self::StorageWriteFailed => "STORAGE_WRITE_FAILED",
+            Self::PersistFailed => "PERSIST_FAILED",
+            Self::AuthzSyncFailed => "AUTHZ_SYNC_FAILED",
+        }
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::PayloadTooLarge => "File exceeds the maximum upload size",
+            Self::UnsupportedMediaType => {
+                "File content is not a supported document format (PDF, DOCX, TXT, MD)"
+            }
+            Self::FileReadFailed => "File part could not be read from the request",
+            Self::StorageWriteFailed => "File could not be written to object storage",
+            Self::PersistFailed => "File metadata could not be persisted",
+            Self::AuthzSyncFailed => "File authorization could not be synchronized",
+        }
+    }
+}
+
+/// Một file bị từ chối trong lô upload, kèm mã lý do máy đọc được.
+#[derive(Serialize)]
+pub struct RejectedUploadItem {
+    pub filename: String,
+    pub reason_code: &'static str,
+    pub message: &'static str,
+}
+
+impl RejectedUploadItem {
+    fn new(filename: String, reason: UploadRejectionReason) -> Self {
+        Self {
+            filename,
+            reason_code: reason.code(),
+            message: reason.message(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct UploadDocumentsResponse {
     pub documents: Vec<UploadedDocumentItem>,
+    /// Luôn có mặt (mảng rỗng khi không có file nào bị loại). Client cũ bỏ qua field này.
+    pub rejected: Vec<RejectedUploadItem>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -473,6 +574,95 @@ pub async fn list_documents(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// Quy tắc che giấu dùng chung cho mọi method trên
+/// `/workspaces/{workspace_id}/documents/{document_id}`.
+///
+/// "Không tồn tại" và "không có quyền" phải ra cùng một `404 RESOURCE_NOT_FOUND`,
+/// nếu không thì caller chỉ cần đổi method trên đúng URL đó là suy ra được tài liệu
+/// có tồn tại hay không. Lỗi hạ tầng authz (5xx) là chuyện khác — nó không nói gì về
+/// tài liệu, và nuốt nó thành 404 sẽ biến sự cố dịch vụ thành "không tìm thấy".
+fn hide_document_existence(err: ApiError) -> ApiError {
+    if err.status.is_server_error() {
+        err
+    } else {
+        ApiError::from_status(StatusCode::NOT_FOUND)
+    }
+}
+
+pub async fn get_document_status(
+    State(state): State<AppState>,
+    authz: Authz,
+    Path((workspace_id, document_id)): Path<(Uuid, Uuid)>,
+) -> impl IntoResponse {
+    if let Err(err) = authz
+        .require_relation(Relation::Member, &Object::Workspace(workspace_id))
+        .await
+    {
+        return hide_document_existence(err).into_response();
+    }
+
+    let document = match get_document_directory(&state.pool, workspace_id, document_id).await {
+        Ok(Some(document)) => document,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to read document status"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let access_mode = match DocumentAccessMode::parse(&document.access_mode) {
+        Some(access_mode) => access_mode,
+        None => {
+            error!(
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Document status read found an invalid access mode"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let can_view = match can_user_view_document(
+        &state.authz_client,
+        &authz.user_id,
+        document_id,
+        access_mode,
+    )
+    .await
+    {
+        Ok(can_view) => can_view,
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to apply document ACL while reading status"
+            );
+            return match err {
+                DocumentAclError::Authz(_) => ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "AUTHZ_ERROR",
+                    "Authorization service unavailable",
+                )
+                .into_response(),
+                _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+        }
+    };
+    if !can_view {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    Json(DocumentStatusResponse::from(document)).into_response()
 }
 
 pub async fn get_document_shares(
@@ -892,7 +1082,7 @@ pub async fn delete_document(
         .require_relation(Relation::Admin, &Object::Workspace(workspace_id))
         .await
     {
-        return err.into_response();
+        return hide_document_existence(err).into_response();
     }
 
     let mut tx = match state.pool.begin().await {
@@ -1239,6 +1429,7 @@ async fn fetch_document_preview(
 pub async fn upload_document(
     State(state): State<AppState>,
     authz: Authz,
+    _upload_permission: HrmDocumentUploadPermission,
     Path(workspace_id): Path<Uuid>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
@@ -1266,6 +1457,7 @@ pub async fn upload_document(
     // Drain multipart trước khi insert để access_mode không phụ thuộc thứ tự field.
     let mut access_mode = DocumentAccessMode::WorkspaceDefault;
     let mut pending_files: Vec<PendingUploadFile> = Vec::new();
+    let mut rejected: Vec<RejectedUploadItem> = Vec::new();
 
     while let Ok(Some(field)) = multipart.next_field().await {
         match field.name() {
@@ -1302,12 +1494,26 @@ pub async fn upload_document(
                     .unwrap_or_else(|| "upload.pdf".to_string());
                 let bytes = match field.bytes().await {
                     Ok(bytes) => bytes.to_vec(),
-                    Err(_) => continue,
+                    Err(_) => {
+                        rejected.push(RejectedUploadItem::new(
+                            filename,
+                            UploadRejectionReason::FileReadFailed,
+                        ));
+                        continue;
+                    }
                 };
                 if bytes.len() > document_max_upload_bytes() {
+                    rejected.push(RejectedUploadItem::new(
+                        filename,
+                        UploadRejectionReason::PayloadTooLarge,
+                    ));
                     continue;
                 }
                 let Some(format) = DocumentFormat::detect_upload(&filename, &bytes) else {
+                    rejected.push(RejectedUploadItem::new(
+                        filename,
+                        UploadRejectionReason::UnsupportedMediaType,
+                    ));
                     continue;
                 };
                 pending_files.push(PendingUploadFile {
@@ -1348,6 +1554,10 @@ pub async fn upload_document(
                     object_key = %object_key,
                     "Failed to upload document object"
                 );
+                rejected.push(RejectedUploadItem::new(
+                    filename,
+                    UploadRejectionReason::StorageWriteFailed,
+                ));
                 continue;
             }
         };
@@ -1357,6 +1567,10 @@ pub async fn upload_document(
             Err(err) => {
                 error!(error = %err, %workspace_id, %document_id, "Failed to begin upload database transaction");
                 let _ = state.storage.delete_object(&object_key).await;
+                rejected.push(RejectedUploadItem::new(
+                    filename,
+                    UploadRejectionReason::PersistFailed,
+                ));
                 continue;
             }
         };
@@ -1417,6 +1631,10 @@ pub async fn upload_document(
                     "Failed to cleanup object after database insert failure"
                 );
             }
+            rejected.push(RejectedUploadItem::new(
+                filename,
+                UploadRejectionReason::PersistFailed,
+            ));
             continue;
         }
 
@@ -1431,11 +1649,19 @@ pub async fn upload_document(
             error!(error = %err, %workspace_id, %document_id, "Failed to enqueue durable ingestion job during upload");
             let _ = transaction.rollback().await;
             let _ = state.storage.delete_object(&object_key).await;
+            rejected.push(RejectedUploadItem::new(
+                filename,
+                UploadRejectionReason::PersistFailed,
+            ));
             continue;
         }
         if let Err(err) = transaction.commit().await {
             error!(error = %err, %workspace_id, %document_id, "Failed to commit upload document and durable job");
             let _ = state.storage.delete_object(&object_key).await;
+            rejected.push(RejectedUploadItem::new(
+                filename,
+                UploadRejectionReason::PersistFailed,
+            ));
             continue;
         }
 
@@ -1480,6 +1706,10 @@ pub async fn upload_document(
                     "Failed to cleanup object after OpenFGA sync failure"
                 );
             }
+            rejected.push(RejectedUploadItem::new(
+                filename,
+                UploadRejectionReason::AuthzSyncFailed,
+            ));
             continue;
         }
 
@@ -1516,19 +1746,23 @@ pub async fn upload_document(
         });
     }
 
+    // Không file nào được nhận thì `202 Accepted` là nói dối: không có gì được nhận để xử lý.
+    // Giữ nguyên `400 INVALID_REQUEST` như trước Phase 5 (tương thích ngược), chỉ bổ sung
+    // danh sách lý do từng file vào `error.details.rejected` để client vẫn debug được.
     if uploaded.is_empty() {
-        return ApiError {
+        let error = ApiError {
             status: StatusCode::BAD_REQUEST,
             code: "INVALID_REQUEST",
             message: "Request did not contain an acceptable file".to_string(),
-        }
-        .into_response();
+        };
+        return error.into_response_with_details(json!({ "rejected": rejected }));
     }
 
     (
         StatusCode::ACCEPTED,
         Json(UploadDocumentsResponse {
             documents: uploaded,
+            rejected,
         }),
     )
         .into_response()
@@ -1576,4 +1810,186 @@ async fn fetch_workspace_tenant_id(
     .bind(workspace_id)
     .fetch_optional(pool)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn document_status_response_contains_the_required_schema() {
+        let document_id = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let created_at =
+            NaiveDateTime::parse_from_str("2026-08-07 08:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let updated_at =
+            NaiveDateTime::parse_from_str("2026-08-07 08:05:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let response = DocumentStatusResponse::from(DocumentDirectoryItem {
+            id: document_id,
+            filename: "policy.pdf".to_string(),
+            status: "COMPLETED".to_string(),
+            processing_stage: "DONE".to_string(),
+            failure_code: None,
+            failure_message: None,
+            created_at,
+            updated_at,
+            chunk_count: 3,
+            size_bytes: Some(1024),
+            access_mode: "workspace_default".to_string(),
+            uploaded_by: "employee-1".to_string(),
+            uploaded_by_email: None,
+            content_type: Some("application/pdf".to_string()),
+        });
+
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({
+                "document_id": document_id,
+                "filename": "policy.pdf",
+                "status": "COMPLETED",
+                "processing_stage": "DONE",
+                "failure_code": null,
+                "failure_message": null,
+                "access_mode": "workspace_default",
+                "created_at": "2026-08-07T08:00:00",
+                "updated_at": "2026-08-07T08:05:00",
+                "chunk_count": 3
+            })
+        );
+    }
+
+    /// Lô hỗn hợp: `documents` chỉ chứa file nhận được, `rejected` liệt kê đủ file hỏng
+    /// kèm mã lý do — client không còn phải đoán bằng cách đếm phần tử.
+    #[test]
+    fn upload_response_reports_accepted_and_rejected_files_separately() {
+        let document_id = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let response = UploadDocumentsResponse {
+            documents: vec![UploadedDocumentItem {
+                document_id,
+                filename: "noi-quy.pdf".to_string(),
+            }],
+            rejected: vec![
+                RejectedUploadItem::new(
+                    "bang-luong.xlsx".to_string(),
+                    UploadRejectionReason::UnsupportedMediaType,
+                ),
+                RejectedUploadItem::new(
+                    "video.pdf".to_string(),
+                    UploadRejectionReason::PayloadTooLarge,
+                ),
+            ],
+        };
+
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({
+                "documents": [{ "document_id": document_id, "filename": "noi-quy.pdf" }],
+                "rejected": [
+                    {
+                        "filename": "bang-luong.xlsx",
+                        "reason_code": "UNSUPPORTED_MEDIA_TYPE",
+                        "message": "File content is not a supported document format (PDF, DOCX, TXT, MD)"
+                    },
+                    {
+                        "filename": "video.pdf",
+                        "reason_code": "PAYLOAD_TOO_LARGE",
+                        "message": "File exceeds the maximum upload size"
+                    }
+                ]
+            })
+        );
+    }
+
+    /// Lô toàn file hợp lệ vẫn phải có `rejected` (mảng rỗng), để client không phải
+    /// phân biệt "field vắng mặt" với "không có file nào bị loại".
+    #[test]
+    fn upload_response_always_carries_the_rejected_array() {
+        let response = UploadDocumentsResponse {
+            documents: Vec::new(),
+            rejected: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({ "documents": [], "rejected": [] })
+        );
+    }
+
+    /// Mã lý do là contract với HRM: phải ổn định, duy nhất, và không rỗng.
+    #[test]
+    fn upload_rejection_reason_codes_are_unique_and_stable() {
+        let reasons = [
+            UploadRejectionReason::PayloadTooLarge,
+            UploadRejectionReason::UnsupportedMediaType,
+            UploadRejectionReason::FileReadFailed,
+            UploadRejectionReason::StorageWriteFailed,
+            UploadRejectionReason::PersistFailed,
+            UploadRejectionReason::AuthzSyncFailed,
+        ];
+
+        let codes: Vec<&str> = reasons.iter().map(|reason| reason.code()).collect();
+        assert_eq!(
+            codes,
+            [
+                "PAYLOAD_TOO_LARGE",
+                "UNSUPPORTED_MEDIA_TYPE",
+                "FILE_READ_FAILED",
+                "STORAGE_WRITE_FAILED",
+                "PERSIST_FAILED",
+                "AUTHZ_SYNC_FAILED",
+            ]
+        );
+
+        let unique: std::collections::HashSet<&str> = codes.iter().copied().collect();
+        assert_eq!(unique.len(), codes.len());
+        assert!(reasons.iter().all(|reason| !reason.message().is_empty()));
+    }
+
+    /// GET và DELETE trên cùng một document path phải trả về cùng một câu trả lời khi
+    /// bị từ chối, nếu không thì đổi method là dò được sự tồn tại của tài liệu.
+    #[test]
+    fn document_authz_denial_is_indistinguishable_from_a_missing_document() {
+        for denial in [
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "WORKSPACE_ADMIN_REQUIRED",
+                "Workspace admin access required",
+            ),
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "WORKSPACE_MEMBER_REQUIRED",
+                "Workspace member access required",
+            ),
+            ApiError::from_status(StatusCode::NOT_FOUND),
+        ] {
+            let hidden = hide_document_existence(denial);
+            assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+            assert_eq!(hidden.code, "RESOURCE_NOT_FOUND");
+        }
+    }
+
+    /// Sự cố hạ tầng authz không nói gì về tài liệu — nuốt nó thành 404 sẽ biến
+    /// outage thành "không tìm thấy" và giấu mất nguyên nhân thật.
+    #[test]
+    fn document_authz_infrastructure_failure_is_not_swallowed_into_404() {
+        let outage = ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "AUTHZ_ERROR",
+            "Authorization service unavailable",
+        );
+        let passed_through = hide_document_existence(outage);
+        assert_eq!(passed_through.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(passed_through.code, "AUTHZ_ERROR");
+    }
+
+    /// Hai mã dùng lại nguyên văn vocabulary lỗi HTTP sẵn có, không tạo tên song song.
+    #[test]
+    fn reused_reason_codes_match_the_existing_api_error_vocabulary() {
+        assert_eq!(
+            UploadRejectionReason::PayloadTooLarge.code(),
+            crate::api_error::ApiError::from_status(StatusCode::PAYLOAD_TOO_LARGE).code
+        );
+        assert_eq!(
+            UploadRejectionReason::UnsupportedMediaType.code(),
+            crate::api_error::ApiError::from_status(StatusCode::UNSUPPORTED_MEDIA_TYPE).code
+        );
+    }
 }
