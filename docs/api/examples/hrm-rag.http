@@ -1,0 +1,221 @@
+### HRM RAG API — ví dụ chạy được
+#
+# Dùng với IntelliJ IDEA HTTP Client (Tools > HTTP Client) hoặc
+# VS Code extension "REST Client".
+#
+# Biến lấy từ http-client.env.json — chọn environment `local` trước khi chạy.
+# Với VS Code REST Client, thay {{...}} bằng giá trị thật hoặc khai báo trong
+# settings.json (mục "rest-client.environmentVariables").
+#
+# Chi tiết contract: ../INTEGRATION_GUIDE.md
+# Spec máy đọc:     ../openapi.yaml
+#
+# KHÔNG commit token thật vào file này.
+
+### 1. Health check — không cần token
+GET {{baseUrl}}/health
+Accept: application/json
+
+> {%
+    client.test("health tra ve 200", function() {
+        client.assert(response.status === 200, "status = " + response.status);
+        client.assert(response.body.status === "ok", "status field");
+        client.assert(response.body.db === "connected", "db field");
+    });
+%}
+
+
+### 2. Upload mot tai lieu
+# Doi duong dan file ben duoi cho dung may ban.
+# Response 202 -> LUU document_id lai, day la handle duy nhat de poll va xoa.
+POST {{baseUrl}}/workspaces/{{workspaceId}}/documents/upload
+Authorization: Bearer {{accessToken}}
+Content-Type: multipart/form-data; boundary=RagBoundary
+
+--RagBoundary
+Content-Disposition: form-data; name="file"; filename="noi-quy-cong-ty.pdf"
+Content-Type: application/pdf
+
+< ./fixtures/noi-quy-cong-ty.pdf
+--RagBoundary--
+
+> {%
+    client.test("upload duoc chap nhan", function() {
+        client.assert(response.status === 202, "status = " + response.status);
+        client.assert(response.body.documents.length > 0, "documents rong");
+    });
+    // Luu document_id cho cac request sau trong file nay
+    client.global.set("documentId", response.body.documents[0].document_id);
+%}
+
+
+### 3. Xem trang thai — chay lai nhieu lan cho toi khi COMPLETED
+GET {{baseUrl}}/workspaces/{{workspaceId}}/documents/{{documentId}}
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+> {%
+    client.test("doc duoc trang thai", function() {
+        client.assert(response.status === 200, "status = " + response.status);
+    });
+    var s = response.body.status;
+    client.log("status=" + s + " stage=" + response.body.processing_stage +
+               " chunks=" + response.body.chunk_count);
+    if (s === "FAILED") {
+        client.log("THAT BAI: " + response.body.failure_code +
+                   " — " + response.body.failure_message);
+    }
+    if (s === "PROCESSING") {
+        client.log("Van dang xu ly. Doi vai giay roi chay lai request nay.");
+    }
+%}
+
+
+### 4. Chat (SSE)
+# CANH BAO: response la text/event-stream, khong phai JSON.
+# Marker [chunk:N] bi cat vun qua nhieu event — phai gom het text roi moi parse.
+# Xem muc 6.4 trong INTEGRATION_GUIDE.md.
+#
+# session_id do CLIENT tu sinh. Dung lai cung gia tri de hoi tiep (multi-turn).
+POST {{baseUrl}}/workspaces/{{workspaceId}}/chat
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: text/event-stream
+
+{
+  "session_id": "{{sessionId}}",
+  "message": "Gio lam viec cua cong ty la may gio?"
+}
+
+
+### 5. Chat — luot hoi tiep theo, CUNG session_id
+# Server tu nap lai lich su cua session nay. Khong can gui lai lich su.
+POST {{baseUrl}}/workspaces/{{workspaceId}}/chat
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: text/event-stream
+
+{
+  "session_id": "{{sessionId}}",
+  "message": "The con ngay thu Bay?"
+}
+
+
+### 6. Chat — cau hoi khong co trong tai lieu
+# Kiem tra client xu ly duoc "event: citations" voi mang rong.
+POST {{baseUrl}}/workspaces/{{workspaceId}}/chat
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: text/event-stream
+
+{
+  "session_id": "{{sessionId}}",
+  "message": "Gia co phieu Apple hom nay bao nhieu?"
+}
+
+
+### 7. Liet ke tai lieu (OPTIONAL — chi de doi soat)
+# Khong bat buoc cho tich hop. Dung khi HRM mat document_id.
+GET {{baseUrl}}/workspaces/{{workspaceId}}/documents?limit=20&offset=0
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### 8. Liet ke tai lieu that bai — quet dinh ky
+GET {{baseUrl}}/workspaces/{{workspaceId}}/documents?status=FAILED&limit=100
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### 9. Xoa tai lieu — 204 No Content, body rong
+# Xoa that, khong khoi phuc duoc.
+DELETE {{baseUrl}}/workspaces/{{workspaceId}}/documents/{{documentId}}
+Authorization: Bearer {{accessToken}}
+
+> {%
+    client.test("xoa thanh cong", function() {
+        client.assert(response.status === 204, "status = " + response.status);
+    });
+%}
+
+
+### 10. Xac nhan da xoa — mong doi 404
+GET {{baseUrl}}/workspaces/{{workspaceId}}/documents/{{documentId}}
+Authorization: Bearer {{accessToken}}
+
+> {%
+    client.test("da bi xoa", function() {
+        client.assert(response.status === 404, "status = " + response.status);
+        client.assert(response.body.error.code === "RESOURCE_NOT_FOUND",
+                      "code = " + response.body.error.code);
+    });
+%}
+
+
+############################################################
+# CAC CASE LOI — chay de xac nhan client xu ly dung
+############################################################
+
+### E1. Thieu header Authorization -> 401 UNAUTHORIZED
+GET {{baseUrl}}/workspaces/{{workspaceId}}/documents/{{documentId}}
+
+### E2. Token rac -> 401 INVALID_TOKEN
+GET {{baseUrl}}/workspaces/{{workspaceId}}/documents/{{documentId}}
+Authorization: Bearer not-a-real-token
+
+### E3. Sai workspace -> 400 HRM_SCOPE_MISMATCH (chi khi HRM_MODE=true)
+GET {{baseUrl}}/workspaces/00000000-0000-0000-0000-000000000001/documents/{{documentId}}
+Authorization: Bearer {{accessToken}}
+
+### E4. document_id khong ton tai -> 404 RESOURCE_NOT_FOUND
+GET {{baseUrl}}/workspaces/{{workspaceId}}/documents/00000000-0000-0000-0000-000000000002
+Authorization: Bearer {{accessToken}}
+
+### E5. message rong -> 400 INVALID_REQUEST
+POST {{baseUrl}}/workspaces/{{workspaceId}}/chat
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "session_id": "{{sessionId}}",
+  "message": "   "
+}
+
+### E6. Thieu field message -> 422 UNPROCESSABLE_ENTITY
+POST {{baseUrl}}/workspaces/{{workspaceId}}/chat
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{
+  "session_id": "{{sessionId}}"
+}
+
+### E7. Sai Content-Type -> 415 UNSUPPORTED_MEDIA_TYPE
+POST {{baseUrl}}/workspaces/{{workspaceId}}/chat
+Authorization: Bearer {{accessToken}}
+Content-Type: text/plain
+
+{"session_id":"{{sessionId}}","message":"xin chao"}
+
+### E8. Upload bang token EMPLOYEE -> 403 WORKSPACE_ADMIN_REQUIRED
+# Doi employeeToken trong http-client.env.json thanh token role EMPLOYEE.
+POST {{baseUrl}}/workspaces/{{workspaceId}}/documents/upload
+Authorization: Bearer {{employeeToken}}
+Content-Type: multipart/form-data; boundary=RagBoundary
+
+--RagBoundary
+Content-Disposition: form-data; name="file"; filename="test.md"
+Content-Type: text/markdown
+
+# tai lieu thu
+--RagBoundary--
+
+### E9. Sai HTTP method -> 405 METHOD_NOT_ALLOWED
+PUT {{baseUrl}}/workspaces/{{workspaceId}}/chat
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+
+{}
+
+### E10. Route khong ton tai -> 404 RESOURCE_NOT_FOUND
+GET {{baseUrl}}/v1/health

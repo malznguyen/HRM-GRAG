@@ -1,0 +1,1306 @@
+# Hướng dẫn tích hợp RAG API cho backend HRM
+
+Tài liệu này dành cho dev backend HRM (Java/Spring). Bạn **không cần** biết gì về
+codebase RAG, không cần đọc Rust.
+
+Mọi thứ trong tài liệu được đọc trực tiếp từ source. Chỗ nào chưa xác nhận được
+đều ghi rõ `TODO`, không suy đoán.
+
+Spec máy đọc được: [`openapi.yaml`](./openapi.yaml) (OpenAPI 3.1).
+Ví dụ chạy được: [`examples/`](./examples/).
+
+---
+
+## Mục lục
+
+1. [Tổng quan](#1-tổng-quan)
+2. [Xác thực](#2-xác-thực)
+3. [Upload tài liệu](#3-upload-tài-liệu)
+4. [Trạng thái tài liệu](#4-trạng-thái-tài-liệu)
+5. [Xóa tài liệu](#5-xóa-tài-liệu)
+6. [Chat — phần quan trọng nhất](#6-chat--phần-quan-trọng-nhất)
+7. [Lỗi](#7-lỗi)
+8. [Giới hạn hiện tại](#8-giới-hạn-hiện-tại)
+9. [Checklist tích hợp](#9-checklist-tích-hợp)
+
+---
+
+## 1. Tổng quan
+
+### 1.1 Service này làm gì
+
+Nhận tài liệu nội bộ (nội quy, quy trình, chính sách...), cắt nhỏ, tạo embedding,
+lưu vào vector store. Khi có câu hỏi, nó tìm các đoạn liên quan, đưa vào prompt
+của LLM, rồi **stream** câu trả lời kèm trích dẫn nguồn.
+
+### 1.2 Service này KHÔNG làm gì
+
+- **Không phát hành token.** Không có endpoint login/register. Nó chỉ verify
+  token do HRM cấp.
+- **Không quản lý user.** User row được tạo tự động từ claim trong token.
+- **Không có OCR.** PDF scan (ảnh) sẽ fail với `NEEDS_OCR`.
+- **Không lưu file để tải về.** HRM vẫn phải giữ bản gốc của mình.
+- **Không đảm bảo câu trả lời đúng.** Đây là LLM. Luôn hiển thị citation để
+  người dùng tự kiểm chứng.
+- **Không xử lý đồng bộ.** Upload xong không có nghĩa là đã tìm kiếm được.
+
+### 1.3 Sơ đồ
+
+```
+┌───────────────┐
+│  HRM frontend │
+└───────┬───────┘
+        │  (token của HRM)
+        ▼
+┌────────────────────┐        Authorization: Bearer <HRM access token>
+│   HRM backend      │ ─────────────────────────────────────────────┐
+│   (Java/Spring)    │                                              │
+└────────────────────┘                                              │
+                                                                    ▼
+                                                    ┌───────────────────────────┐
+                                                    │       RAG API             │
+                                                    │  (Rust / Axum, HTTP)      │
+                                                    │                           │
+                                                    │  • verify JWT của HRM     │
+                                                    │  • ánh xạ role → quyền    │
+                                                    │  • upload / status / xóa  │
+                                                    │  • chat SSE               │
+                                                    └─────┬───────┬───────┬─────┘
+                                                          │       │       │
+                                     ┌────────────────────┘       │       └──────────────┐
+                                     ▼                            ▼                      ▼
+                            ┌────────────────┐          ┌──────────────────┐   ┌──────────────────┐
+                            │  PostgreSQL    │          │     Qdrant       │   │  LLM + Embedding │
+                            │  metadata,     │          │  vector search   │   │  (DeepSeek,      │
+                            │  chunk, phiên  │          │                  │   │   Ollama)        │
+                            └────────────────┘          └──────────────────┘   └──────────────────┘
+                                     │
+                                     ▼
+                            ┌────────────────┐          ┌──────────────────┐
+                            │  MinIO / S3    │          │    OpenFGA       │
+                            │  file gốc      │          │  phân quyền      │
+                            └────────────────┘          └──────────────────┘
+
+              ┌──────────────────────────────────────────┐
+              │  ingestion-worker (process riêng)        │
+              │  chạy nền: parse → embed → index         │
+              │  ⇒ lý do upload là BẤT ĐỒNG BỘ           │
+              └──────────────────────────────────────────┘
+```
+
+Điểm cần nhớ từ sơ đồ: **`ingestion-worker` là một process riêng**. API chỉ ghi
+một job vào hàng đợi rồi trả về ngay. Đó là lý do bắt buộc phải poll trạng thái.
+
+### 1.4 Base URL và cấu hình
+
+Địa chỉ bind lấy từ biến môi trường `API_BIND_ADDR`.
+
+| Nguồn | Giá trị |
+|---|---|
+| Default trong code (`main.rs`) | `127.0.0.1:8083` |
+| Giá trị trong `gmrag_api/.env.example` | `127.0.0.1:18083` |
+| Production cho HRM | **TODO: chưa quyết định** |
+
+> **TODO — cần xác nhận:** hiện API chỉ bind `127.0.0.1`, tức là **chỉ gọi được
+> từ chính máy đó**. Chưa có reverse proxy, chưa mở port ra ngoài, chưa có TLS.
+> Trước khi HRM tích hợp thật, hai bên phải chốt: base URL, có HTTPS không, và
+> HRM backend gọi từ network nào.
+
+**Không có version prefix.** Đường dẫn là `/health`, không phải `/v1/health`.
+
+Toàn bộ endpoint HRM cần:
+
+| # | Việc | Method | Path |
+|---|---|---|---|
+| 1 | Upload tài liệu | `POST` | `/workspaces/{workspace_id}/documents/upload` |
+| 2 | Xem trạng thái | `GET` | `/workspaces/{workspace_id}/documents/{document_id}` |
+| 3 | Xóa tài liệu | `DELETE` | `/workspaces/{workspace_id}/documents/{document_id}` |
+| 4 | Chat (SSE) | `POST` | `/workspaces/{workspace_id}/chat` |
+| 5 | Health check | `GET` | `/health` |
+| — | *(optional)* Liệt kê tài liệu để đối soát | `GET` | `/workspaces/{workspace_id}/documents` |
+
+---
+
+## 2. Xác thực
+
+### 2.1 Cách gửi
+
+Mọi request (trừ `/health`) phải có header:
+
+```
+Authorization: Bearer <ACCESS_TOKEN>
+```
+
+Đây là **access token của chính HRM**, không phải token do RAG service cấp.
+RAG service không có endpoint đăng nhập.
+
+Lưu ý cách server đọc header: nó chỉ chấp nhận đúng tiền tố `Bearer ` (chữ B
+hoa, một dấu cách). Phần token sau đó không được rỗng. Sai định dạng → `401
+UNAUTHORIZED`.
+
+### 2.2 Claim bắt buộc
+
+| Claim | Kiểu | Bắt buộc | Ý nghĩa |
+|---|---|---|---|
+| `userid` | string | **Có** | ID người dùng chuẩn. Rỗng/thiếu/không phải string → `401`. |
+| `role` | string | **Có** | Quyết định quyền admin hay member. |
+| `permissions` | array of string | Có, nếu dùng chat | Phải chứa `CHATBOT_USE`. |
+| `email` | string | Không | Dùng để tạo user row. |
+| `exp` | number | Có | Hết hạn → `401`. Cho phép lệch đồng hồ 60 giây. |
+| `iss` | string | Có | Phải khớp `JWT_ISSUER` cấu hình phía RAG. |
+| `aud` | string | Không | Chỉ verify khi `JWT_VERIFY_AUDIENCE=true`. Deployment HRM đặt `false`, nên token không có `aud` vẫn pass. |
+
+> **Tên claim chủ thể là `userid`, không phải `sub`.** Server đọc claim theo tên
+> cấu hình trong `JWT_SUBJECT_CLAIM`, và cho HRM giá trị đó là `userid`.
+> Giá trị này trở thành ID người dùng duy nhất trong cả database lẫn hệ thống
+> phân quyền. Nó phải **ổn định vĩnh viễn** cho một nhân viên — nếu HRM đổi
+> `userid` của một người, phía RAG sẽ coi đó là người hoàn toàn khác và người đó
+> mất sạch lịch sử chat.
+
+Ví dụ payload token hợp lệ:
+
+```json
+{
+  "userid": "employee-1",
+  "role": "EMPLOYEE",
+  "permissions": ["CHATBOT_USE", "DOCUMENT_READ"],
+  "email": "nhanvien@congty.vn",
+  "iss": "<issuer HRM đã cấu hình>",
+  "exp": 1786000000
+}
+```
+
+### 2.3 Role → quyền
+
+| `role` trong token | Quyền phía RAG | Làm được gì |
+|---|---|---|
+| `ADMIN` | admin | Upload, xóa, xem trạng thái, chat |
+| `HR` | admin | Upload, xóa, xem trạng thái, chat |
+| `MANAGER` | admin | Upload, xóa, xem trạng thái, chat |
+| `EMPLOYEE` | member | Xem trạng thái, chat. **Không** upload, **không** xóa |
+| Bất kỳ giá trị nào khác | — | `403 HRM_ROLE_REQUIRED` |
+| Thiếu / rỗng / không phải string | — | `403 HRM_ROLE_REQUIRED` |
+
+So khớp **phân biệt hoa thường và chính xác tuyệt đối**. `"Admin"`, `"admin"`,
+`"HR "` (có dấu cách thừa) đều **fail**. Không có role nào được suy diễn hay
+gộp nhóm.
+
+Quyền được đồng bộ **ở mỗi request**: server đọc `role` trong token hiện tại rồi
+cập nhật quan hệ phân quyền cho khớp. Nghĩa là khi HRM đổi role của một nhân
+viên, **token mới đầu tiên** sẽ tự động áp dụng role mới — không cần gọi API
+đồng bộ nào cả. Không cần thao tác gì thêm phía HRM.
+
+### 2.4 Quyền chat
+
+Endpoint chat còn kiểm tra thêm: mảng `permissions` phải chứa **đúng chuỗi**
+`CHATBOT_USE`. Thiếu → `403 CHATBOT_PERMISSION_REQUIRED`.
+
+Kiểm tra này chạy **rất sớm**, trước cả khi server đọc body request. Hệ quả cần
+biết khi debug: nếu bạn gửi body JSON sai *và* token thiếu `CHATBOT_USE`, bạn sẽ
+nhận `403`, không phải `400`. Đừng tưởng body của mình đúng.
+
+### 2.5 Caller KHÔNG gửi tenant / workspace
+
+**HRM không được truyền `tenant_id` hay `workspace_id` như dữ liệu do client
+chọn.** Server tự chốt phạm vi: nó so `{workspace_id}` trong URL với giá trị
+`HRM_WORKSPACE_ID` cấu hình sẵn, khác một ký tự là `400 HRM_SCOPE_MISMATCH`.
+
+Nhưng **path hiện tại vẫn còn `{workspace_id}`**. Nên trên thực tế:
+
+> HRM phải hard-code **một** UUID workspace cố định vào config, rồi ghép vào mọi
+> URL. Không bao giờ lấy giá trị này từ input người dùng, không bao giờ cho phép
+> chọn.
+
+```java
+// application.yml
+// rag.workspace-id: <UUID do team RAG cung cấp>
+private static final String WORKSPACE_PATH =
+    "/workspaces/" + ragWorkspaceId + "/documents/upload";
+```
+
+> **TODO — chặn tích hợp:** UUID cụ thể **chưa tồn tại**. Đã kiểm tra file `.env`
+> của deployment ngày 2026-08-10: các key `HRM_MODE`, `HRM_TENANT_ID`,
+> `HRM_WORKSPACE_ID` đều **chưa được đặt**, nghĩa là HRM mode chưa bật. Team RAG
+> phải tạo tenant + workspace, bật `HRM_MODE=true`, rồi bàn giao UUID cho HRM.
+> Trước khi có giá trị đó, HRM không thể gọi bất kỳ endpoint nào ngoài `/health`.
+
+> **TODO — đề xuất cho phase sau:** nên bỏ `{workspace_id}` khỏi path. Server đã
+> biết workspace từ config rồi, để nó trong URL chỉ tạo ra một tham số mà client
+> bắt buộc phải đoán đúng và không có quyền thay đổi. Path gọn hơn nên là
+> `POST /documents/upload`, `POST /chat`, v.v. Việc này đổi contract nên để
+> phase sau, không làm ở Phase 4.
+
+### 2.6 Lỗi xác thực
+
+| HTTP | `code` | Khi nào | HRM nên làm gì |
+|---|---|---|---|
+| 401 | `UNAUTHORIZED` | Thiếu header, sai tiền tố `Bearer `, token rỗng | Sửa code gửi header |
+| 401 | `INVALID_TOKEN` | Token hết hạn, sai chữ ký, sai issuer, sai audience, sai thuật toán, thiếu claim `userid` | Lấy token mới rồi thử lại **một** lần. Vẫn lỗi → sai cấu hình, phải báo người |
+| 400 | `HRM_SCOPE_MISMATCH` | `{workspace_id}` trong URL không khớp cấu hình | Bug phía HRM: sai config workspace |
+| 403 | `HRM_ROLE_REQUIRED` | `role` không thuộc 4 giá trị hợp lệ | Kiểm tra HRM có nhét `role` vào token chưa |
+| 403 | `CHATBOT_PERMISSION_REQUIRED` | Thiếu `CHATBOT_USE` (chỉ endpoint chat) | Cấp quyền cho user, hoặc ẩn tính năng chat |
+| 500 | `INTERNAL_ERROR` | Không tạo được user row | Lỗi server, retry với backoff |
+| 500 | `AUTHZ_ERROR` | Dịch vụ phân quyền chết/timeout | Lỗi server, retry với backoff |
+
+> **Quan trọng:** mọi lý do token bị từ chối đều trả về cùng một
+> `401 INVALID_TOKEN`. Server **cố ý** không nói cụ thể sai ở đâu. Lý do thật
+> (hết hạn / sai thuật toán / sai chữ ký...) chỉ ghi trong log của server RAG.
+> Khi debug phải xin log phía RAG, đừng đoán từ response.
+
+---
+
+## 3. Upload tài liệu
+
+```
+POST /workspaces/{workspace_id}/documents/upload
+```
+
+Yêu cầu role admin (`ADMIN` / `HR` / `MANAGER`). Token `EMPLOYEE` → `403
+WORKSPACE_ADMIN_REQUIRED`.
+
+### 3.1 Định dạng request
+
+`Content-Type: multipart/form-data`.
+
+| Field | Bắt buộc | Ghi chú |
+|---|---|---|
+| `file` | Có | Nội dung file. **Lặp lại được** để upload nhiều file trong một request |
+| `access_mode` | Không | `workspace_default` (mặc định) hoặc `restricted`. **HRM nên bỏ trống** |
+
+Field tên khác `file` / `access_mode` bị bỏ qua im lặng.
+
+`access_mode=restricted` sẽ ẩn tài liệu khỏi *tất cả* mọi người cho đến khi được
+cấp quyền xem riêng — mà endpoint cấp quyền đó nằm ngoài phạm vi tích hợp này.
+Đặt `restricted` = tài liệu vô hình với mọi user. **Đừng dùng.**
+
+### 3.2 Giới hạn kích thước
+
+| Giới hạn | Giá trị | Nguồn |
+|---|---|---|
+| Toàn bộ request body | 50 MiB (`52428800` bytes) | `DOCUMENT_MAX_UPLOAD_BYTES`, mặc định trong code |
+
+Đây là giới hạn cho **cả request**, không phải từng file. Upload 3 file mỗi file
+20 MB trong một request sẽ vượt ngưỡng. Vượt → `413 PAYLOAD_TOO_LARGE`.
+
+Khuyến nghị: **mỗi request một file**. Dễ xử lý lỗi hơn nhiều (xem 3.4).
+
+### 3.3 Định dạng file được hỗ trợ
+
+Server **không tin `Content-Type` bạn khai báo**, cũng không tin đuôi file (trừ
+txt/md). Nó đọc bytes để tự nhận dạng:
+
+| Loại | Cách nhận dạng | Ghi chú |
+|---|---|---|
+| PDF | Bắt đầu bằng `%PDF-` **và** parse được cấu trúc | PDF hỏng → bị loại ngay lúc upload |
+| DOCX | Là file ZIP **và** chứa cả `[Content_Types].xml` lẫn `word/document.xml` | |
+| TXT | UTF-8 hợp lệ, không rỗng, không chứa byte NUL, **và** đuôi `.txt` | Không phân biệt hoa thường |
+| Markdown | Như TXT nhưng đuôi `.md` | |
+
+**Không** hỗ trợ: `.doc` (Word cũ), `.xlsx`, `.pptx`, `.csv`, `.html`, `.rtf`,
+`.odt`, ảnh, ZIP thường. Đổi tên file thành `.txt` không cứu được — file phải
+thực sự là UTF-8.
+
+> **PDF scan (ảnh chụp / bản scan) sẽ được nhận nhưng ingest THẤT BẠI.**
+> Nó qua được bước nhận dạng (vẫn là PDF hợp lệ), trả `202` bình thường, rồi
+> vài giây sau chuyển sang `status=FAILED`, `failure_code=NEEDS_OCR`. Hiện chưa
+> có OCR provider nào được đấu nối, nên đây là lỗi **vĩnh viễn** — upload lại
+> đúng file đó sẽ fail y hệt. HRM cần nói rõ với người dùng: PDF phải có text
+> thật, không phải ảnh.
+
+### 3.4 Xử lý bất đồng bộ và lỗi cục bộ
+
+**`202 Accepted` KHÔNG có nghĩa là tài liệu đã sẵn sàng.** Nó chỉ có nghĩa: row
+đã tạo, job đã vào hàng đợi. Lúc này `status=PROCESSING`,
+`processing_stage=QUEUED`, `chunk_count=0`. Chat **chưa** tìm thấy tài liệu này.
+
+HRM bắt buộc phải poll trạng thái (mục 4).
+
+> **CẢNH BÁO — thành công một phần diễn ra âm thầm.**
+> Nếu bạn gửi nhiều `file` trong một request, những file bị loại (quá lớn, không
+> nhận dạng được, lưu trữ lỗi) sẽ **bị bỏ qua không báo lỗi**. Response `202`
+> chỉ liệt kê những file thành công, và **không có** danh sách file bị loại,
+> cũng không có lý do.
+>
+> HRM phải tự kiểm tra: `response.documents.size()` có bằng số file đã gửi không.
+> Lệch nghĩa là có file bị loại — nhưng bạn sẽ không biết file nào và vì sao.
+>
+> Đây chính là lý do nên **upload mỗi request một file**: khi đó "bị loại" biến
+> thành `400 INVALID_REQUEST` rõ ràng, thay vì một mảng rỗng khó hiểu.
+
+Nếu **mọi** file đều bị loại → `400 INVALID_REQUEST` với message
+`Request did not contain an acceptable file`.
+
+### 3.5 Ví dụ curl
+
+```bash
+curl -i -X POST \
+  "http://<RAG_HOST>:<RAG_PORT>/workspaces/<WORKSPACE_ID>/documents/upload" \
+  -H "Authorization: Bearer <ACCESS_TOKEN>" \
+  -F "file=@noi-quy-cong-ty.pdf;type=application/pdf"
+```
+
+Response `202`:
+
+```json
+{
+  "documents": [
+    {
+      "document_id": "69f56ad1-f379-4705-9eb4-f58cbd269420",
+      "filename": "noi-quy-cong-ty.pdf"
+    }
+  ]
+}
+```
+
+> **`filename` trả về có thể khác cái bạn gửi.** Server làm sạch tên: bỏ đường
+> dẫn, bỏ ký tự `/`, `\`, NUL, cắt còn tối đa 255 ký tự. Nếu không lấy được tên
+> hợp lệ, nó dùng `upload.pdf` — **kể cả khi file không phải PDF**. Muốn hiển
+> thị đúng tên gốc thì HRM tự lưu tên của mình, đừng phụ thuộc field này.
+
+> **PHẢI LƯU `document_id`.** Xem mục 5.
+
+---
+
+## 4. Trạng thái tài liệu
+
+```
+GET /workspaces/{workspace_id}/documents/{document_id}
+```
+
+Yêu cầu role member trở lên — `EMPLOYEE` gọi được.
+
+### 4.1 Response schema
+
+```json
+{
+  "document_id": "69f56ad1-f379-4705-9eb4-f58cbd269420",
+  "filename": "noi-quy-cong-ty-smoke.md",
+  "status": "COMPLETED",
+  "processing_stage": "DONE",
+  "failure_code": null,
+  "failure_message": null,
+  "access_mode": "workspace_default",
+  "created_at": "2026-08-06T03:22:57.106555",
+  "updated_at": "2026-08-06T03:23:18.856347",
+  "chunk_count": 1
+}
+```
+
+*(nguyên văn từ `docs/PHASE3_RESULT.md`)*
+
+| Field | Kiểu | Ghi chú |
+|---|---|---|
+| `document_id` | UUID | |
+| `filename` | string | Tên đã được làm sạch |
+| `status` | enum | Xem 4.2 |
+| `processing_stage` | enum | Xem 4.3 |
+| `failure_code` | string hoặc `null` | Luôn có mặt trong JSON. Xem 4.4 |
+| `failure_message` | string hoặc `null` | Tiếng Anh, dành cho log. **Đừng hiện cho người dùng cuối, đừng branch theo nó** |
+| `access_mode` | enum | `workspace_default` \| `restricted` |
+| `created_at` | timestamp | Lúc upload |
+| `updated_at` | timestamp | Xem cảnh báo dưới |
+| `chunk_count` | integer | Số đoạn đã tạo. `0` khi đang xử lý và khi thất bại |
+
+> **Cảnh báo định dạng thời gian.** `created_at` / `updated_at` **không có `Z`,
+> không có offset múi giờ**: `2026-08-06T03:22:57.106555`. Chúng là giờ UTC theo
+> quy ước, nhưng parser RFC 3339 nghiêm ngặt sẽ **ném exception**.
+>
+> ```java
+> // ĐÚNG
+> LocalDateTime.parse(value).atOffset(ZoneOffset.UTC);
+> // SAI — DateTimeParseException
+> OffsetDateTime.parse(value);
+> ```
+>
+> Với Jackson, đừng map thẳng vào `Instant` hay `OffsetDateTime`; dùng
+> `LocalDateTime` rồi tự gắn UTC.
+
+> `updated_at` **không phải** thời điểm sửa tài liệu. Nó là thời điểm cập nhật
+> gần nhất của *job ingest*, và fallback về `created_at` nếu chưa có job nào.
+> Dùng nó để đo tiến độ xử lý, đừng dùng để phát hiện nội dung thay đổi.
+
+### 4.2 Bảng giá trị `status`
+
+| `status` | Nghĩa | HRM nên làm gì |
+|---|---|---|
+| `PROCESSING` | Đang chờ hoặc đang xử lý. Chưa tìm kiếm được | Tiếp tục poll |
+| `COMPLETED` | Đã index xong, chat tìm thấy được | Dừng poll. Đánh dấu sẵn sàng |
+| `FAILED` | Thất bại, đã hết số lần retry tự động | Dừng poll. Đọc `failure_code`, xem 4.4 |
+
+Chỉ có đúng 3 giá trị. Không có `PENDING`, `CANCELLED`, `DELETED`.
+
+> `COMPLETED` với `chunk_count = 0` là trường hợp đặc biệt: xử lý xong nhưng
+> không rút được nội dung nào (ví dụ file rỗng về mặt nội dung). Tài liệu này
+> **sẽ không bao giờ được trích dẫn**. HRM nên coi đây là bất thường và cảnh báo
+> cho người upload.
+
+### 4.3 Bảng giá trị `processing_stage`
+
+Đây là thông tin **hiển thị tiến độ**. Logic nghiệp vụ phải branch theo `status`,
+không phải theo stage.
+
+| `processing_stage` | Nghĩa | Đi kèm `status` |
+|---|---|---|
+| `QUEUED` | Đang chờ worker rảnh | `PROCESSING` |
+| `PARSING` | Đang rút text từ PDF/DOCX/TXT/MD | `PROCESSING` |
+| `EMBEDDING` | Đang tạo vector cho từng đoạn | `PROCESSING` |
+| `GRAPH_EXTRACTION` | Đang dựng knowledge graph | `PROCESSING` |
+| `SAVING` | Đang ghi đoạn + vector vào database | `PROCESSING` |
+| `INDEXING` | Đang đẩy vector lên Qdrant | `PROCESSING` |
+| `DONE` | Xong toàn bộ | `COMPLETED` |
+| `FAILED` | Dừng giữa chừng | `FAILED` |
+
+> `GRAPH_EXTRACTION` bị **tắt mặc định** (`GMRAG_GRAPH_EXTRACTION_ENABLED=false`).
+> Ở cấu hình hiện tại bạn sẽ không thấy stage này. Cứ xử lý enum đầy đủ để phòng
+> khi nó được bật.
+
+Thứ tự stage **không đảm bảo tăng dần đơn điệu**: khi một job retry, tài liệu
+quay lại `QUEUED`. Đừng viết code kiểu "stage chỉ có thể tiến, không thể lùi".
+
+Cũng đừng dùng `switch` không có nhánh `default` trên enum này — nếu phase sau
+thêm stage mới, code HRM sẽ ném exception. Luôn có nhánh fallback.
+
+### 4.4 Bảng giá trị `failure_code`
+
+Chỉ có giá trị khi `status = FAILED`. Cột "Tự retry" cho biết hệ thống RAG **đã**
+tự thử lại (tối đa 5 lần, backoff tăng dần) trước khi báo `FAILED`.
+
+| `failure_code` | Nghĩa | Tự retry rồi? | HRM nên làm gì |
+|---|---|---|---|
+| `NEEDS_OCR` | PDF scan/ảnh, không có text | Không | **Lỗi vĩnh viễn.** Báo người dùng: cần file có text thật. Upload lại vô ích |
+| `PDF_PARSE_FAILED` | PDF hỏng hoặc parse quá lâu | Không | Báo người dùng file hỏng. Đề nghị xuất lại PDF |
+| `DOCX_PARSE_FAILED` | DOCX hỏng | Không | Như trên |
+| `TEXT_DECODE_FAILED` | File text không phải UTF-8 hợp lệ | Không | Yêu cầu lưu lại dưới dạng UTF-8 |
+| `DOCUMENT_OBJECT_MISSING` | File đã lưu bị mất khỏi object storage | Có | Lỗi hệ thống. Báo team RAG. Upload lại |
+| `EMBEDDING_PROVIDER_UNAVAILABLE` | Dịch vụ embedding chết | Có | Sự cố hạ tầng. Upload lại sau, hoặc báo team RAG |
+| `GRAPH_EXTRACTION_FAILED` | Dựng graph thất bại | Có | Như trên |
+| `QDRANT_INDEX_FAILED` | Đẩy vector thất bại | Có | Như trên |
+| `DATABASE_SAVE_FAILED` | Ghi database thất bại | Có | Như trên |
+| `INTERNAL_INGESTION_ERROR` | Lỗi không phân loại được | Có | Báo team RAG kèm `document_id` |
+| `INGESTION_JOB_MISSING` | Job biến mất khi tài liệu đang `PROCESSING` | — | Lỗi hệ thống. Xóa rồi upload lại |
+
+Cách chia đơn giản cho HRM:
+
+- **4 code đầu** = lỗi của file. Người dùng phải sửa file. Upload lại y hệt sẽ
+  fail lại.
+- **7 code còn lại** = lỗi hệ thống. Upload lại có thể thành công.
+
+> **Không có endpoint retry trong phạm vi tích hợp này.** Service *có* một route
+> retry cho admin nhưng nó nằm ngoài 5 việc HRM cần nên không đưa vào spec. Với
+> HRM, cách khôi phục một tài liệu `FAILED` là: xóa (mục 5) rồi upload lại.
+
+### 4.5 Chu kỳ poll khuyến nghị
+
+Không có webhook, không có callback. HRM phải poll.
+
+Không có rate limit trên endpoint này (rate limit chỉ áp cho chat và upload),
+nhưng vẫn nên poll có chừng mực:
+
+| Thời điểm sau upload | Chu kỳ |
+|---|---|
+| 0–30 giây | mỗi 2 giây |
+| 30 giây – 5 phút | mỗi 5 giây |
+| 5–15 phút | mỗi 30 giây |
+| Sau 15 phút | Dừng poll, coi như treo, báo người |
+
+Cơ sở của mốc 15 phút: một job có tối đa 5 lần thử, lease mỗi lần 300 giây, backoff
+tối đa 300 giây. Trường hợp xấu nhất trên lý thuyết vượt 15 phút, nhưng một tài
+liệu bình thường vẫn `PROCESSING` sau 15 phút gần như chắc chắn là có sự cố.
+
+> **TODO — cần xác nhận:** chưa có số đo thời gian ingest thực tế theo kích
+> thước file. Bảng trên là suy ra từ tham số cấu hình, không phải đo đạc. Nên
+> chỉnh lại sau khi chạy thử với corpus thật của HRM.
+
+### 4.6 Ví dụ curl
+
+```bash
+curl -s \
+  "http://<RAG_HOST>:<RAG_PORT>/workspaces/<WORKSPACE_ID>/documents/<DOCUMENT_ID>" \
+  -H "Authorization: Bearer <ACCESS_TOKEN>"
+```
+
+Đang xử lý:
+
+```json
+{"document_id":"69f56ad1-f379-4705-9eb4-f58cbd269420","filename":"noi-quy-cong-ty.pdf","status":"PROCESSING","processing_stage":"PARSING","failure_code":null,"failure_message":null,"access_mode":"workspace_default","created_at":"2026-08-06T03:22:57.106555","updated_at":"2026-08-06T03:23:01.004112","chunk_count":0}
+```
+
+Thất bại vì PDF scan:
+
+```json
+{"document_id":"69f56ad1-f379-4705-9eb4-f58cbd269420","filename":"hop-dong-scan.pdf","status":"FAILED","processing_stage":"FAILED","failure_code":"NEEDS_OCR","failure_message":"Document requires OCR and no OCR provider is available","access_mode":"workspace_default","created_at":"2026-08-06T03:22:57.106555","updated_at":"2026-08-06T03:23:05.221904","chunk_count":0}
+```
+
+Không tìm thấy (nguyên văn từ `PHASE3_RESULT.md`):
+
+```json
+{"error":{"code":"RESOURCE_NOT_FOUND","message":"Resource not found"}}
+```
+
+### 4.7 Vì sao mọi thứ đều là 404
+
+Endpoint này **cố ý** trả `404` cho cả ba trường hợp:
+
+- `document_id` không tồn tại
+- Tài liệu thuộc workspace khác
+- Tài liệu tồn tại nhưng caller không có quyền xem
+
+Đây là chống dò tài liệu: không cho phép phân biệt "không có" với "có nhưng cấm".
+HRM không thể và không nên cố tách ba trường hợp này.
+
+Chỉ khi **hạ tầng phân quyền** hỏng thì mới ra `500 AUTHZ_ERROR` — đó mới là lỗi
+đáng retry.
+
+---
+
+## 5. Xóa tài liệu
+
+```
+DELETE /workspaces/{workspace_id}/documents/{document_id}
+```
+
+Yêu cầu role admin. Thành công → **`204 No Content`, body rỗng**.
+
+### 5.1 Xóa thật hay xóa mềm?
+
+**Xóa thật.** Không phải soft delete, không có thùng rác, không khôi phục được.
+
+Xóa đồng bộ, trong một transaction:
+
+| Xóa khỏi | Thời điểm |
+|---|---|
+| Quan hệ phân quyền (OpenFGA) | Trước khi commit SQL |
+| Row `documents` trong PostgreSQL | Trong transaction |
+| Các đoạn (chunks) | Cascade theo document |
+| Dữ liệu graph provenance | Trong transaction |
+
+Xóa **sau khi** commit, theo cơ chế best-effort + outbox bền vững:
+
+| Xóa khỏi | Cơ chế |
+|---|---|
+| Vector trong Qdrant | Thử ngay; thất bại thì worker nền dọn sau |
+| File gốc trong MinIO/S3 | Thử ngay; thất bại thì worker nền dọn sau |
+
+Nghĩa là `204` đảm bảo: tài liệu **đã** biến mất khỏi database và khỏi phân
+quyền, và việc dọn vector/file **đã được lên lịch chắc chắn**. Nó không đảm bảo
+vector đã bị xóa xong ngay tại thời điểm response.
+
+Trên thực tế điều này an toàn: chat lọc kết quả theo tài liệu còn tồn tại trong
+database, nên tài liệu vừa xóa không thể bị trích dẫn nữa, kể cả khi vector còn
+sót lại vài giây.
+
+### 5.2 HRM PHẢI GIỮ `document_id`
+
+> **Đây là điều dễ bị bỏ sót nhất trong toàn bộ tích hợp.**
+>
+> `document_id` do RAG service sinh ra lúc upload là **cách duy nhất** để xóa
+> hoặc tra trạng thái một tài liệu.
+>
+> - Không có xóa theo tên file.
+> - Không có xóa theo ID của HRM (không có khái niệm external ID).
+> - Không có xóa theo checksum.
+>
+> HRM **phải lưu `document_id` vào database của mình** ngay khi nhận response
+> `202`, gắn với record tài liệu tương ứng bên HRM. Mất `document_id` là mất
+> khả năng quản lý tài liệu đó qua API.
+
+Schema gợi ý phía HRM:
+
+```sql
+ALTER TABLE hrm_documents
+  ADD COLUMN rag_document_id UUID NULL,
+  ADD COLUMN rag_status      VARCHAR(16) NULL,   -- PROCESSING | COMPLETED | FAILED
+  ADD COLUMN rag_synced_at   TIMESTAMP NULL;
+```
+
+Nếu lỡ mất: dùng endpoint list (mục 1.4, optional) để đối chiếu theo `filename`
+và `created_at`. Đây là cách chữa cháy, không phải giải pháp — `filename` không
+duy nhất.
+
+### 5.3 Ví dụ curl
+
+```bash
+curl -i -X DELETE \
+  "http://<RAG_HOST>:<RAG_PORT>/workspaces/<WORKSPACE_ID>/documents/<DOCUMENT_ID>" \
+  -H "Authorization: Bearer <ACCESS_TOKEN>"
+```
+
+```
+HTTP/1.1 204 No Content
+```
+
+### 5.4 Lỗi
+
+| HTTP | `code` | Nghĩa | HRM nên làm gì |
+|---|---|---|---|
+| 403 | `WORKSPACE_ADMIN_REQUIRED` | Token `EMPLOYEE` | Chặn từ phía HRM, đừng để user thường bấm xóa |
+| 404 | `RESOURCE_NOT_FOUND` | Không tồn tại hoặc thuộc workspace khác | **Coi như đã xóa xong.** Xóa hai lần là idempotent |
+| 500 | `AUTHZ_REVOKE_FAILED` | Không thu hồi được phân quyền; **chưa xóa gì cả** | An toàn để retry |
+| 500 | `INTERNAL_ERROR` | Transaction lỗi, đã rollback | An toàn để retry |
+
+Lưu ý khác biệt so với `GET`: `DELETE` **có** trả `403` thật khi thiếu quyền
+(không giấu thành `404`).
+
+---
+
+## 6. Chat — phần quan trọng nhất
+
+```
+POST /workspaces/{workspace_id}/chat
+```
+
+Yêu cầu role member trở lên **và** `permissions` chứa `CHATBOT_USE`.
+
+Đây là endpoint dễ code sai nhất trong toàn bộ API. Đọc hết mục này trước khi
+viết dòng code đầu tiên.
+
+### 6.1 Request
+
+`Content-Type: application/json`
+
+```json
+{
+  "session_id": "df093a48-ed78-4109-ac96-a75be34ab35c",
+  "message": "Giờ làm việc của công ty là mấy giờ?"
+}
+```
+
+| Field | Kiểu | Bắt buộc |
+|---|---|---|
+| `session_id` | UUID | Có |
+| `message` | string | Có, không được rỗng sau khi trim |
+
+### 6.2 Session — HRM tự sinh ID
+
+> **Không có endpoint tạo session.** `session_id` do **client tự sinh**.
+
+Cách hoạt động:
+
+- Bắt đầu hội thoại mới → HRM sinh một UUID v4 mới. Server thấy chưa tồn tại thì
+  tự tạo session, lấy đoạn đầu câu hỏi làm tiêu đề.
+- Hỏi tiếp trong cùng hội thoại → gửi lại **đúng** `session_id` đó. Server nạp
+  lại toàn bộ lịch sử của session và đưa vào prompt.
+
+**Đó là toàn bộ cơ chế multi-turn.** HRM không cần và không nên tự gửi lại lịch
+sử hội thoại — server đã lưu và tự nạp. Chỉ cần gửi câu hỏi mới nhất.
+
+Session gắn với người dùng: nếu gửi một `session_id` đang thuộc về **user khác**,
+kết quả là `403`. Vậy nên UUID v4 ngẫu nhiên là bắt buộc — đừng sinh session id
+theo kiểu đoán được.
+
+`event: done` trả về chính `session_id` đó. Xem 6.6.
+
+### 6.3 Response là SSE, không phải JSON
+
+```
+Content-Type: text/event-stream
+```
+
+Không được dùng `RestTemplate` / `ObjectMapper.readValue()` cho endpoint này.
+Với Spring, dùng `WebClient` và đọc từng dòng, hoặc dùng thư viện SSE.
+
+Các loại event:
+
+| Event | Có tên? | Data |
+|---|---|---|
+| Mảnh text câu trả lời | **Không** (mặc định là `message`) | Text thô, **không phải JSON** |
+| `citations` | Có | JSON object |
+| `done` | Có | UUID dạng text thuần, **không phải JSON**, không có dấu nháy |
+| `error` | Có | Text thuần (chỉ khi lỗi giữa chừng) |
+
+> Event text **không có dòng `event:`**. Theo chuẩn SSE, event không tên có type
+> mặc định là `message`. Consumer phải phân biệt bằng field `event` — event nào
+> không có tên thì là text câu trả lời.
+
+Ngoài ra, cứ 15 giây im lặng server gửi một dòng comment `:keep-alive`. Thư viện
+SSE chuẩn tự bỏ qua dòng comment. Nếu bạn tự parse thì phải bỏ qua mọi dòng bắt
+đầu bằng `:`.
+
+### 6.4 ⚠️ CẢNH BÁO QUAN TRỌNG NHẤT: marker `[chunk:N]` bị cắt vụn
+
+# 🚨 **MARKER `[chunk:N]` BỊ CẮT RỜI QUA NHIỀU EVENT.**
+
+# **HRM PHẢI GOM TOÀN BỘ TEXT LẠI RỒI MỚI PARSE MARKER.**
+
+# **TUYỆT ĐỐI KHÔNG PARSE THEO TỪNG EVENT.**
+
+Đây là **lỗi dễ mắc nhất** khi tích hợp endpoint này.
+
+Text đến từ LLM theo từng token. Một marker `[chunk:1]` **không** nằm gọn trong
+một event. Trong stream thật đã bắt được, `[chunk:1]` đến dưới dạng **6 event
+riêng biệt**:
+
+```
+data: [          ← event 1
+data: ch         ← event 2
+data: unk        ← event 3
+data: :          ← event 4
+data: 1          ← event 5
+data: ]          ← event 6
+```
+
+Nếu bạn chạy regex `\[chunk:(\d+)\]` trên từng event, bạn sẽ **không bao giờ
+match được gì**, và người dùng sẽ nhìn thấy chuỗi `[chunk:1]` thô nằm giữa câu
+trả lời.
+
+Cách chia còn tùy tokenizer của model và **có thể khác ở mỗi lần chạy**. Đừng
+bao giờ giả định độ dài event, đừng buffer "vài event" rồi parse. Chỉ có một
+cách đúng:
+
+```
+✅ ĐÚNG:  gom tất cả data của event không tên  →  đợi event `done`  →  parse marker
+❌ SAI:   parse marker trên từng event khi nó đến
+❌ SAI:   parse marker trên buffer từng phần khi đang stream
+```
+
+Nếu HRM muốn hiển thị text dần dần (typing effect) thì vẫn được — cứ hiển thị
+text thô ngay, nhưng **chỉ thay marker thành link sau khi stream kết thúc**.
+Hoặc đơn giản hơn: che marker khi đang stream bằng cách chỉ render tới ký tự `[`
+cuối cùng chưa đóng.
+
+### 6.5 Thứ tự event
+
+Thứ tự này được đảm bảo:
+
+```
+(0..n event text, không tên)
+   ↓
+[tùy chọn: event: error  — chỉ khi luồng LLM đứt giữa chừng]
+   ↓
+event: citations       ← LUÔN CÓ, đúng một lần
+   ↓
+event: done            ← LUÔN CÓ, đúng một lần, cuối cùng
+```
+
+- `citations` **luôn được gửi**, kể cả khi không tìm thấy đoạn nào — khi đó là
+  mảng rỗng `{"citations":[]}`. Đừng viết code kiểu "không có citations thì
+  không có event citations".
+- `done` luôn là event cuối. Nhận được `done` là biết stream đã xong bình thường.
+- Nếu kết nối đứt mà chưa thấy `done` → coi là lỗi, không phải kết thúc.
+
+### 6.6 `event: done` trả về gì
+
+```
+event: done
+data: df093a48-ed78-4109-ac96-a75be34ab35c
+```
+
+Data là **`session_id`** dạng text thuần — không phải JSON, không có dấu nháy.
+Nó chính là giá trị HRM đã gửi trong request.
+
+HRM dùng nó để:
+
+1. **Biết stream đã kết thúc bình thường** (đây là công dụng chính).
+2. Xác nhận session server đang dùng đúng session mình gửi.
+3. Lưu lại để gửi cho lượt hỏi tiếp theo trong cùng hội thoại.
+
+Nó **không** chứa thống kê token, thời gian xử lý hay thông tin gì khác.
+
+### 6.7 `event: citations`
+
+```json
+{
+  "citations": [
+    {
+      "index": 1,
+      "chunk_id": "3f601309-1f9e-4f88-9f16-1077bb849460",
+      "document_id": "69f56ad1-f379-4705-9eb4-f58cbd269420",
+      "document_name": "noi-quy-cong-ty-smoke.md",
+      "snippet": "# NỘI QUY CÔNG TY HRM — ..."
+    }
+  ]
+}
+```
+
+| Field | Ghi chú |
+|---|---|
+| `index` | Số `N` trong `[chunk:N]`. **Đếm từ 1.** Đây là khóa để map marker sang tài liệu |
+| `chunk_id` | ID đoạn văn bản |
+| `document_id` | ID tài liệu — **khớp với `document_id` HRM đã lưu lúc upload** |
+| `document_name` | Tên file nguồn |
+| `snippet` | Nội dung đoạn, cắt còn tối đa 280 ký tự tại ranh giới từ, thêm `…` nếu bị cắt |
+
+> **`index` đếm từ 1, và KHÔNG phải vị trí trong mảng `citations`.**
+> Nó là vị trí của đoạn trong kết quả tìm kiếm. Mảng `citations` chỉ chứa những
+> đoạn caller **được phép xem** — đoạn bị lọc vì phân quyền sẽ bị bỏ khỏi mảng
+> nhưng `index` của các đoạn còn lại **không** được đánh số lại.
+>
+> Ví dụ: mảng có thể là `[{index: 2}, {index: 4}]`. Phải tra cứu theo giá trị
+> `index`, tuyệt đối không dùng `citations.get(i)`.
+
+Hệ quả: câu trả lời có thể chứa `[chunk:3]` mà trong `citations` **không có**
+`index = 3`. Xảy ra khi đoạn đó bị lọc vì phân quyền, hoặc khi LLM bịa ra số
+không tồn tại. **HRM phải xử lý được marker không map được** — cách an toàn là
+xóa marker đó khỏi text hiển thị.
+
+> `snippet` chứa xuống dòng và ký tự markdown **nguyên bản từ tài liệu nguồn**,
+> không được escape HTML. Nếu HRM render ra web thì **phải tự escape**, nếu
+> không sẽ dính XSS từ nội dung tài liệu.
+
+### 6.8 Stream mẫu nguyên văn
+
+Dưới đây là **nguyên văn** một stream thật, chép từ `docs/PHASE3_RESULT.md`
+(câu hỏi về giờ làm việc, câu trả lời `08:00-17:00[chunk:1]`):
+
+```text
+data: 08
+
+data: :
+
+data: 00
+
+data: -
+
+data: 17
+
+data: :
+
+data: 00
+
+data: [
+
+data: ch
+
+data: unk
+
+data: :
+
+data: 1
+
+data: ]
+
+event: citations
+data: {"citations":[{"index":1,"chunk_id":"3f601309-1f9e-4f88-9f16-1077bb849460","document_id":"69f56ad1-f379-4705-9eb4-f58cbd269420","document_name":"noi-quy-cong-ty-smoke.md","snippet":"# NỘI QUY CÔNG TY HRM — TÀI LIỆU KIỂM THỬ\n\n## Chương I. Quy định chung\n\n### Điều 1. Phạm vi áp dụng\n1. Nội quy này áp dụng cho toàn bộ nhân viên đang làm việc tại công ty HRM.\n2. Nhân viên có trách nhiệm đọc, hiểu và tuân thủ các quy định trong tài liệu.\n\n### Điều 2. Nguyên tắc…"}]}
+
+event: done
+data: df093a48-ed78-4109-ac96-a75be34ab35c
+```
+
+Nhìn kỹ: câu trả lời cuối cùng chỉ là `08:00-17:00[chunk:1]` — vậy mà mất **13
+event** để gửi, trong đó riêng marker chiếm 6 event. Ngay cả `08:00` cũng bị cắt
+thành `08` / `:` / `00`.
+
+Stream khi không tìm thấy đoạn nào:
+
+```text
+data: Tôi không tìm thấy thông tin này trong tài liệu.
+
+event: citations
+data: {"citations":[]}
+
+event: done
+data: df093a48-ed78-4109-ac96-a75be34ab35c
+```
+
+### 6.9 Pseudocode xử lý phía Java
+
+```java
+// ---- Trạng thái tích luỹ trong suốt stream ----
+StringBuilder answerBuffer = new StringBuilder();   // gom TẤT CẢ text
+List<Citation> citations   = new ArrayList<>();
+String         sessionId   = null;
+boolean        completed   = false;
+String         streamError = null;
+
+// ---- Đọc stream ----
+for (ServerSentEvent event : stream) {
+
+    String name = event.event();   // null hoặc "message" = event text không tên
+
+    if (name == null || name.equals("message")) {
+        // ⚠️ CHỈ GOM. TUYỆT ĐỐI KHÔNG PARSE MARKER Ở ĐÂY.
+        answerBuffer.append(event.data());
+
+        // Muốn hiệu ứng gõ chữ thì render text thô ở đây cũng được,
+        // nhưng KHÔNG được thay marker ở bước này.
+
+    } else if (name.equals("citations")) {
+        citations = objectMapper
+            .readValue(event.data(), CitationsEnvelope.class)
+            .citations();
+
+    } else if (name.equals("done")) {
+        sessionId = event.data().trim();   // UUID thuần, KHÔNG phải JSON
+        completed = true;
+
+    } else if (name.equals("error")) {
+        streamError = event.data();        // câu trả lời sẽ không đầy đủ
+    }
+}
+
+if (!completed) {
+    throw new RagStreamException("Stream ended without a done event");
+}
+
+// ---- Chỉ tới ĐÂY mới được parse marker ----
+String finalAnswer = renderCitations(answerBuffer.toString(), citations);
+
+
+// ---- Thay marker bằng link ----
+private static final Pattern CHUNK_MARKER = Pattern.compile("\\[chunk:(\\d+)\\]");
+
+String renderCitations(String text, List<Citation> citations) {
+    // Tra cứu theo GIÁ TRỊ index, không phải vị trí trong mảng
+    Map<Integer, Citation> byIndex = citations.stream()
+        .collect(Collectors.toMap(Citation::index, c -> c, (a, b) -> a));
+
+    Matcher  m   = CHUNK_MARKER.matcher(text);
+    StringBuilder out = new StringBuilder();
+
+    while (m.find()) {
+        int       n = Integer.parseInt(m.group(1));
+        Citation  c = byIndex.get(n);
+
+        String replacement = (c == null)
+            // Marker không map được (bị lọc quyền, hoặc LLM bịa số).
+            // Xóa hẳn — đừng để lộ "[chunk:7]" cho người dùng.
+            ? ""
+            : renderLink(c);   // NHỚ escape HTML cho document_name và snippet
+
+        m.appendReplacement(out, Matcher.quoteReplacement(replacement));
+    }
+    m.appendTail(out);
+    return out.toString();
+}
+```
+
+Bốn điểm phải làm đúng, tóm tắt lại:
+
+1. Gom hết text rồi mới regex — không parse từng event.
+2. Map theo **giá trị** `index`, không theo vị trí trong mảng.
+3. Xử lý được marker không map được (xóa đi).
+4. Escape HTML cho `document_name` và `snippet` trước khi render.
+
+### 6.10 Lỗi giữa chừng
+
+Khi luồng LLM đứt sau khi stream đã bắt đầu:
+
+```text
+data: Theo nội quy công ty,
+
+event: error
+data: Generation service unavailable
+
+event: citations
+data: {"citations":[]}
+
+event: done
+data: df093a48-ed78-4109-ac96-a75be34ab35c
+```
+
+> **HTTP status vẫn là `200`.** Header đã gửi đi rồi nên không thể đổi status
+> nữa. Đây là lý do **không được** chỉ dựa vào HTTP status để biết chat thành
+> công. Phải kiểm tra: có nhận được `event: done` không, và có gặp
+> `event: error` không.
+
+Sau `error`, stream vẫn kết thúc đúng thủ tục với `citations` và `done`. Câu trả
+lời tích luỹ được là một phần dở dang — HRM nên hiển thị nó kèm cảnh báo, hoặc
+bỏ đi và mời người dùng hỏi lại.
+
+Server vẫn lưu phần trả lời dở dang vào lịch sử session. Điều này cũng đúng khi
+**client tự ngắt kết nối** giữa chừng.
+
+### 6.11 Ví dụ curl
+
+```bash
+curl -N -X POST \
+  "http://<RAG_HOST>:<RAG_PORT>/workspaces/<WORKSPACE_ID>/chat" \
+  -H "Authorization: Bearer <ACCESS_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "session_id": "df093a48-ed78-4109-ac96-a75be34ab35c",
+        "message": "Giờ làm việc của công ty là mấy giờ?"
+      }'
+```
+
+> Bắt buộc có `-N` (`--no-buffer`), nếu không curl sẽ đệm và bạn không thấy
+> stream chảy theo thời gian thực.
+
+### 6.12 Lỗi của endpoint chat
+
+| HTTP | `code` | Nghĩa | HRM nên làm gì |
+|---|---|---|---|
+| 400 | `INVALID_REQUEST` | `message` rỗng, hoặc JSON sai cú pháp | Bug phía HRM. Validate trước khi gửi |
+| 403 | `CHATBOT_PERMISSION_REQUIRED` | Thiếu `CHATBOT_USE` | Ẩn tính năng chat với user này |
+| 403 | `FORBIDDEN` | Không phải member, **hoặc** `session_id` thuộc user khác | Kiểm tra logic sinh session id |
+| 415 | `UNSUPPORTED_MEDIA_TYPE` | Thiếu `Content-Type: application/json` | Bug phía HRM |
+| 422 | `UNPROCESSABLE_ENTITY` | JSON đúng cú pháp nhưng sai schema (thiếu field, `session_id` không phải UUID) | Bug phía HRM |
+| 429 | `RATE_LIMITED` | Quá 30 request/phút cho một user | Backoff rồi thử lại. Nên chặn sẵn ở UI |
+| 500 | `INTERNAL_ERROR` | Lỗi server | Retry với backoff |
+| 502 | `GENERATION_SERVICE_UNAVAILABLE` | LLM / embedding / vector store chết **trước khi** stream mở | Retry với backoff. Báo người dùng "hệ thống bận" |
+
+> Phân biệt hai kiểu lỗi generation:
+> - Chết **trước** khi stream mở → `502` JSON bình thường.
+> - Chết **sau** khi stream mở → HTTP `200` + `event: error`.
+>
+> Code HRM phải xử lý cả hai đường.
+
+---
+
+## 7. Lỗi
+
+### 7.1 Format chung
+
+Mọi lỗi HTTP đều trả về đúng một cấu trúc — kể cả lỗi framework, route không tồn
+tại, sai method:
+
+```json
+{
+  "error": {
+    "code": "RESOURCE_NOT_FOUND",
+    "message": "Resource not found"
+  }
+}
+```
+
+| Field | Ghi chú |
+|---|---|
+| `error.code` | **Chuỗi ổn định, máy đọc. HRM phải branch theo field này** |
+| `error.message` | Tiếng Anh, cho người đọc. **Câu chữ không thuộc contract, có thể đổi** |
+| `error.details` | Chỉ xuất hiện ở một số endpoint ngoài phạm vi này. Bỏ qua |
+
+Ngoại lệ duy nhất: `204 No Content` (xóa thành công) có body rỗng.
+
+> Đừng bao giờ so sánh chuỗi `message` trong code. Chỉ dùng `code`.
+
+### 7.2 Bảng đầy đủ
+
+Toàn bộ mã lỗi có thể gặp trên 6 endpoint trong tài liệu này:
+
+| HTTP | `code` | Nghĩa | HRM nên làm gì |
+|---|---|---|---|
+| 400 | `INVALID_REQUEST` | Body/tham số sai, hoặc không có file nào hợp lệ | Sửa request. **Không retry** |
+| 400 | `INVALID_ACCESS_MODE` | `access_mode` không phải `workspace_default`/`restricted` | Sửa request. **Không retry** |
+| 400 | `HRM_SCOPE_MISMATCH` | `{workspace_id}` sai so với cấu hình server | Sai config phía HRM. **Không retry** |
+| 401 | `UNAUTHORIZED` | Thiếu/sai định dạng header `Authorization` | Sửa code. **Không retry** |
+| 401 | `INVALID_TOKEN` | Token không hợp lệ vì bất kỳ lý do gì | Lấy token mới, thử lại **1 lần** |
+| 403 | `FORBIDDEN` | Không phải member, hoặc session của user khác | **Không retry** |
+| 403 | `WORKSPACE_ADMIN_REQUIRED` | Cần role admin (upload/xóa) | **Không retry**. Chặn ở UI |
+| 403 | `HRM_ROLE_REQUIRED` | `role` không hợp lệ | **Không retry**. Sửa cách phát hành token |
+| 403 | `CHATBOT_PERMISSION_REQUIRED` | Thiếu `CHATBOT_USE` | **Không retry**. Cấp quyền hoặc ẩn chat |
+| 404 | `RESOURCE_NOT_FOUND` | Không tồn tại / workspace khác / không có quyền xem / URL sai | **Không retry**. Với `DELETE`: coi như đã xong |
+| 405 | `METHOD_NOT_ALLOWED` | Sai HTTP method | Bug phía HRM. **Không retry** |
+| 413 | `PAYLOAD_TOO_LARGE` | Body vượt 50 MiB | Chia nhỏ. **Không retry** |
+| 415 | `UNSUPPORTED_MEDIA_TYPE` | Sai `Content-Type` | Bug phía HRM. **Không retry** |
+| 422 | `UNPROCESSABLE_ENTITY` | JSON hợp lệ nhưng sai schema | Bug phía HRM. **Không retry** |
+| 429 | `RATE_LIMITED` | Vượt rate limit | **Retry** với exponential backoff |
+| 500 | `INTERNAL_ERROR` | Lỗi server không xác định | **Retry** với backoff |
+| 500 | `AUTHZ_ERROR` | Dịch vụ phân quyền chết/timeout | **Retry** với backoff |
+| 500 | `AUTHZ_REVOKE_FAILED` | Không thu hồi được quyền khi xóa; chưa xóa gì | **Retry** — an toàn |
+| 502 | `GENERATION_SERVICE_UNAVAILABLE` | LLM/embedding/vector store chết trước khi stream mở | **Retry** với backoff |
+
+### 7.3 Quy tắc retry gọn
+
+```
+4xx  →  KHÔNG retry (trừ 429). Đây là bug hoặc thiếu quyền phía client.
+429  →  Retry, exponential backoff.
+5xx  →  Retry, exponential backoff, tối đa 3 lần.
+```
+
+Không có header `Retry-After` cho `429`. Tự chọn backoff — cửa sổ rate limit mặc
+định là 60 giây, nên khởi điểm 5 giây rồi nhân đôi là hợp lý.
+
+---
+
+## 8. Giới hạn hiện tại
+
+Ghi trung thực để HRM biết trước, không phải để bào chữa.
+
+### 8.1 Chưa có idempotency
+
+Upload **cùng một file hai lần sẽ tạo ra hai document riêng biệt**, hai
+`document_id` khác nhau, cả hai đều được index, và chat có thể trích dẫn cả hai
+cho cùng một câu hỏi.
+
+Không có idempotency key, không có dedup theo checksum (server *có* tính SHA-256
+và lưu, nhưng **không** dùng nó để chặn trùng).
+
+**HRM phải tự chống trùng.** Ví dụ: giữ cột `rag_document_id` và chỉ upload khi
+cột đó còn `NULL`; upload lại thì xóa cái cũ trước.
+
+Rủi ro thực tế cần đề phòng: request upload timeout ở phía HRM nhưng server vẫn
+xử lý xong. Retry mù sẽ tạo bản trùng. Khi timeout, nên dùng endpoint list
+(optional) để kiểm tra trước khi retry.
+
+### 8.2 Chưa hỗ trợ xóa theo ID bên ngoài
+
+Chỉ xóa được theo `document_id` do RAG service cấp. Không có external ID, không
+có cột metadata tuỳ ý cho HRM gắn ID của mình. Xem lại mục 5.2.
+
+### 8.3 PDF scan chưa OCR được
+
+Chưa đấu nối OCR provider nào. PDF ảnh → `FAILED` / `NEEDS_OCR` vĩnh viễn.
+
+Ảnh hưởng thực tế: hợp đồng scan, quyết định có dấu đỏ, form viết tay — nhóm tài
+liệu rất phổ biến trong HR — đều **không dùng được**. Cần thống nhất với người
+dùng cuối trước khi triển khai.
+
+### 8.4 Chưa có versioning
+
+Không có `/v1`. Đổi contract là đổi trực tiếp trên path hiện tại.
+
+**Đề xuất:** trước khi lên production, hai bên chốt cơ chế version (thêm `/v1`
+hoặc dùng header). Không thì bản nâng cấp sau sẽ làm hỏng HRM mà không báo trước.
+
+### 8.5 Rate limit hiện tại
+
+Sliding window trong bộ nhớ, khóa theo user (subject của token):
+
+| Nhóm | Giới hạn mặc định | Biến môi trường |
+|---|---|---|
+| Chat | **30 request / 60 giây / user** | `RATE_LIMIT_CHAT_PER_WINDOW` |
+| Upload | **10 request / 60 giây / user** | `RATE_LIMIT_UPLOAD_PER_WINDOW` |
+| Cửa sổ | **60 giây** | `RATE_LIMIT_WINDOW_SECS` |
+
+**Không** có rate limit trên GET status, DELETE và `/health`.
+
+Hai điều cần biết:
+
+- Giới hạn tính **theo user**, không theo HRM backend. Nếu HRM gọi bằng token
+  riêng của từng nhân viên thì mỗi người có hạn mức riêng.
+- Bộ đếm nằm **trong bộ nhớ của một process**. Restart API là reset sạch. Chạy
+  nhiều instance thì mỗi instance đếm riêng — tức là giới hạn thực tế bị nhân
+  lên theo số instance. Không nên coi đây là cơ chế bảo vệ nghiêm túc.
+
+### 8.6 Những điều khác nên biết trước
+
+Đọc được trong code, HRM nên nắm:
+
+1. **Không có webhook/callback.** Muốn biết ingest xong phải poll. Nếu HRM cần
+   push, phải đề xuất cho phase sau.
+
+2. **Không có endpoint tải lại file gốc trong phạm vi này.** HRM phải tự giữ bản
+   gốc.
+
+3. **Timestamp không có timezone.** Xem cảnh báo ở mục 4.1. Đây là lỗi runtime
+   rất dễ dính.
+
+4. **API hiện bind `127.0.0.1`.** Chưa gọi được từ máy khác. Xem 1.4.
+
+5. **Chưa từng chạy với token production của HRM.** Toàn bộ kiểm thử Phase 3 dùng
+   secret test trong process. Chưa có bằng chứng token thật của HRM verify được.
+   Đây là rủi ro tích hợp thật, cần smoke test chung sớm.
+
+6. **Chat lọc theo tài liệu `COMPLETED` + `DONE`.** Tài liệu đang `PROCESSING`
+   hoặc `FAILED` hoàn toàn vô hình với chat. Không có kết quả một phần.
+
+7. **Retrieval lấy tối đa 5 đoạn mỗi câu hỏi** (`QDRANT_TOP_K=5`). Câu hỏi cần
+   tổng hợp từ nhiều tài liệu có thể trả lời thiếu.
+
+8. **Chưa có kiểm soát độ dài `message`.** API không giới hạn, nhưng câu quá dài
+   sẽ bị LLM từ chối hoặc cắt. HRM nên tự giới hạn ở UI.
+
+9. **Model trả lời và model embedding cấu hình phía server.** HRM không chọn được
+   model, không chỉnh được temperature, không sửa được system prompt.
+
+10. **Câu trả lời được sinh bằng tiếng Việt hay tiếng Anh phụ thuộc LLM**, không
+    có tham số ép ngôn ngữ.
+
+---
+
+## 9. Checklist tích hợp
+
+Tick dần khi làm.
+
+### Chuẩn bị (làm cùng team RAG)
+
+- [ ] Nhận **base URL** thật (host + port + có HTTPS hay không)
+- [ ] Xác nhận API đã bind ra ngoài `127.0.0.1`, HRM backend gọi tới được
+- [ ] Nhận **UUID workspace cố định** (`HRM_WORKSPACE_ID`) — *chặn tích hợp, xem 2.5*
+- [ ] Xác nhận team RAG đã bật `HRM_MODE=true`
+- [ ] Bàn giao **shared secret / JWKS** để RAG verify được token HRM (qua kênh bảo mật, **không** qua chat/email)
+- [ ] Xác nhận `JWT_ISSUER` khớp issuer của HRM
+- [ ] Xác nhận `JWT_SUBJECT_CLAIM=userid`
+
+### Token
+
+- [ ] Token HRM có claim `userid`, giá trị ổn định vĩnh viễn theo nhân viên
+- [ ] Token có claim `role` ∈ {`ADMIN`, `HR`, `MANAGER`, `EMPLOYEE`} — **đúng hoa thường**
+- [ ] Token có `permissions` chứa `CHATBOT_USE` cho user được phép chat
+- [ ] Đã thử token **hết hạn** → nhận `401 INVALID_TOKEN`
+- [ ] Đã thử role sai (ví dụ `SUPERVISOR`) → nhận `403 HRM_ROLE_REQUIRED`
+
+### Kết nối cơ bản
+
+- [ ] `GET /health` trả `200 {"status":"ok","db":"connected"}`
+- [ ] Gọi một endpoint có auth bằng token thật → không phải `401`
+
+### Upload
+
+- [ ] Upload một PDF có text → nhận `202` kèm `document_id`
+- [ ] **Đã lưu `document_id` vào database của HRM**
+- [ ] Upload bằng token `EMPLOYEE` → nhận `403 WORKSPACE_ADMIN_REQUIRED`
+- [ ] Upload file không hỗ trợ (ví dụ `.xlsx`) → nhận `400 INVALID_REQUEST`
+- [ ] Upload PDF scan → theo dõi tới `FAILED` / `NEEDS_OCR`, và HRM hiển thị được thông báo phù hợp
+
+### Poll trạng thái
+
+- [ ] Poll ngay sau upload → thấy `PROCESSING`
+- [ ] Poll tới khi thấy `COMPLETED` / `DONE`
+- [ ] Kiểm tra `chunk_count > 0`
+- [ ] Parse `created_at` / `updated_at` **không ném exception** (dùng `LocalDateTime`)
+- [ ] Có timeout dừng poll (khuyến nghị 15 phút) và cảnh báo
+- [ ] Xử lý được `404` khi poll một `document_id` không tồn tại
+
+### Chat
+
+- [ ] Sinh `session_id` bằng UUID v4 ngẫu nhiên
+- [ ] Nhận được stream, đọc được các event
+- [ ] **Gom toàn bộ text rồi mới parse marker** — *xem 6.4*
+- [ ] Thay `[chunk:N]` bằng link, tra cứu theo **giá trị** `index`
+- [ ] Xử lý được marker không map được (xóa khỏi text hiển thị)
+- [ ] Escape HTML cho `document_name` và `snippet`
+- [ ] Xử lý được `citations` rỗng (hỏi câu không có trong tài liệu)
+- [ ] Coi thiếu `event: done` là lỗi
+- [ ] Xử lý được `event: error` giữa chừng (HTTP vẫn `200`)
+- [ ] Bỏ qua dòng comment `:keep-alive`
+- [ ] Multi-turn: gửi lại cùng `session_id`, xác nhận LLM nhớ ngữ cảnh
+- [ ] Chat bằng token thiếu `CHATBOT_USE` → nhận `403 CHATBOT_PERMISSION_REQUIRED`
+
+### Xóa
+
+- [ ] Xóa bằng `document_id` đã lưu → nhận `204`
+- [ ] Poll lại sau khi xóa → nhận `404`
+- [ ] Xóa hai lần → lần hai `404`, HRM coi là thành công
+- [ ] Xóa bằng token `EMPLOYEE` → nhận `403`
+
+### Xử lý lỗi
+
+- [ ] Branch theo `error.code`, **không** theo `error.message`
+- [ ] Không retry 4xx (trừ 429)
+- [ ] Retry 429 và 5xx với exponential backoff, có giới hạn số lần
+- [ ] Log kèm `document_id` / `session_id` để còn đối chiếu với log phía RAG
+- [ ] Xử lý được `502` (trước stream) và `event: error` (trong stream) như hai đường khác nhau
+
+### Trước khi lên production
+
+- [ ] Chốt cơ chế versioning API với team RAG (xem 8.4)
+- [ ] Chốt cách chống upload trùng phía HRM (xem 8.1)
+- [ ] Thống nhất với người dùng cuối rằng PDF scan chưa dùng được (xem 8.3)
+- [ ] Chạy smoke test chung end-to-end bằng token production thật (xem 8.6 mục 5)
+
+---
+
+## Phụ lục — tóm tắt biến môi trường phía RAG
+
+HRM **không** đặt các biến này, nhưng cần biết để trao đổi khi debug.
+
+| Biến | Ảnh hưởng tới HRM |
+|---|---|
+| `API_BIND_ADDR` | Base URL |
+| `HRM_MODE` | Phải `true`, nếu không toàn bộ logic role/permission của HRM không chạy |
+| `HRM_TENANT_ID`, `HRM_WORKSPACE_ID` | UUID cố định HRM phải nhét vào path |
+| `JWT_ISSUER` | Phải khớp `iss` trong token HRM |
+| `JWT_SUBJECT_CLAIM` | Phải là `userid` |
+| `JWT_ALG`, `JWT_HMAC_SECRET`, `JWT_JWKS_URL` | Cách verify chữ ký |
+| `JWT_VERIFY_AUDIENCE` | `false` cho HRM → token không cần `aud` |
+| `DOCUMENT_MAX_UPLOAD_BYTES` | Giới hạn upload (mặc định 50 MiB) |
+| `RATE_LIMIT_CHAT_PER_WINDOW`, `RATE_LIMIT_UPLOAD_PER_WINDOW`, `RATE_LIMIT_WINDOW_SECS` | Rate limit |
+| `QDRANT_TOP_K` | Số đoạn tối đa mỗi câu hỏi (mặc định 5) |
+| `INGESTION_JOB_MAX_ATTEMPTS` | Số lần retry ingest trước khi `FAILED` (mặc định 5) |
+| `GMRAG_GRAPH_EXTRACTION_ENABLED` | Có thấy stage `GRAPH_EXTRACTION` hay không |
+
+---
+
+*Tài liệu này được sinh ở Phase 4, đọc trực tiếp từ source `gmrag_api/src`.
+Các mục `TODO` được tổng hợp lại trong `docs/PHASE4_RESULT.md`.*
