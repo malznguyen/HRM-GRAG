@@ -1202,6 +1202,15 @@ Không có header `Retry-After` cho `429`. Tự chọn backoff — cửa sổ ra
 
 Ghi trung thực để HRM biết trước, không phải để bào chữa.
 
+Đã sửa ở Phase 5, **không còn là giới hạn**:
+
+| Từng là giới hạn | Nay |
+|---|---|
+| Upload lỗi một phần diễn ra âm thầm | `202` trả kèm mảng `rejected` với `reason_code` từng file (mục 3.4) |
+| `DELETE` lộ sự tồn tại của tài liệu mà `GET` cố giấu | Cả hai cùng trả `404 RESOURCE_NOT_FOUND` (mục 5.4) |
+| HRM phải nhét UUID workspace vào mọi URL | Dùng alias `hrm` (mục 2.5). UUID vẫn dùng được |
+| Chưa chứng minh service đọc được cấu hình HRM từ `.env` | Đã verify khởi động thật, có dòng log INFO xác nhận mode/alg/claim/workspace |
+
 ### 8.1 Chưa có idempotency
 
 Upload **cùng một file hai lần sẽ tạo ra hai document riêng biệt**, hai
@@ -1273,9 +1282,11 @@ Hai điều cần biết:
 
 4. **API hiện bind `127.0.0.1`.** Chưa gọi được từ máy khác. Xem 1.4.
 
-5. **Chưa từng chạy với token production của HRM.** Toàn bộ kiểm thử Phase 3 dùng
-   secret test trong process. Chưa có bằng chứng token thật của HRM verify được.
-   Đây là rủi ro tích hợp thật, cần smoke test chung sớm.
+5. **Chưa chạy với shared secret thật của HRM.** Phase 5.1 đã verify đường đi đầy
+   đủ — HRM mode đọc từ `.env`, token HS512 ký bằng `JWT_HMAC_SECRET` trong `.env`
+   gọi chat được `200`, `EMPLOYEE` → member, `HR` → admin, thiếu `CHATBOT_USE` →
+   `403` — nhưng bằng một **secret tạm**. Đổi sang secret thật chỉ là thay đúng một
+   dòng `JWT_HMAC_SECRET` rồi restart; vẫn nên smoke test chung ngay sau khi đổi.
 
 6. **Chat lọc theo tài liệu `COMPLETED` + `DONE`.** Tài liệu đang `PROCESSING`
    hoặc `FAILED` hoàn toàn vô hình với chat. Không có kết quả một phần.
@@ -1302,8 +1313,9 @@ Tick dần khi làm.
 
 - [ ] Nhận **base URL** thật (host + port + có HTTPS hay không)
 - [ ] Xác nhận API đã bind ra ngoài `127.0.0.1`, HRM backend gọi tới được
-- [ ] Nhận **UUID workspace cố định** (`HRM_WORKSPACE_ID`) — *chặn tích hợp, xem 2.5*
-- [ ] Xác nhận team RAG đã bật `HRM_MODE=true`
+- [x] ~~Nhận **UUID workspace cố định**~~ — không còn cần: dùng alias `hrm` trong path (mục 2.5).
+      Muốn gọi bằng UUID thì workspace là `fa76881f-6367-4b80-a89e-a3e01206a806`
+- [x] ~~Xác nhận team RAG đã bật `HRM_MODE=true`~~ — đã bật và verify từ `.env` (Phase 5.1)
 - [ ] Bàn giao **shared secret / JWKS** để RAG verify được token HRM (qua kênh bảo mật, **không** qua chat/email)
 - [ ] Xác nhận `JWT_ISSUER` khớp issuer của HRM
 - [ ] Xác nhận `JWT_SUBJECT_CLAIM=userid`
@@ -1326,7 +1338,10 @@ Tick dần khi làm.
 - [ ] Upload một PDF có text → nhận `202` kèm `document_id`
 - [ ] **Đã lưu `document_id` vào database của HRM**
 - [ ] Upload bằng token `EMPLOYEE` → nhận `403 WORKSPACE_ADMIN_REQUIRED`
-- [ ] Upload file không hỗ trợ (ví dụ `.xlsx`) → nhận `400 INVALID_REQUEST`
+- [ ] Upload file không hỗ trợ (ví dụ `.xlsx`) → nhận `400 INVALID_REQUEST`,
+      `error.details.rejected[0].reason_code = UNSUPPORTED_MEDIA_TYPE`
+- [ ] Upload lô hỗn hợp (1 file tốt + 1 file `.xlsx`) → `202`, `documents` có 1 phần tử
+      và `rejected` có 1 phần tử. **Đọc `rejected`, đừng đếm `documents`**
 - [ ] Upload PDF scan → theo dõi tới `FAILED` / `NEEDS_OCR`, và HRM hiển thị được thông báo phù hợp
 
 ### Poll trạng thái
@@ -1358,7 +1373,8 @@ Tick dần khi làm.
 - [ ] Xóa bằng `document_id` đã lưu → nhận `204`
 - [ ] Poll lại sau khi xóa → nhận `404`
 - [ ] Xóa hai lần → lần hai `404`, HRM coi là thành công
-- [ ] Xóa bằng token `EMPLOYEE` → nhận `403`
+- [ ] Xóa bằng token `EMPLOYEE` → nhận **`404`** (không phải `403` — xem 5.4).
+      Chặn nút xóa theo `role` trong token, đừng dựa vào mã lỗi của RAG
 
 ### Xử lý lỗi
 
@@ -1385,7 +1401,7 @@ HRM **không** đặt các biến này, nhưng cần biết để trao đổi kh
 |---|---|
 | `API_BIND_ADDR` | Base URL |
 | `HRM_MODE` | Phải `true`, nếu không toàn bộ logic role/permission của HRM không chạy |
-| `HRM_TENANT_ID`, `HRM_WORKSPACE_ID` | UUID cố định HRM phải nhét vào path |
+| `HRM_TENANT_ID`, `HRM_WORKSPACE_ID` | Phạm vi server tự chốt. `HRM_WORKSPACE_ID` cũng là giá trị alias `hrm` resolve về |
 | `JWT_ISSUER` | Phải khớp `iss` trong token HRM |
 | `JWT_SUBJECT_CLAIM` | Phải là `userid` |
 | `JWT_ALG`, `JWT_HMAC_SECRET`, `JWT_JWKS_URL` | Cách verify chữ ký |

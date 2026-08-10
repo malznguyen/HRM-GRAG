@@ -186,6 +186,13 @@ else
   blue "session_id (client tự sinh) = ${SESSION_ID}"
 
   sse_raw="$(mktemp)"
+  chat_body="$(mktemp)"
+
+  # Body đi qua file chứ không qua `-d "..."`: trên Git Bash/Windows, chuỗi tiếng
+  # Việt truyền thẳng làm tham số bị chuyển mã trước khi tới curl, server nhận
+  # được JSON hỏng và trả 400 INVALID_REQUEST. Ghi file rồi --data-binary thì
+  # bytes tới nguyên vẹn trên mọi nền tảng.
+  printf '%s' "{\"session_id\":\"${SESSION_ID}\",\"message\":\"Giờ làm việc của công ty là mấy giờ?\"}" > "$chat_body"
 
   # -N (--no-buffer) là bắt buộc, nếu không curl sẽ đệm cả stream.
   curl -sS -N \
@@ -193,8 +200,10 @@ else
     -H "$AUTH" \
     -H 'Content-Type: application/json' \
     -H 'Accept: text/event-stream' \
-    -d "{\"session_id\":\"${SESSION_ID}\",\"message\":\"Giờ làm việc của công ty là mấy giờ?\"}" \
+    --data-binary "@${chat_body}" \
     > "$sse_raw"
+
+  rm -f "$chat_body"
 
   echo "--- stream nguyên văn ---"
   cat "$sse_raw"
@@ -219,7 +228,12 @@ for block in raw.split("\n\n"):
         if line.startswith("event:"):
             name = line[6:].strip()
         elif line.startswith("data:"):
-            data.append(line[5:].lstrip())
+            # Đúng chuẩn SSE: sau "data:" chỉ bỏ **một** dấu cách phân cách.
+            # Dùng lstrip() sẽ nuốt luôn dấu cách thật của câu trả lời — server gửi
+            # "data:  làm" (một cách phân cách + một cách thật) và text ráp lại sẽ
+            # dính liền thành "Giờlàmviệc".
+            chunk = line[5:]
+            data.append(chunk[1:] if chunk.startswith(" ") else chunk)
     if not data:
         continue
     payload = "\n".join(data)

@@ -102,6 +102,16 @@ All endpoint-specific error bullets below define only the relevant HTTP status
 and stable domain code; the cross-cutting error contract applies to every
 application failure.
 
+### Current `{workspace_id}` Path Segment
+
+When `HRM_MODE=true`, the literal lowercase `hrm` is accepted wherever
+`{workspace_id}` appears and resolves to `HRM_WORKSPACE_ID`. Resolution happens in
+a middleware wrapping the whole router, before route matching, so it applies to
+every route in the table below without exception and every handler still receives
+a parsed `Uuid`. Scope checks, authorization, metrics and logs therefore only ever
+observe the resolved UUID. The alias is case-sensitive (`HRM` is not an alias), and
+when `HRM_MODE=false` it is not resolved at all. Full UUIDs are unaffected.
+
 | Method | Path | Authorization |
 | --- | --- | --- |
 | `GET` | `/health` | public |
@@ -392,8 +402,8 @@ Evidence: `gmrag_api/src/tenant_cleanup.rs:373-428,649-706` and
 - Auth: bearer JWT.
 - Authorization: `admin` on `workspace:{workspace_id}`.
 - Request body: `multipart/form-data` with one or more `file` parts, and an optional text field `access_mode` (`workspace_default` | `restricted`). Supported files are PDF, DOCX, TXT, and MD. When omitted, `access_mode` defaults to `workspace_default`. The same `access_mode` applies to every accepted file in the request.
-- Success: `202` with `{ documents: [{ document_id, filename }] }` for the accepted files.
-- Errors: `400 INVALID_REQUEST` when no acceptable file is accepted; `400 INVALID_ACCESS_MODE`; authz `403`; `404 RESOURCE_NOT_FOUND`; or `500 INTERNAL_ERROR`, all JSON envelopes.
+- Success: `202` with `{ documents: [{ document_id, filename }], rejected: [{ filename, reason_code, message }] }`. `rejected` is always present (empty when nothing was dropped) and lists every `file` part that was not accepted; `reason_code` is one of `PAYLOAD_TOO_LARGE`, `UNSUPPORTED_MEDIA_TYPE`, `FILE_READ_FAILED`, `STORAGE_WRITE_FAILED`, `PERSIST_FAILED`, `AUTHZ_SYNC_FAILED`.
+- Errors: `400 INVALID_REQUEST` when no acceptable file is accepted, carrying the same list in `error.details.rejected`; `400 INVALID_ACCESS_MODE`; authz `403`; `404 RESOURCE_NOT_FOUND`; or `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: uploads original bytes to MinIO/S3, then atomically inserts `documents` metadata (including `access_mode`) and one durable `ingestion_jobs` row. Processing is performed by the separate ingestion worker after commit.
 - Validation: PDF requires a `%PDF-` signature plus successful `lopdf` structural parsing. DOCX requires the ZIP local-file signature, a readable archive, `[Content_Types].xml`, and `word/document.xml`. TXT/MD require non-empty valid UTF-8 bytes with no NUL; because their content validators are identical, only the sanitized `.txt`/`.md` extension selects which server MIME is stored. `DOCUMENT_MAX_UPLOAD_BYTES` limits each file and the multipart request body (default `52428800`, 50 MiB).
 - Security notes: client MIME is ignored for acceptance and persistence. `documents.content_type` is always one of the server-validated values `application/pdf`, `application/vnd.openxmlformats-officedocument.wordprocessingml.document`, `text/plain`, or `text/markdown`. Filename suffix does not establish PDF/DOCX identity and is used only to disambiguate valid TXT from MD. Responses do not expose raw object keys. Uploading as `restricted` does not auto-create `document_shares` or `explicit_viewer` tuples for the uploader; visibility follows the same restricted-document rules as after `PATCH .../access-mode`.
@@ -404,9 +414,12 @@ Evidence: `gmrag_api/src/tenant_cleanup.rs:373-428,649-706` and
 - Authorization: `admin` on `workspace:{workspace_id}`.
 - Request body: none.
 - Success: `204` empty body.
-- Errors: authz `403`; `404 RESOURCE_NOT_FOUND`; `500 AUTHZ_REVOKE_FAILED`
-  when document tuple revoke fails before SQL mutation; or `500 INTERNAL_ERROR`,
-  all JSON envelopes.
+- Errors: `404 RESOURCE_NOT_FOUND` for an unknown document, a document in another
+  workspace, **and** an authorization denial — the same concealment rule `GET` on
+  this path uses, so switching method cannot reveal whether a document exists;
+  `500 AUTHZ_REVOKE_FAILED` when document tuple revoke fails before SQL mutation;
+  `500 AUTHZ_ERROR` when the authorization dependency itself fails; or
+  `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: captures document tuples and object metadata, revokes OpenFGA
   first, then removes graph provenance/document SQL and inserts audit,
   `qdrant_outbox` (`delete_by_document`) and `storage_outbox` (`delete_object`)
