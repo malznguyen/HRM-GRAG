@@ -5,8 +5,9 @@
 #
 # Cách dùng:
 #   export RAG_BASE_URL="http://127.0.0.1:18083"
-#   export RAG_WORKSPACE_ID="<uuid workspace cố định của HRM>"
 #   export RAG_TOKEN="<access token role ADMIN/HR/MANAGER, có CHATBOT_USE>"
+#   # RAG_WORKSPACE_ID mặc định là alias "hrm"; đặt UUID đầy đủ nếu muốn.
+#   export RAG_WORKSPACE_ID="hrm"
 #   ./smoke.sh [đường-dẫn-file-để-upload]
 #
 # Không có file truyền vào thì script tự tạo một file .md tạm.
@@ -18,7 +19,8 @@
 set -uo pipefail
 
 BASE_URL="${RAG_BASE_URL:-http://127.0.0.1:18083}"
-WORKSPACE_ID="${RAG_WORKSPACE_ID:-}"
+# Alias "hrm" chạy được khi server bật HRM_MODE; UUID đầy đủ vẫn luôn dùng được.
+WORKSPACE_ID="${RAG_WORKSPACE_ID:-hrm}"
 TOKEN="${RAG_TOKEN:-}"
 UPLOAD_FILE="${1:-}"
 
@@ -51,7 +53,7 @@ print(d)
 " "$1" 2>/dev/null
 }
 
-[ -n "$WORKSPACE_ID" ] || die "Chưa đặt RAG_WORKSPACE_ID. Xin UUID workspace từ team RAG (xem mục 2.5 của INTEGRATION_GUIDE.md)."
+[ -n "$WORKSPACE_ID" ] || die "RAG_WORKSPACE_ID rỗng. Bỏ trống để dùng alias 'hrm', hoặc đặt UUID workspace (xem mục 2.5 của INTEGRATION_GUIDE.md)."
 [ -n "$TOKEN" ]        || die "Chưa đặt RAG_TOKEN."
 
 command -v curl    >/dev/null || die "cần curl"

@@ -747,19 +747,27 @@ components:
       in: path
       required: true
       description: |
-        The workspace UUID. In HRM mode this is **not** a free parameter: the
-        server compares it against `HRM_WORKSPACE_ID` and rejects any other
-        value with `400 HRM_SCOPE_MISMATCH`. HRM must hard-code the single
-        configured value.
+        The workspace, either as a UUID or as the literal alias `hrm`.
 
-        TODO: the concrete UUID has not been provisioned — `HRM_MODE`,
-        `HRM_TENANT_ID` and `HRM_WORKSPACE_ID` are absent from the deployment
-        `.env` as of 2026-08-10. This value must be handed to HRM before
-        integration. See `docs/PHASE4_RESULT.md`.
+        This is **not** a free parameter: the server compares the resolved value
+        against `HRM_WORKSPACE_ID` and rejects any other workspace with
+        `400 HRM_SCOPE_MISMATCH`.
+
+        **Alias `hrm`** (HRM mode only) resolves to the configured
+        `HRM_WORKSPACE_ID` on every route in this specification, so HRM never has
+        to carry the UUID and a workspace change does not require an HRM deploy.
+        The alias is matched exactly and is case-sensitive: `HRM` and `Hrm` are
+        not aliases and fail UUID parsing with `400 INVALID_REQUEST`. When
+        `HRM_MODE=false` the alias is not resolved and behaves the same way.
+
+        The full UUID keeps working unchanged — the alias is additive.
       schema:
-        type: string
-        format: uuid
-      example: fa76881f-6367-4b80-a89e-a3e01206a806
+        oneOf:
+          - type: string
+            format: uuid
+          - type: string
+            enum: [hrm]
+      example: hrm
 
     DocumentId:
       name: document_id

@@ -4,6 +4,8 @@
 # VS Code extension "REST Client".
 #
 # Biến lấy từ http-client.env.json — chọn environment `local` trước khi chạy.
+# {{workspaceId}} mặc định là alias `hrm`: server đang bật HRM_MODE sẽ resolve nó
+# về workspace đã ghim. Thay bằng UUID đầy đủ cũng chạy y hệt.
 # Với VS Code REST Client, thay {{...}} bằng giá trị thật hoặc khai báo trong
 # settings.json (mục "rest-client.environmentVariables").
 #
@@ -170,6 +172,17 @@ Authorization: Bearer {{accessToken}}
 ### E4. document_id khong ton tai -> 404 RESOURCE_NOT_FOUND
 GET {{baseUrl}}/workspaces/{{workspaceId}}/documents/00000000-0000-0000-0000-000000000002
 Authorization: Bearer {{accessToken}}
+
+### E4b. Alias viet hoa -> KHONG resolve, 400 INVALID_REQUEST
+# Alias chi nhan dung chuoi thuong `hrm`. HRM / Hrm van la chuoi khong parse duoc
+# thanh UUID, nen tra ve 400 giong nhu truoc khi co alias.
+GET {{baseUrl}}/workspaces/HRM/documents/{{documentId}}
+Authorization: Bearer {{accessToken}}
+
+### E4c. Xoa bang token EMPLOYEE -> 404 RESOURCE_NOT_FOUND (khong phai 403)
+# DELETE giau su ton tai giong het GET: khong co quyen va khong ton tai deu ra 404.
+DELETE {{baseUrl}}/workspaces/{{workspaceId}}/documents/{{documentId}}
+Authorization: Bearer {{employeeToken}}
 
 ### E5. message rong -> 400 INVALID_REQUEST
 POST {{baseUrl}}/workspaces/{{workspaceId}}/chat

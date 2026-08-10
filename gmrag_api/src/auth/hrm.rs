@@ -92,6 +92,35 @@ impl fmt::Display for HrmProvisionError {
 
 impl std::error::Error for HrmProvisionError {}
 
+/// Chuỗi duy nhất được chấp nhận thay cho UUID ở vị trí `{workspace_id}`.
+///
+/// Cố tình chỉ nhận đúng dạng chữ thường: một alias phân biệt hoa thường là một
+/// alias, còn `hrm`/`HRM`/`Hrm` cùng chạy là ba cách viết cho một thứ và sẽ trôi
+/// vào log, cache key, tài liệu ở ba dạng khác nhau.
+pub const HRM_WORKSPACE_ALIAS: &str = "hrm";
+
+/// Đổi alias `hrm` ở vị trí `{workspace_id}` thành `HRM_WORKSPACE_ID`.
+///
+/// Trả `None` khi path không chứa alias — caller giữ nguyên URI thay vì dựng lại
+/// chuỗi, nên UUID thật đi qua đây không bị đụng vào.
+///
+/// Chỉ đổi segment đứng **ngay sau** `workspaces`, nên `hrm` ở vị trí khác
+/// (tên file, session id, `/tenants/hrm/...`) không bị ảnh hưởng.
+pub fn resolve_workspace_alias_path(path: &str, config: &HrmConfig) -> Option<String> {
+    let workspace_id = config.workspace_id.to_string();
+    let mut segments: Vec<&str> = path.split('/').collect();
+    let mut resolved = false;
+
+    for index in 1..segments.len() {
+        if segments[index - 1] == "workspaces" && segments[index] == HRM_WORKSPACE_ALIAS {
+            segments[index] = workspace_id.as_str();
+            resolved = true;
+        }
+    }
+
+    resolved.then(|| segments.join("/"))
+}
+
 pub fn ensure_scope(path: &str, config: &HrmConfig) -> Result<(), HrmScopeError> {
     let segments: Vec<&str> = path.split('/').filter(|segment| !segment.is_empty()).collect();
     for pair in segments.windows(2) {
@@ -314,6 +343,93 @@ mod tests {
             ensure_scope("/tenants/00000000-0000-0000-0000-000000000001/workspaces", &config),
             Err(HrmScopeError::Tenant(_))
         ));
+    }
+
+    fn hrm_test_config() -> HrmConfig {
+        HrmConfig {
+            tenant_id: Uuid::parse_str("a47ab6d6-bf77-4c8c-a22d-a4f1997eb18d").unwrap(),
+            workspace_id: Uuid::parse_str("fa76881f-6367-4b80-a89e-a3e01206a806").unwrap(),
+        }
+    }
+
+    /// Alias phải chạy trên **mọi** route workspace, không chỉ vài route được nhớ tới:
+    /// alias hoạt động chỗ này mà không hoạt động chỗ kia là thứ khó debug nhất.
+    #[test]
+    fn workspace_alias_resolves_on_every_workspace_route() {
+        let config = hrm_test_config();
+        let workspace_id = config.workspace_id.to_string();
+
+        for suffix in [
+            "",
+            "/documents",
+            "/documents/upload",
+            "/documents/2f1d4e3c-0000-4000-8000-000000000001",
+            "/documents/2f1d4e3c-0000-4000-8000-000000000001/retry",
+            "/documents/2f1d4e3c-0000-4000-8000-000000000001/preview",
+            "/chat",
+            "/chat/history",
+            "/chat/sessions",
+            "/chat/sessions/2f1d4e3c-0000-4000-8000-000000000002/messages",
+            "/chunks/2f1d4e3c-0000-4000-8000-000000000003",
+            "/citations/resolve",
+            "/graph",
+            "/members",
+        ] {
+            assert_eq!(
+                resolve_workspace_alias_path(&format!("/workspaces/hrm{suffix}"), &config),
+                Some(format!("/workspaces/{workspace_id}{suffix}")),
+                "alias must resolve for /workspaces/hrm{suffix}"
+            );
+        }
+    }
+
+    /// UUID thật không được đụng tới — trả `None` để caller giữ nguyên URI gốc.
+    #[test]
+    fn real_uuid_paths_are_left_untouched() {
+        let config = hrm_test_config();
+
+        for path in [
+            "/workspaces/fa76881f-6367-4b80-a89e-a3e01206a806/chat",
+            "/workspaces/00000000-0000-0000-0000-000000000001/documents",
+            "/health",
+            "/tenants/a47ab6d6-bf77-4c8c-a22d-a4f1997eb18d/workspaces",
+        ] {
+            assert_eq!(resolve_workspace_alias_path(path, &config), None);
+        }
+    }
+
+    /// Alias chỉ nhận đúng chuỗi thường `hrm`, và chỉ ở vị trí ngay sau `workspaces`.
+    #[test]
+    fn alias_is_case_sensitive_and_positional() {
+        let config = hrm_test_config();
+
+        for path in [
+            "/workspaces/HRM/chat",
+            "/workspaces/Hrm/chat",
+            "/workspaces/hrm-workspace/chat",
+            "/workspaces/hrmx/chat",
+            // `hrm` ở vị trí khác không phải alias workspace.
+            "/tenants/hrm/workspaces",
+            "/workspaces/fa76881f-6367-4b80-a89e-a3e01206a806/chat/sessions/hrm",
+        ] {
+            assert_eq!(
+                resolve_workspace_alias_path(path, &config),
+                None,
+                "must not resolve {path}"
+            );
+        }
+    }
+
+    /// Sau khi resolve, `ensure_scope` phải thấy đúng workspace đã ghim — alias không
+    /// được trở thành đường vòng qua kiểm tra scope.
+    #[test]
+    fn resolved_alias_satisfies_scope_check() {
+        let config = hrm_test_config();
+        let resolved =
+            resolve_workspace_alias_path("/workspaces/hrm/documents/upload", &config).unwrap();
+
+        assert!(ensure_scope(&resolved, &config).is_ok());
+        assert!(resolved.contains(&config.workspace_id.to_string()));
     }
 
     #[test]

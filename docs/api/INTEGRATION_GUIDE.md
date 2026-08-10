@@ -112,12 +112,12 @@ Toàn bộ endpoint HRM cần:
 
 | # | Việc | Method | Path |
 |---|---|---|---|
-| 1 | Upload tài liệu | `POST` | `/workspaces/{workspace_id}/documents/upload` |
-| 2 | Xem trạng thái | `GET` | `/workspaces/{workspace_id}/documents/{document_id}` |
-| 3 | Xóa tài liệu | `DELETE` | `/workspaces/{workspace_id}/documents/{document_id}` |
-| 4 | Chat (SSE) | `POST` | `/workspaces/{workspace_id}/chat` |
+| 1 | Upload tài liệu | `POST` | `/workspaces/hrm/documents/upload` |
+| 2 | Xem trạng thái | `GET` | `/workspaces/hrm/documents/{document_id}` |
+| 3 | Xóa tài liệu | `DELETE` | `/workspaces/hrm/documents/{document_id}` |
+| 4 | Chat (SSE) | `POST` | `/workspaces/hrm/chat` |
 | 5 | Health check | `GET` | `/health` |
-| — | *(optional)* Liệt kê tài liệu để đối soát | `GET` | `/workspaces/{workspace_id}/documents` |
+| — | *(optional)* Liệt kê tài liệu để đối soát | `GET` | `/workspaces/hrm/documents` |
 
 ---
 
@@ -205,30 +205,48 @@ nhận `403`, không phải `400`. Đừng tưởng body của mình đúng.
 chọn.** Server tự chốt phạm vi: nó so `{workspace_id}` trong URL với giá trị
 `HRM_WORKSPACE_ID` cấu hình sẵn, khác một ký tự là `400 HRM_SCOPE_MISMATCH`.
 
-Nhưng **path hiện tại vẫn còn `{workspace_id}`**. Nên trên thực tế:
+Path vẫn còn `{workspace_id}`, nhưng HRM **không cần biết UUID**: viết đúng chuỗi
+`hrm` vào vị trí đó, server tự resolve về `HRM_WORKSPACE_ID`.
 
-> HRM phải hard-code **một** UUID workspace cố định vào config, rồi ghép vào mọi
-> URL. Không bao giờ lấy giá trị này từ input người dùng, không bao giờ cho phép
-> chọn.
+```
+POST   /workspaces/hrm/documents/upload
+GET    /workspaces/hrm/documents/{document_id}
+DELETE /workspaces/hrm/documents/{document_id}
+POST   /workspaces/hrm/chat
+GET    /workspaces/hrm/documents
+```
 
 ```java
 // application.yml
-// rag.workspace-id: <UUID do team RAG cung cấp>
-private static final String WORKSPACE_PATH =
-    "/workspaces/" + ragWorkspaceId + "/documents/upload";
+// rag.base-url: http://<RAG_HOST>:<RAG_PORT>
+// Không cần rag.workspace-id nữa.
+private static final String WORKSPACE_PATH = "/workspaces/hrm/documents/upload";
 ```
 
-> **TODO — chặn tích hợp:** UUID cụ thể **chưa tồn tại**. Đã kiểm tra file `.env`
-> của deployment ngày 2026-08-10: các key `HRM_MODE`, `HRM_TENANT_ID`,
-> `HRM_WORKSPACE_ID` đều **chưa được đặt**, nghĩa là HRM mode chưa bật. Team RAG
-> phải tạo tenant + workspace, bật `HRM_MODE=true`, rồi bàn giao UUID cho HRM.
-> Trước khi có giá trị đó, HRM không thể gọi bất kỳ endpoint nào ngoài `/health`.
+Alias hoạt động trên **mọi** route có `{workspace_id}` trong tài liệu này — upload,
+trạng thái, xóa, danh sách, chat và mọi route chat con. Không có route nào là ngoại lệ.
 
-> **TODO — đề xuất cho phase sau:** nên bỏ `{workspace_id}` khỏi path. Server đã
-> biết workspace từ config rồi, để nó trong URL chỉ tạo ra một tham số mà client
-> bắt buộc phải đoán đúng và không có quyền thay đổi. Path gọn hơn nên là
-> `POST /documents/upload`, `POST /chat`, v.v. Việc này đổi contract nên để
-> phase sau, không làm ở Phase 4.
+Ba điều cần nhớ:
+
+| Điều | Chi tiết |
+|---|---|
+| **Phân biệt hoa thường** | Chỉ đúng chuỗi thường `hrm`. `HRM`, `Hrm` **không** phải alias → `400 INVALID_REQUEST` |
+| **UUID vẫn dùng được** | Alias là bổ sung, không thay thế. Điền UUID đầy đủ vẫn chạy y hệt |
+| **Chỉ khi HRM mode bật** | `HRM_MODE=false` thì `hrm` lại chỉ là chuỗi thường và không parse được thành UUID → `400 INVALID_REQUEST` |
+
+Alias resolve **trước khi routing**, nên phần còn lại của hệ thống chỉ nhìn thấy
+UUID: kiểm tra scope, phân quyền, log và metrics đều ghi UUID thật, không ghi `hrm`.
+
+> Vẫn giữ nguyên nguyên tắc: **không** lấy workspace từ input người dùng. Alias
+> `hrm` là hằng số trong code HRM, không phải tham số cấu hình cho user chọn.
+
+Nếu vẫn muốn dùng UUID: workspace của HRM là
+`fa76881f-6367-4b80-a89e-a3e01206a806`, tenant `a47ab6d6-bf77-4c8c-a22d-a4f1997eb18d`.
+Gửi UUID **khác** hai giá trị này → `400 HRM_SCOPE_MISMATCH`.
+
+> **TODO — đề xuất cho phase sau:** nên bỏ hẳn `{workspace_id}` khỏi path. Alias
+> đã giấu được UUID, nhưng path gọn hơn vẫn nên là `POST /documents/upload`,
+> `POST /chat`. Việc này đổi contract nên để phase sau.
 
 ### 2.6 Lỗi xác thực
 
@@ -252,7 +270,7 @@ private static final String WORKSPACE_PATH =
 ## 3. Upload tài liệu
 
 ```
-POST /workspaces/{workspace_id}/documents/upload
+POST /workspaces/hrm/documents/upload
 ```
 
 Yêu cầu role admin (`ADMIN` / `HR` / `MANAGER`). Token `EMPLOYEE` → `403
@@ -357,7 +375,7 @@ có ít nhất một file thực sự được nhận để xử lý.
 
 ```bash
 curl -i -X POST \
-  "http://<RAG_HOST>:<RAG_PORT>/workspaces/<WORKSPACE_ID>/documents/upload" \
+  "http://<RAG_HOST>:<RAG_PORT>/workspaces/hrm/documents/upload" \
   -H "Authorization: Bearer <ACCESS_TOKEN>" \
   -F "file=@noi-quy-cong-ty.pdf;type=application/pdf"
 ```
@@ -433,7 +451,7 @@ Gửi 2 file và **cả hai** đều bị loại — `400`, lý do nằm trong `
 ## 4. Trạng thái tài liệu
 
 ```
-GET /workspaces/{workspace_id}/documents/{document_id}
+GET /workspaces/hrm/documents/{document_id}
 ```
 
 Yêu cầu role member trở lên — `EMPLOYEE` gọi được.
@@ -584,7 +602,7 @@ liệu bình thường vẫn `PROCESSING` sau 15 phút gần như chắc chắn 
 
 ```bash
 curl -s \
-  "http://<RAG_HOST>:<RAG_PORT>/workspaces/<WORKSPACE_ID>/documents/<DOCUMENT_ID>" \
+  "http://<RAG_HOST>:<RAG_PORT>/workspaces/hrm/documents/<DOCUMENT_ID>" \
   -H "Authorization: Bearer <ACCESS_TOKEN>"
 ```
 
@@ -625,7 +643,7 @@ Chỉ khi **hạ tầng phân quyền** hỏng thì mới ra `500 AUTHZ_ERROR` �
 ## 5. Xóa tài liệu
 
 ```
-DELETE /workspaces/{workspace_id}/documents/{document_id}
+DELETE /workspaces/hrm/documents/{document_id}
 ```
 
 Yêu cầu role admin. Thành công → **`204 No Content`, body rỗng**.
@@ -690,7 +708,7 @@ duy nhất.
 
 ```bash
 curl -i -X DELETE \
-  "http://<RAG_HOST>:<RAG_PORT>/workspaces/<WORKSPACE_ID>/documents/<DOCUMENT_ID>" \
+  "http://<RAG_HOST>:<RAG_PORT>/workspaces/hrm/documents/<DOCUMENT_ID>" \
   -H "Authorization: Bearer <ACCESS_TOKEN>"
 ```
 
@@ -724,7 +742,7 @@ Chỉ `5xx` mới là lỗi đáng retry.
 ## 6. Chat — phần quan trọng nhất
 
 ```
-POST /workspaces/{workspace_id}/chat
+POST /workspaces/hrm/chat
 ```
 
 Yêu cầu role member trở lên **và** `permissions` chứa `CHATBOT_USE`.
@@ -1082,7 +1100,7 @@ Server vẫn lưu phần trả lời dở dang vào lịch sử session. Điều
 
 ```bash
 curl -N -X POST \
-  "http://<RAG_HOST>:<RAG_PORT>/workspaces/<WORKSPACE_ID>/chat" \
+  "http://<RAG_HOST>:<RAG_PORT>/workspaces/hrm/chat" \
   -H "Authorization: Bearer <ACCESS_TOKEN>" \
   -H "Content-Type: application/json" \
   -d '{

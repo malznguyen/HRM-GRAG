@@ -16,7 +16,9 @@ Kèm theo [`../INTEGRATION_GUIDE.md`](../INTEGRATION_GUIDE.md) và
 Cho **IntelliJ IDEA** (Tools → HTTP Client) hoặc **VS Code** + extension
 *REST Client*. Tiện nhất cho dev Java vì chạy thẳng trong IDE.
 
-1. Mở `http-client.env.json`, điền `baseUrl`, `workspaceId`, `accessToken`.
+1. Mở `http-client.env.json`, điền `baseUrl` và `accessToken`. `workspaceId` để
+   sẵn là alias `hrm` — server tự resolve về workspace đã ghim, không cần điền
+   UUID. Muốn gọi tường minh thì thay bằng UUID đầy đủ, vẫn chạy y hệt.
 2. Mở `hrm-rag.http`, chọn environment `local` ở góc trên.
 3. Bấm ▶ bên trái từng request.
 
@@ -39,8 +41,10 @@ Chạy tuần tự cả 5 việc và kiểm tra kết quả từng bước. Dùn
 
 ```bash
 export RAG_BASE_URL="http://127.0.0.1:18083"
-export RAG_WORKSPACE_ID="<uuid workspace cố định của HRM>"
 export RAG_TOKEN="<access token role ADMIN/HR/MANAGER, có CHATBOT_USE>"
+
+# Tuỳ chọn. Mặc định là alias "hrm"; đặt UUID đầy đủ nếu muốn gọi tường minh.
+export RAG_WORKSPACE_ID="hrm"
 
 ./smoke.sh                          # tự tạo file .md mẫu để upload
 ./smoke.sh /duong/dan/tai-lieu.pdf  # hoặc upload file của bạn
