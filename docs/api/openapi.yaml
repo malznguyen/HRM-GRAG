@@ -354,20 +354,24 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403":
           description: |
-            `WORKSPACE_ADMIN_REQUIRED` — the caller is not a workspace admin.
             `HRM_ROLE_REQUIRED` — the token carries no recognised HRM `role`.
-            Unlike `GET`, this endpoint does report an authorization denial as `403`.
+            An *authorization* denial is not reported here: a caller who is not a
+            workspace admin gets `404`, exactly like `GET` on this path.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
               examples:
-                adminRequired:
+                roleRequired:
                   value:
                     error:
-                      code: WORKSPACE_ADMIN_REQUIRED
-                      message: Workspace admin access required
+                      code: HRM_ROLE_REQUIRED
+                      message: A valid HRM role is required
         "404":
-          description: Unknown document, or the document belongs to another workspace.
+          description: |
+            Unknown document, the document belongs to another workspace, **or**
+            the caller lacks the `admin` relation. These three are deliberately
+            indistinguishable — the same rule `GET` on this path already applied.
+            Changing method must not reveal whether a document exists.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }

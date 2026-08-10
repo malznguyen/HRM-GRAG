@@ -702,13 +702,22 @@ HTTP/1.1 204 No Content
 
 | HTTP | `code` | Nghĩa | HRM nên làm gì |
 |---|---|---|---|
-| 403 | `WORKSPACE_ADMIN_REQUIRED` | Token `EMPLOYEE` | Chặn từ phía HRM, đừng để user thường bấm xóa |
-| 404 | `RESOURCE_NOT_FOUND` | Không tồn tại hoặc thuộc workspace khác | **Coi như đã xóa xong.** Xóa hai lần là idempotent |
+| 404 | `RESOURCE_NOT_FOUND` | Không tồn tại, thuộc workspace khác, **hoặc** caller không phải admin | **Coi như đã xóa xong.** Xóa hai lần là idempotent |
 | 500 | `AUTHZ_REVOKE_FAILED` | Không thu hồi được phân quyền; **chưa xóa gì cả** | An toàn để retry |
 | 500 | `INTERNAL_ERROR` | Transaction lỗi, đã rollback | An toàn để retry |
+| 500 | `AUTHZ_ERROR` | Hạ tầng phân quyền hỏng | An toàn để retry |
 
-Lưu ý khác biệt so với `GET`: `DELETE` **có** trả `403` thật khi thiếu quyền
-(không giấu thành `404`).
+`DELETE` áp dụng **đúng quy tắc che giấu như `GET`** (mục 4.7): không tồn tại,
+thuộc workspace khác, và không đủ quyền đều ra `404 RESOURCE_NOT_FOUND` giống hệt
+nhau. Trước Phase 5 endpoint này trả `403 WORKSPACE_ADMIN_REQUIRED` khi thiếu
+quyền — nghĩa là chỉ cần đổi `GET` thành `DELETE` trên cùng một URL là dò ra được
+tài liệu có tồn tại hay không, đúng thứ `GET` cố tình giấu. Nay không còn.
+
+> **Hệ quả cho HRM:** token `EMPLOYEE` bấm xóa sẽ nhận `404`, không phải `403`.
+> Không suy ra được "file không tồn tại" từ đó. Hãy chặn nút xóa ở phía HRM theo
+> role trong token thay vì dựa vào mã lỗi của RAG.
+
+Chỉ `5xx` mới là lỗi đáng retry.
 
 ---
 
@@ -1144,10 +1153,10 @@ Toàn bộ mã lỗi có thể gặp trên 6 endpoint trong tài liệu này:
 | 401 | `UNAUTHORIZED` | Thiếu/sai định dạng header `Authorization` | Sửa code. **Không retry** |
 | 401 | `INVALID_TOKEN` | Token không hợp lệ vì bất kỳ lý do gì | Lấy token mới, thử lại **1 lần** |
 | 403 | `FORBIDDEN` | Không phải member, hoặc session của user khác | **Không retry** |
-| 403 | `WORKSPACE_ADMIN_REQUIRED` | Cần role admin (upload/xóa) | **Không retry**. Chặn ở UI |
+| 403 | `WORKSPACE_ADMIN_REQUIRED` | Cần role admin (upload). **Xóa** thiếu quyền ra `404`, không phải mã này | **Không retry**. Chặn ở UI |
 | 403 | `HRM_ROLE_REQUIRED` | `role` không hợp lệ | **Không retry**. Sửa cách phát hành token |
 | 403 | `CHATBOT_PERMISSION_REQUIRED` | Thiếu `CHATBOT_USE` | **Không retry**. Cấp quyền hoặc ẩn chat |
-| 404 | `RESOURCE_NOT_FOUND` | Không tồn tại / workspace khác / không có quyền xem / URL sai | **Không retry**. Với `DELETE`: coi như đã xong |
+| 404 | `RESOURCE_NOT_FOUND` | Không tồn tại / workspace khác / không có quyền (xem *hoặc* xóa) / URL sai | **Không retry**. Với `DELETE`: coi như đã xong |
 | 405 | `METHOD_NOT_ALLOWED` | Sai HTTP method | Bug phía HRM. **Không retry** |
 | 413 | `PAYLOAD_TOO_LARGE` | Body vượt 50 MiB | Chia nhỏ. **Không retry** |
 | 415 | `UNSUPPORTED_MEDIA_TYPE` | Sai `Content-Type` | Bug phía HRM. **Không retry** |

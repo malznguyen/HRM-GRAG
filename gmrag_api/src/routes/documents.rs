@@ -575,6 +575,21 @@ pub async fn list_documents(
     }
 }
 
+/// Quy tắc che giấu dùng chung cho mọi method trên
+/// `/workspaces/{workspace_id}/documents/{document_id}`.
+///
+/// "Không tồn tại" và "không có quyền" phải ra cùng một `404 RESOURCE_NOT_FOUND`,
+/// nếu không thì caller chỉ cần đổi method trên đúng URL đó là suy ra được tài liệu
+/// có tồn tại hay không. Lỗi hạ tầng authz (5xx) là chuyện khác — nó không nói gì về
+/// tài liệu, và nuốt nó thành 404 sẽ biến sự cố dịch vụ thành "không tìm thấy".
+fn hide_document_existence(err: ApiError) -> ApiError {
+    if err.status.is_server_error() {
+        err
+    } else {
+        ApiError::from_status(StatusCode::NOT_FOUND)
+    }
+}
+
 pub async fn get_document_status(
     State(state): State<AppState>,
     authz: Authz,
@@ -584,11 +599,7 @@ pub async fn get_document_status(
         .require_relation(Relation::Member, &Object::Workspace(workspace_id))
         .await
     {
-        return if err.status.is_server_error() {
-            err.into_response()
-        } else {
-            StatusCode::NOT_FOUND.into_response()
-        };
+        return hide_document_existence(err).into_response();
     }
 
     let document = match get_document_directory(&state.pool, workspace_id, document_id).await {
@@ -1070,7 +1081,7 @@ pub async fn delete_document(
         .require_relation(Relation::Admin, &Object::Workspace(workspace_id))
         .await
     {
-        return err.into_response();
+        return hide_document_existence(err).into_response();
     }
 
     let mut tx = match state.pool.begin().await {
@@ -1928,6 +1939,43 @@ mod tests {
         let unique: std::collections::HashSet<&str> = codes.iter().copied().collect();
         assert_eq!(unique.len(), codes.len());
         assert!(reasons.iter().all(|reason| !reason.message().is_empty()));
+    }
+
+    /// GET và DELETE trên cùng một document path phải trả về cùng một câu trả lời khi
+    /// bị từ chối, nếu không thì đổi method là dò được sự tồn tại của tài liệu.
+    #[test]
+    fn document_authz_denial_is_indistinguishable_from_a_missing_document() {
+        for denial in [
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "WORKSPACE_ADMIN_REQUIRED",
+                "Workspace admin access required",
+            ),
+            ApiError::new(
+                StatusCode::FORBIDDEN,
+                "WORKSPACE_MEMBER_REQUIRED",
+                "Workspace member access required",
+            ),
+            ApiError::from_status(StatusCode::NOT_FOUND),
+        ] {
+            let hidden = hide_document_existence(denial);
+            assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+            assert_eq!(hidden.code, "RESOURCE_NOT_FOUND");
+        }
+    }
+
+    /// Sự cố hạ tầng authz không nói gì về tài liệu — nuốt nó thành 404 sẽ biến
+    /// outage thành "không tìm thấy" và giấu mất nguyên nhân thật.
+    #[test]
+    fn document_authz_infrastructure_failure_is_not_swallowed_into_404() {
+        let outage = ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "AUTHZ_ERROR",
+            "Authorization service unavailable",
+        );
+        let passed_through = hide_document_existence(outage);
+        assert_eq!(passed_through.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(passed_through.code, "AUTHZ_ERROR");
     }
 
     /// Hai mã dùng lại nguyên văn vocabulary lỗi HTTP sẵn có, không tạo tên song song.
