@@ -111,11 +111,12 @@ paths:
         be valid non-empty UTF-8 with no NUL byte *and* carry a `.txt` or `.md`
         extension. Everything else is rejected.
 
-        **Partial success is silent.** Each `file` part that is oversized,
-        undetectable, or fails to store is skipped without an error entry; the
-        response lists only the parts that succeeded. Compare the length of
-        `documents` against the number of parts you sent. If *every* part is
-        skipped the call returns `400 INVALID_REQUEST`.
+        **Partial success is reported, not silent.** Every `file` part that is
+        oversized, undetectable, or fails to store is listed in `rejected` with
+        a machine-readable `reason_code`. Read `rejected` — do not infer failure
+        by comparing the length of `documents` against the number of parts you
+        sent. If *every* part is rejected the call returns `400 INVALID_REQUEST`
+        and the same list is carried in `error.details.rejected`.
 
         Uploading the same bytes twice creates two independent documents — there
         is no idempotency key and no checksum-based deduplication.
@@ -148,11 +149,26 @@ paths:
                     documents:
                       - document_id: 69f56ad1-f379-4705-9eb4-f58cbd269420
                         filename: noi-quy-cong-ty-smoke.md
+                    rejected: []
+                partial:
+                  summary: Three parts sent, one accepted and two rejected
+                  value:
+                    documents:
+                      - document_id: 69f56ad1-f379-4705-9eb4-f58cbd269420
+                        filename: quy-dinh.md
+                    rejected:
+                      - filename: bang-luong.xlsx
+                        reason_code: UNSUPPORTED_MEDIA_TYPE
+                        message: File content is not a supported document format (PDF, DOCX, TXT, MD)
+                      - filename: anh.bin
+                        reason_code: UNSUPPORTED_MEDIA_TYPE
+                        message: File content is not a supported document format (PDF, DOCX, TXT, MD)
         "400":
           description: |
             `INVALID_ACCESS_MODE` — the `access_mode` part is present but is not
             `workspace_default` or `restricted`.
-            `INVALID_REQUEST` — no part survived validation.
+            `INVALID_REQUEST` — no part survived validation. `error.details.rejected`
+            carries the same per-file reason list as the `202` response.
             `HRM_SCOPE_MISMATCH` — the `{workspace_id}` in the path is not the
             workspace this deployment is pinned to (HRM mode only).
           content:
@@ -164,6 +180,11 @@ paths:
                     error:
                       code: INVALID_REQUEST
                       message: Request did not contain an acceptable file
+                      details:
+                        rejected:
+                          - filename: bang-luong.xlsx
+                            reason_code: UNSUPPORTED_MEDIA_TYPE
+                            message: File content is not a supported document format (PDF, DOCX, TXT, MD)
                 invalidAccessMode:
                   value:
                     error:
@@ -896,9 +917,18 @@ components:
 
     UploadDocumentsResponse:
       type: object
-      required: [documents]
+      required: [documents, rejected]
       additionalProperties: false
       properties:
+        rejected:
+          type: array
+          description: |
+            Every `file` part that was NOT accepted, in the order the parts were
+            read. Always present; empty when nothing was rejected. Added in Phase
+            5.2 — a client written against the earlier schema keeps working by
+            ignoring this field, but then loses per-file failure information.
+          items:
+            $ref: "#/components/schemas/RejectedUpload"
         documents:
           type: array
           description: Only the parts that were accepted. May be shorter than the number of parts sent; never empty (an empty result is a `400`).
@@ -920,6 +950,50 @@ components:
                   characters. Falls back to `upload.pdf` when the part carries no
                   usable filename. May differ from what was sent.
                 maxLength: 255
+
+    RejectedUpload:
+      type: object
+      required: [filename, reason_code, message]
+      additionalProperties: false
+      properties:
+        filename:
+          type: string
+          description: The sanitized filename of the rejected part, sanitized by the same rules as an accepted one.
+          maxLength: 255
+        reason_code:
+          $ref: "#/components/schemas/UploadRejectionReasonCode"
+        message:
+          type: string
+          description: Fixed English explanation for the `reason_code`. Intended for logs, not for end users — branch on `reason_code`.
+
+    UploadRejectionReasonCode:
+      type: string
+      description: |
+        Why a single `file` part was not accepted. Stable machine-readable code;
+        branch on this, never on `message`.
+          * `PAYLOAD_TOO_LARGE` — the part exceeds `DOCUMENT_MAX_UPLOAD_BYTES`.
+            In practice the whole request usually trips the body limit first and
+            the call fails with `413` before any part is inspected.
+          * `UNSUPPORTED_MEDIA_TYPE` — content sniffing found no supported format.
+            This is the code HRM will see in day-to-day use (`.xlsx`, images,
+            scanned binaries, a `.txt` that is not valid UTF-8).
+          * `FILE_READ_FAILED` — the multipart part could not be read to the end
+            (client aborted, malformed body).
+          * `STORAGE_WRITE_FAILED` — object storage rejected the write.
+          * `PERSIST_FAILED` — the document row or ingestion job could not be
+            written to Postgres. The stored object is cleaned up.
+          * `AUTHZ_SYNC_FAILED` — the document→workspace relation could not be
+            written to OpenFGA. The row and object are rolled back.
+        The last four are server-side faults: the part itself may be fine and the
+        upload is worth retrying. The first two are caller faults — retrying the
+        same bytes gives the same result.
+      enum:
+        - PAYLOAD_TOO_LARGE
+        - UNSUPPORTED_MEDIA_TYPE
+        - FILE_READ_FAILED
+        - STORAGE_WRITE_FAILED
+        - PERSIST_FAILED
+        - AUTHZ_SYNC_FAILED
 
     DocumentStatus:
       type: string

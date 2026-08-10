@@ -282,7 +282,9 @@ cấp quyền xem riêng — mà endpoint cấp quyền đó nằm ngoài phạm
 Đây là giới hạn cho **cả request**, không phải từng file. Upload 3 file mỗi file
 20 MB trong một request sẽ vượt ngưỡng. Vượt → `413 PAYLOAD_TOO_LARGE`.
 
-Khuyến nghị: **mỗi request một file**. Dễ xử lý lỗi hơn nhiều (xem 3.4).
+Khuyến nghị: **mỗi request một file** — vì giới hạn body tính cho cả request, một
+file hỏng không làm hỏng lô, và tiến độ upload dễ hiển thị hơn. Lỗi từng file thì
+gửi lô cũng biết được: xem `rejected` ở mục 3.4.
 
 ### 3.3 Định dạng file được hỗ trợ
 
@@ -315,20 +317,41 @@ thực sự là UTF-8.
 
 HRM bắt buộc phải poll trạng thái (mục 4).
 
-> **CẢNH BÁO — thành công một phần diễn ra âm thầm.**
-> Nếu bạn gửi nhiều `file` trong một request, những file bị loại (quá lớn, không
-> nhận dạng được, lưu trữ lỗi) sẽ **bị bỏ qua không báo lỗi**. Response `202`
-> chỉ liệt kê những file thành công, và **không có** danh sách file bị loại,
-> cũng không có lý do.
->
-> HRM phải tự kiểm tra: `response.documents.size()` có bằng số file đã gửi không.
-> Lệch nghĩa là có file bị loại — nhưng bạn sẽ không biết file nào và vì sao.
->
-> Đây chính là lý do nên **upload mỗi request một file**: khi đó "bị loại" biến
-> thành `400 INVALID_REQUEST` rõ ràng, thay vì một mảng rỗng khó hiểu.
+**Thành công một phần được báo cáo tường minh.** Response `202` có hai mảng:
+
+| Field | Nội dung |
+|---|---|
+| `documents` | Các file đã nhận, mỗi phần tử có `document_id` + `filename` |
+| `rejected` | Các file **bị loại**, mỗi phần tử có `filename`, `reason_code`, `message` |
+
+`rejected` **luôn có mặt** — mảng rỗng khi không file nào bị loại. Đừng suy ra lỗi
+bằng cách so `documents.size()` với số file đã gửi; hãy đọc thẳng `rejected`.
+
+Bảng `reason_code`:
+
+| `reason_code` | Nghĩa | Lỗi của ai | Retry cùng bytes có ích? |
+|---|---|---|---|
+| `UNSUPPORTED_MEDIA_TYPE` | Nội dung không phải PDF/DOCX/TXT/MD hợp lệ (xem 3.3) | Caller | Không |
+| `PAYLOAD_TOO_LARGE` | File vượt `DOCUMENT_MAX_UPLOAD_BYTES` | Caller | Không |
+| `FILE_READ_FAILED` | Không đọc hết được phần multipart (client ngắt, body hỏng) | Caller | Có |
+| `STORAGE_WRITE_FAILED` | Ghi object storage thất bại | Server | Có |
+| `PERSIST_FAILED` | Ghi bản ghi tài liệu / job ingestion vào DB thất bại | Server | Có |
+| `AUTHZ_SYNC_FAILED` | Đồng bộ quyền tài liệu sang OpenFGA thất bại | Server | Có |
+
+Bốn mã cuối là sự cố phía server: bản thân file có thể vẫn tốt, upload lại là hợp lý.
+Với hai mã đầu, gửi lại đúng bytes đó sẽ ra đúng kết quả đó.
+
+> Trong thực tế `PAYLOAD_TOO_LARGE` ở mức từng file hiếm khi xuất hiện: giới hạn
+> body áp cho **cả request** (mục 3.2) nên request thường bị chặn bằng `413`
+> trước khi server kịp soi từng file.
+
+`message` là chuỗi tiếng Anh cố định, dùng để ghi log. **Phân nhánh theo
+`reason_code`, đừng parse `message`.**
 
 Nếu **mọi** file đều bị loại → `400 INVALID_REQUEST` với message
-`Request did not contain an acceptable file`.
+`Request did not contain an acceptable file`. Danh sách lý do vẫn còn, nằm ở
+`error.details.rejected` với đúng schema như trên — `202` chỉ dùng cho trường hợp
+có ít nhất một file thực sự được nhận để xử lý.
 
 ### 3.5 Ví dụ curl
 
@@ -348,7 +371,53 @@ Response `202`:
       "document_id": "69f56ad1-f379-4705-9eb4-f58cbd269420",
       "filename": "noi-quy-cong-ty.pdf"
     }
+  ],
+  "rejected": []
+}
+```
+
+Gửi 3 file, 1 nhận được và 2 bị loại — vẫn là `202`:
+
+```json
+{
+  "documents": [
+    {
+      "document_id": "69f56ad1-f379-4705-9eb4-f58cbd269420",
+      "filename": "quy-dinh.md"
+    }
+  ],
+  "rejected": [
+    {
+      "filename": "bang-luong.xlsx",
+      "reason_code": "UNSUPPORTED_MEDIA_TYPE",
+      "message": "File content is not a supported document format (PDF, DOCX, TXT, MD)"
+    },
+    {
+      "filename": "anh.bin",
+      "reason_code": "UNSUPPORTED_MEDIA_TYPE",
+      "message": "File content is not a supported document format (PDF, DOCX, TXT, MD)"
+    }
   ]
+}
+```
+
+Gửi 2 file và **cả hai** đều bị loại — `400`, lý do nằm trong `error.details`:
+
+```json
+{
+  "error": {
+    "code": "INVALID_REQUEST",
+    "message": "Request did not contain an acceptable file",
+    "details": {
+      "rejected": [
+        {
+          "filename": "bang-luong.xlsx",
+          "reason_code": "UNSUPPORTED_MEDIA_TYPE",
+          "message": "File content is not a supported document format (PDF, DOCX, TXT, MD)"
+        }
+      ]
+    }
+  }
 }
 ```
 

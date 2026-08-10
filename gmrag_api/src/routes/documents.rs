@@ -101,9 +101,77 @@ pub struct UploadedDocumentItem {
     pub filename: String,
 }
 
+/// Lý do một file bị loại khỏi lô upload.
+///
+/// Mọi nhánh `continue` trong `upload_document` phải map về đúng một biến thể ở đây —
+/// đó là điều kiện để client biết file nào hỏng thay vì đếm phần tử `documents`.
+/// Hai mã đầu tái dùng nguyên văn vocabulary lỗi sẵn có của API
+/// (`ApiError::from_status`) để cùng một điều kiện không có hai tên gọi.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadRejectionReason {
+    /// File vượt `DOCUMENT_MAX_UPLOAD_BYTES`.
+    PayloadTooLarge,
+    /// Nội dung không phải PDF/DOCX/TXT/MD hợp lệ (kiểm bằng nội dung, không tin đuôi file).
+    UnsupportedMediaType,
+    /// Không đọc hết được phần multipart của file (client ngắt giữa chừng, body hỏng).
+    FileReadFailed,
+    /// Ghi object gốc lên object storage thất bại.
+    StorageWriteFailed,
+    /// Ghi bản ghi tài liệu / job ingestion vào Postgres thất bại.
+    PersistFailed,
+    /// Đồng bộ quan hệ document→workspace sang OpenFGA thất bại (bản ghi đã được rollback).
+    AuthzSyncFailed,
+}
+
+impl UploadRejectionReason {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::PayloadTooLarge => "PAYLOAD_TOO_LARGE",
+            Self::UnsupportedMediaType => "UNSUPPORTED_MEDIA_TYPE",
+            Self::FileReadFailed => "FILE_READ_FAILED",
+            Self::StorageWriteFailed => "STORAGE_WRITE_FAILED",
+            Self::PersistFailed => "PERSIST_FAILED",
+            Self::AuthzSyncFailed => "AUTHZ_SYNC_FAILED",
+        }
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::PayloadTooLarge => "File exceeds the maximum upload size",
+            Self::UnsupportedMediaType => {
+                "File content is not a supported document format (PDF, DOCX, TXT, MD)"
+            }
+            Self::FileReadFailed => "File part could not be read from the request",
+            Self::StorageWriteFailed => "File could not be written to object storage",
+            Self::PersistFailed => "File metadata could not be persisted",
+            Self::AuthzSyncFailed => "File authorization could not be synchronized",
+        }
+    }
+}
+
+/// Một file bị từ chối trong lô upload, kèm mã lý do máy đọc được.
+#[derive(Serialize)]
+pub struct RejectedUploadItem {
+    pub filename: String,
+    pub reason_code: &'static str,
+    pub message: &'static str,
+}
+
+impl RejectedUploadItem {
+    fn new(filename: String, reason: UploadRejectionReason) -> Self {
+        Self {
+            filename,
+            reason_code: reason.code(),
+            message: reason.message(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct UploadDocumentsResponse {
     pub documents: Vec<UploadedDocumentItem>,
+    /// Luôn có mặt (mảng rỗng khi không có file nào bị loại). Client cũ bỏ qua field này.
+    pub rejected: Vec<RejectedUploadItem>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -1376,6 +1444,7 @@ pub async fn upload_document(
     // Drain multipart trước khi insert để access_mode không phụ thuộc thứ tự field.
     let mut access_mode = DocumentAccessMode::WorkspaceDefault;
     let mut pending_files: Vec<PendingUploadFile> = Vec::new();
+    let mut rejected: Vec<RejectedUploadItem> = Vec::new();
 
     while let Ok(Some(field)) = multipart.next_field().await {
         match field.name() {
@@ -1412,12 +1481,26 @@ pub async fn upload_document(
                     .unwrap_or_else(|| "upload.pdf".to_string());
                 let bytes = match field.bytes().await {
                     Ok(bytes) => bytes.to_vec(),
-                    Err(_) => continue,
+                    Err(_) => {
+                        rejected.push(RejectedUploadItem::new(
+                            filename,
+                            UploadRejectionReason::FileReadFailed,
+                        ));
+                        continue;
+                    }
                 };
                 if bytes.len() > document_max_upload_bytes() {
+                    rejected.push(RejectedUploadItem::new(
+                        filename,
+                        UploadRejectionReason::PayloadTooLarge,
+                    ));
                     continue;
                 }
                 let Some(format) = DocumentFormat::detect_upload(&filename, &bytes) else {
+                    rejected.push(RejectedUploadItem::new(
+                        filename,
+                        UploadRejectionReason::UnsupportedMediaType,
+                    ));
                     continue;
                 };
                 pending_files.push(PendingUploadFile {
@@ -1458,6 +1541,10 @@ pub async fn upload_document(
                     object_key = %object_key,
                     "Failed to upload document object"
                 );
+                rejected.push(RejectedUploadItem::new(
+                    filename,
+                    UploadRejectionReason::StorageWriteFailed,
+                ));
                 continue;
             }
         };
@@ -1467,6 +1554,10 @@ pub async fn upload_document(
             Err(err) => {
                 error!(error = %err, %workspace_id, %document_id, "Failed to begin upload database transaction");
                 let _ = state.storage.delete_object(&object_key).await;
+                rejected.push(RejectedUploadItem::new(
+                    filename,
+                    UploadRejectionReason::PersistFailed,
+                ));
                 continue;
             }
         };
@@ -1527,6 +1618,10 @@ pub async fn upload_document(
                     "Failed to cleanup object after database insert failure"
                 );
             }
+            rejected.push(RejectedUploadItem::new(
+                filename,
+                UploadRejectionReason::PersistFailed,
+            ));
             continue;
         }
 
@@ -1541,11 +1636,19 @@ pub async fn upload_document(
             error!(error = %err, %workspace_id, %document_id, "Failed to enqueue durable ingestion job during upload");
             let _ = transaction.rollback().await;
             let _ = state.storage.delete_object(&object_key).await;
+            rejected.push(RejectedUploadItem::new(
+                filename,
+                UploadRejectionReason::PersistFailed,
+            ));
             continue;
         }
         if let Err(err) = transaction.commit().await {
             error!(error = %err, %workspace_id, %document_id, "Failed to commit upload document and durable job");
             let _ = state.storage.delete_object(&object_key).await;
+            rejected.push(RejectedUploadItem::new(
+                filename,
+                UploadRejectionReason::PersistFailed,
+            ));
             continue;
         }
 
@@ -1590,6 +1693,10 @@ pub async fn upload_document(
                     "Failed to cleanup object after OpenFGA sync failure"
                 );
             }
+            rejected.push(RejectedUploadItem::new(
+                filename,
+                UploadRejectionReason::AuthzSyncFailed,
+            ));
             continue;
         }
 
@@ -1626,19 +1733,23 @@ pub async fn upload_document(
         });
     }
 
+    // Không file nào được nhận thì `202 Accepted` là nói dối: không có gì được nhận để xử lý.
+    // Giữ nguyên `400 INVALID_REQUEST` như trước Phase 5 (tương thích ngược), chỉ bổ sung
+    // danh sách lý do từng file vào `error.details.rejected` để client vẫn debug được.
     if uploaded.is_empty() {
-        return ApiError {
+        let error = ApiError {
             status: StatusCode::BAD_REQUEST,
             code: "INVALID_REQUEST",
             message: "Request did not contain an acceptable file".to_string(),
-        }
-        .into_response();
+        };
+        return error.into_response_with_details(json!({ "rejected": rejected }));
     }
 
     (
         StatusCode::ACCEPTED,
         Json(UploadDocumentsResponse {
             documents: uploaded,
+            rejected,
         }),
     )
         .into_response()
@@ -1730,6 +1841,105 @@ mod tests {
                 "updated_at": "2026-08-07T08:05:00",
                 "chunk_count": 3
             })
+        );
+    }
+
+    /// Lô hỗn hợp: `documents` chỉ chứa file nhận được, `rejected` liệt kê đủ file hỏng
+    /// kèm mã lý do — client không còn phải đoán bằng cách đếm phần tử.
+    #[test]
+    fn upload_response_reports_accepted_and_rejected_files_separately() {
+        let document_id = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let response = UploadDocumentsResponse {
+            documents: vec![UploadedDocumentItem {
+                document_id,
+                filename: "noi-quy.pdf".to_string(),
+            }],
+            rejected: vec![
+                RejectedUploadItem::new(
+                    "bang-luong.xlsx".to_string(),
+                    UploadRejectionReason::UnsupportedMediaType,
+                ),
+                RejectedUploadItem::new(
+                    "video.pdf".to_string(),
+                    UploadRejectionReason::PayloadTooLarge,
+                ),
+            ],
+        };
+
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({
+                "documents": [{ "document_id": document_id, "filename": "noi-quy.pdf" }],
+                "rejected": [
+                    {
+                        "filename": "bang-luong.xlsx",
+                        "reason_code": "UNSUPPORTED_MEDIA_TYPE",
+                        "message": "File content is not a supported document format (PDF, DOCX, TXT, MD)"
+                    },
+                    {
+                        "filename": "video.pdf",
+                        "reason_code": "PAYLOAD_TOO_LARGE",
+                        "message": "File exceeds the maximum upload size"
+                    }
+                ]
+            })
+        );
+    }
+
+    /// Lô toàn file hợp lệ vẫn phải có `rejected` (mảng rỗng), để client không phải
+    /// phân biệt "field vắng mặt" với "không có file nào bị loại".
+    #[test]
+    fn upload_response_always_carries_the_rejected_array() {
+        let response = UploadDocumentsResponse {
+            documents: Vec::new(),
+            rejected: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({ "documents": [], "rejected": [] })
+        );
+    }
+
+    /// Mã lý do là contract với HRM: phải ổn định, duy nhất, và không rỗng.
+    #[test]
+    fn upload_rejection_reason_codes_are_unique_and_stable() {
+        let reasons = [
+            UploadRejectionReason::PayloadTooLarge,
+            UploadRejectionReason::UnsupportedMediaType,
+            UploadRejectionReason::FileReadFailed,
+            UploadRejectionReason::StorageWriteFailed,
+            UploadRejectionReason::PersistFailed,
+            UploadRejectionReason::AuthzSyncFailed,
+        ];
+
+        let codes: Vec<&str> = reasons.iter().map(|reason| reason.code()).collect();
+        assert_eq!(
+            codes,
+            [
+                "PAYLOAD_TOO_LARGE",
+                "UNSUPPORTED_MEDIA_TYPE",
+                "FILE_READ_FAILED",
+                "STORAGE_WRITE_FAILED",
+                "PERSIST_FAILED",
+                "AUTHZ_SYNC_FAILED",
+            ]
+        );
+
+        let unique: std::collections::HashSet<&str> = codes.iter().copied().collect();
+        assert_eq!(unique.len(), codes.len());
+        assert!(reasons.iter().all(|reason| !reason.message().is_empty()));
+    }
+
+    /// Hai mã dùng lại nguyên văn vocabulary lỗi HTTP sẵn có, không tạo tên song song.
+    #[test]
+    fn reused_reason_codes_match_the_existing_api_error_vocabulary() {
+        assert_eq!(
+            UploadRejectionReason::PayloadTooLarge.code(),
+            crate::api_error::ApiError::from_status(StatusCode::PAYLOAD_TOO_LARGE).code
+        );
+        assert_eq!(
+            UploadRejectionReason::UnsupportedMediaType.code(),
+            crate::api_error::ApiError::from_status(StatusCode::UNSUPPORTED_MEDIA_TYPE).code
         );
     }
 }
