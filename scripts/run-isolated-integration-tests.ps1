@@ -209,6 +209,11 @@ try {
     $env:TEST_OPENFGA_STORE_NAME = $storeName
     $env:OPENFGA_STORE_ID = $fgaNamespace.StoreId
     $env:OPENFGA_MODEL_ID = $fgaNamespace.ModelId
+    # Import-GmragEnvironment kéo cả `.env` vào process env, và `.env` của máy dev
+    # có thể đang bật HRM_MODE. HrmConfig::from_env() được đọc trước cả nhánh
+    # TEST_BYPASS_JWT, nên nếu không ghim ở đây thì mọi integration test sẽ chạy
+    # trong HRM mode và bị ensure_scope từ chối bằng HRM_SCOPE_MISMATCH.
+    $env:HRM_MODE = "false"
     $env:CARGO_INCREMENTAL = "0"
     $env:RUST_TEST_THREADS = "1"
 
