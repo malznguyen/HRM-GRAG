@@ -45,9 +45,9 @@ Source: `scripts/p0-bringup-migrate.ps1:1-13,64-71,83-107`.
 The handoff starts the local infrastructure and checks the ingestion worker:
 
 ```powershell
-docker compose up -d --build
-docker compose ps
-docker compose logs --tail 100 ingestion-worker
+docker compose -p hrm-rag up -d --build
+docker compose -p hrm-rag ps
+docker compose -p hrm-rag logs --tail 100 ingestion-worker
 ```
 
 Compose starts the application Postgres, OpenFGA Postgres/migration/server,
@@ -70,15 +70,16 @@ defined at `docker-compose.yml:97-118`.
 Run the API on the host using the values printed by the bring-up helper:
 
 ```powershell
-Set-Location .\gmrag_api
-$env:QDRANT_URL='http://127.0.0.1:6333'
+Set-Location .
+$env:QDRANT_URL='http://127.0.0.1:16333'
 $env:QDRANT_VECTOR_SIZE='1024'
-$env:OLLAMA_EMBED_URL='http://127.0.0.1:11434/api/embed'
+$env:OLLAMA_EMBED_URL='http://127.0.0.1:11435/api/embed'
 $env:OLLAMA_EMBED_MODEL='AITeamVN/Vietnamese_Embedding'
-cargo run --locked
+cargo run --manifest-path .\gmrag_api\Cargo.toml --locked
 ```
 
-The API defaults to `127.0.0.1:8083`; the frontend package provides `npm run
+The HRM API binds to `127.0.0.1:18083`; OpenFGA is published at `18081`, Qdrant at
+`16333`, Ollama at `11435`, MinIO at `19000`, and Keycloak at `18080`. The frontend package provides `npm run
 dev` and its API client defaults to that API base URL. Configure the remaining
 API and OIDC values from `gmrag_api/.env.example` and the frontend’s existing
 environment contract before testing authenticated flows.
