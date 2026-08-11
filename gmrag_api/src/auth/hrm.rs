@@ -414,6 +414,15 @@ mod tests {
     }
 
     #[test]
+    fn manager_maps_to_member_and_never_admin() {
+        let relation = HrmConfig::role_relation(Some(HRM_MANAGER_ROLE)).unwrap();
+
+        // Phase 9 contract: MANAGER can read/chat as a member but cannot manage the corpus.
+        assert_eq!(relation, Relation::Member);
+        assert_ne!(relation, Relation::Admin);
+    }
+
+    #[test]
     fn scope_rejects_foreign_tenant_or_workspace() {
         let config = HrmConfig {
             tenant_id: Uuid::parse_str("a47ab6d6-bf77-4c8c-a22d-a4f1997eb18d").unwrap(),
@@ -552,12 +561,13 @@ mod tests {
         let manager_plan = plan_tuple_sync(
             "user:manager-1",
             &object,
-            Relation::Admin,
             Relation::Member,
+            Relation::Admin,
             false,
             false,
         );
-        assert_eq!(manager_plan.writes[0].relation, "admin");
+        // Phase 9 contract: initial MANAGER provisioning writes member, never admin.
+        assert_eq!(manager_plan.writes[0].relation, "member");
 
         let repeated_plan = plan_tuple_sync(
             "user:employee-1",
@@ -580,5 +590,67 @@ mod tests {
         );
         assert_eq!(role_change_plan.writes[0].relation, "admin");
         assert_eq!(role_change_plan.deletes[0].relation, "member");
+    }
+
+    #[test]
+    fn manager_to_hr_promotes_the_single_tuple() {
+        let object = Object::Workspace(
+            Uuid::parse_str("fa76881f-6367-4b80-a89e-a3e01206a806").unwrap(),
+        );
+        let desired_relation = HrmConfig::role_relation(Some(HRM_HR_ROLE)).unwrap();
+        let plan = plan_tuple_sync(
+            "user:role-change-1",
+            &object,
+            desired_relation,
+            Relation::Member,
+            false,
+            true,
+        );
+
+        assert_eq!(plan.writes.len(), 1);
+        assert_eq!(plan.writes[0].relation, "admin");
+        assert_eq!(plan.deletes.len(), 1);
+        assert_eq!(plan.deletes[0].relation, "member");
+
+        let settled = plan_tuple_sync(
+            "user:role-change-1",
+            &object,
+            desired_relation,
+            Relation::Member,
+            true,
+            false,
+        );
+        assert_eq!(settled, TupleSyncPlan::default());
+    }
+
+    #[test]
+    fn hr_to_manager_demotes_the_single_tuple() {
+        let object = Object::Workspace(
+            Uuid::parse_str("fa76881f-6367-4b80-a89e-a3e01206a806").unwrap(),
+        );
+        let desired_relation = HrmConfig::role_relation(Some(HRM_MANAGER_ROLE)).unwrap();
+        let plan = plan_tuple_sync(
+            "user:role-change-2",
+            &object,
+            desired_relation,
+            Relation::Admin,
+            false,
+            true,
+        );
+
+        assert_eq!(plan.writes.len(), 1);
+        assert_eq!(plan.writes[0].relation, "member");
+        assert_eq!(plan.deletes.len(), 1);
+        assert_eq!(plan.deletes[0].relation, "admin");
+
+        let settled = plan_tuple_sync(
+            "user:role-change-2",
+            &object,
+            desired_relation,
+            Relation::Admin,
+            true,
+            false,
+        );
+        assert_eq!(settled, TupleSyncPlan::default());
     }
 }
