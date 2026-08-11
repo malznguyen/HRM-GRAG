@@ -60,8 +60,8 @@ impl HrmConfig {
 
     pub fn role_relation(role: Option<&str>) -> Result<Relation, HrmProvisionError> {
         match role {
-            Some(HRM_EMPLOYEE_ROLE) => Ok(Relation::Member),
-            Some(HRM_ADMIN_ROLE | HRM_HR_ROLE | HRM_MANAGER_ROLE) => Ok(Relation::Admin),
+            Some(HRM_MANAGER_ROLE | HRM_EMPLOYEE_ROLE) => Ok(Relation::Member),
+            Some(HRM_ADMIN_ROLE | HRM_HR_ROLE) => Ok(Relation::Admin),
             _ => Err(HrmProvisionError::InvalidRole),
         }
     }
@@ -393,7 +393,8 @@ mod tests {
         for (role, relation) in [
             (HRM_ADMIN_ROLE, Relation::Admin),
             (HRM_HR_ROLE, Relation::Admin),
-            (HRM_MANAGER_ROLE, Relation::Admin),
+            // Phase 9 contract: managers consume the corpus as members; only ADMIN/HR manage it.
+            (HRM_MANAGER_ROLE, Relation::Member),
             (HRM_EMPLOYEE_ROLE, Relation::Member),
         ] {
             assert_eq!(HrmConfig::role_relation(Some(role)).unwrap(), relation);
