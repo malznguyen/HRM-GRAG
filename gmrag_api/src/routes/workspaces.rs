@@ -42,6 +42,7 @@ pub struct CreateTenantRequest {
 pub struct TenantResponse {
     pub id: Uuid,
     pub name: String,
+    #[serde(serialize_with = "crate::utc_timestamp::serialize")]
     pub created_at: NaiveDateTime,
 }
 
@@ -59,6 +60,7 @@ pub struct CreateWorkspaceRequest {
 pub struct WorkspaceResponse {
     pub id: Uuid,
     pub name: String,
+    #[serde(serialize_with = "crate::utc_timestamp::serialize")]
     pub created_at: NaiveDateTime,
 }
 

@@ -578,6 +578,7 @@ pub async fn ensure_chat_session(
 pub struct ChatSessionSummary {
     pub id: Uuid,
     pub title: String,
+    #[serde(serialize_with = "crate::utc_timestamp::serialize")]
     pub created_at: NaiveDateTime,
 }
 

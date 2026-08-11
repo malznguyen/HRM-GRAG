@@ -15,6 +15,7 @@ pub struct TenantOwner {
 pub struct TenantDirectoryItem {
     pub id: Uuid,
     pub name: String,
+    #[serde(serialize_with = "crate::utc_timestamp::serialize")]
     pub created_at: NaiveDateTime,
     pub owners: Vec<TenantOwner>,
 }
@@ -32,6 +33,7 @@ pub struct TenantDirectoryPage {
 pub struct OwnedTenant {
     pub id: Uuid,
     pub name: String,
+    #[serde(serialize_with = "crate::utc_timestamp::serialize")]
     pub created_at: NaiveDateTime,
 }
 

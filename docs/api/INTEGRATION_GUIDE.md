@@ -526,13 +526,13 @@ Yêu cầu role member trở lên — `MANAGER` và `EMPLOYEE` đều gọi đư
   "failure_code": null,
   "failure_message": null,
   "access_mode": "workspace_default",
-  "created_at": "2026-08-06T03:22:57.106555",
-  "updated_at": "2026-08-06T03:23:18.856347",
+  "created_at": "2026-08-06T03:22:57.106555Z",
+  "updated_at": "2026-08-06T03:23:18.856347Z",
   "chunk_count": 1
 }
 ```
 
-*(nguyên văn từ `docs/PHASE3_RESULT.md`)*
+*(payload Phase 3, với timestamp được trình bày theo wire format Phase 11 hiện tại)*
 
 | Field | Kiểu | Ghi chú |
 |---|---|---|
@@ -547,19 +547,20 @@ Yêu cầu role member trở lên — `MANAGER` và `EMPLOYEE` đều gọi đư
 | `updated_at` | timestamp | Xem cảnh báo dưới |
 | `chunk_count` | integer | Số đoạn đã tạo. `0` khi đang xử lý và khi thất bại |
 
-> **Cảnh báo định dạng thời gian.** `created_at` / `updated_at` **không có `Z`,
-> không có offset múi giờ**: `2026-08-06T03:22:57.106555`. Chúng là giờ UTC theo
-> quy ước, nhưng parser RFC 3339 nghiêm ngặt sẽ **ném exception**.
+> **Định dạng thời gian hiện tại.** Mọi timestamp trong HTTP response là UTC và
+> serialize theo RFC 3339 với hậu tố `Z`, ví dụ
+> `2026-08-06T03:22:57.106555Z`. PostgreSQL vẫn lưu `TIMESTAMP WITHOUT TIME ZONE`
+> và Rust vẫn đọc thành `NaiveDateTime`; response layer gắn UTC khi serialize,
+> nên không cần migration và client không phải tự đoán timezone.
 >
 > ```java
-> // ĐÚNG
-> LocalDateTime.parse(value).atOffset(ZoneOffset.UTC);
-> // SAI — DateTimeParseException
-> OffsetDateTime.parse(value);
+> Instant instant = Instant.parse(value);
+> OffsetDateTime utc = OffsetDateTime.parse(value); // offset = Z
+> ZonedDateTime local = instant.atZone(ZoneId.of("Asia/Ho_Chi_Minh"));
 > ```
 >
-> Với Jackson, đừng map thẳng vào `Instant` hay `OffsetDateTime`; dùng
-> `LocalDateTime` rồi tự gắn UTC.
+> Với Spring/Jackson có `JavaTimeModule`, map thẳng field sang `Instant` hoặc
+> `OffsetDateTime`; **không** map sang `LocalDateTime`, vì kiểu đó lại làm mất zone.
 
 > `updated_at` **không phải** thời điểm sửa tài liệu. Nó là thời điểm cập nhật
 > gần nhất của *job ingest*, và fallback về `created_at` nếu chưa có job nào.
@@ -668,13 +669,13 @@ curl -s \
 Đang xử lý:
 
 ```json
-{"document_id":"69f56ad1-f379-4705-9eb4-f58cbd269420","filename":"noi-quy-cong-ty.pdf","status":"PROCESSING","processing_stage":"PARSING","failure_code":null,"failure_message":null,"access_mode":"workspace_default","created_at":"2026-08-06T03:22:57.106555","updated_at":"2026-08-06T03:23:01.004112","chunk_count":0}
+{"document_id":"69f56ad1-f379-4705-9eb4-f58cbd269420","filename":"noi-quy-cong-ty.pdf","status":"PROCESSING","processing_stage":"PARSING","failure_code":null,"failure_message":null,"access_mode":"workspace_default","created_at":"2026-08-06T03:22:57.106555Z","updated_at":"2026-08-06T03:23:01.004112Z","chunk_count":0}
 ```
 
 Thất bại vì PDF scan:
 
 ```json
-{"document_id":"69f56ad1-f379-4705-9eb4-f58cbd269420","filename":"hop-dong-scan.pdf","status":"FAILED","processing_stage":"FAILED","failure_code":"NEEDS_OCR","failure_message":"Document requires OCR and no OCR provider is available","access_mode":"workspace_default","created_at":"2026-08-06T03:22:57.106555","updated_at":"2026-08-06T03:23:05.221904","chunk_count":0}
+{"document_id":"69f56ad1-f379-4705-9eb4-f58cbd269420","filename":"hop-dong-scan.pdf","status":"FAILED","processing_stage":"FAILED","failure_code":"NEEDS_OCR","failure_message":"Document requires OCR and no OCR provider is available","access_mode":"workspace_default","created_at":"2026-08-06T03:22:57.106555Z","updated_at":"2026-08-06T03:23:05.221904Z","chunk_count":0}
 ```
 
 Không tìm thấy (nguyên văn từ `PHASE3_RESULT.md`):
@@ -1229,7 +1230,7 @@ Không có phân trang. Response là mảng sắp xếp `created_at` mới nhấ
   {
     "id": "df093a48-ed78-4109-ac96-a75be34ab35c",
     "title": "Giờ làm việc của công ty là mấy giờ?",
-    "created_at": "2026-08-10T07:15:42.120314"
+    "created_at": "2026-08-10T07:15:42.120314Z"
   }
 ]
 ```
@@ -1263,14 +1264,14 @@ Không có phân trang. Messages sắp xếp cũ nhất trước:
     "role": "user",
     "content": "Giờ làm việc của công ty là mấy giờ?",
     "citations": [],
-    "created_at": "2026-08-10T07:15:42.125901"
+    "created_at": "2026-08-10T07:15:42.125901Z"
   },
   {
     "id": "57b3e448-11c7-48ab-8e36-0f6957235522",
     "role": "assistant",
     "content": "Giờ làm việc là 08:00–17:00.[chunk:3f601309-1f9e-4f88-9f16-1077bb849460]",
     "citations": ["3f601309-1f9e-4f88-9f16-1077bb849460"],
-    "created_at": "2026-08-10T07:15:43.601842"
+    "created_at": "2026-08-10T07:15:43.601842Z"
   }
 ]
 ```
@@ -1446,8 +1447,9 @@ Hai điều cần biết:
 2. **Không có endpoint tải lại file gốc trong phạm vi này.** HRM phải tự giữ bản
    gốc.
 
-3. **Timestamp không có timezone.** Xem cảnh báo ở mục 4.1. Đây là lỗi runtime
-   rất dễ dính.
+3. **Timestamp là UTC RFC 3339 có `Z`.** Ví dụ
+   `2026-08-06T03:22:57.106555Z`; Java parse thẳng bằng `Instant` hoặc
+   `OffsetDateTime`. Xem mục 4.1.
 
 4. **API đã mở cho LAN.** Deployment bàn giao bind `0.0.0.0:18083` và firewall
    đã mở inbound TCP port `18083`; máy khác trong LAN gọi qua
@@ -1526,7 +1528,8 @@ Tick dần khi làm.
 - [ ] Poll ngay sau upload → thấy `PROCESSING`
 - [ ] Poll tới khi thấy `COMPLETED` / `DONE`
 - [ ] Kiểm tra `chunk_count > 0`
-- [ ] Parse `created_at` / `updated_at` **không ném exception** (dùng `LocalDateTime`)
+- [ ] Parse `created_at` / `updated_at` bằng `Instant`/`OffsetDateTime`, xác nhận
+      hậu tố `Z` và đổi sang timezone hiển thị chỉ ở UI
 - [ ] Có timeout dừng poll (khuyến nghị 15 phút) và cảnh báo
 - [ ] Xử lý được `404` khi poll một `document_id` không tồn tại
 

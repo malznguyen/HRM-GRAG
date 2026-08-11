@@ -21,6 +21,7 @@ pub mod storage;
 pub mod telemetry;
 pub mod tenant_cleanup;
 pub mod tenant_directory;
+pub(crate) mod utc_timestamp;
 pub mod workspace_admin_recovery;
 
 #[cfg(test)]

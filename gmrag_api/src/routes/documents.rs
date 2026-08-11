@@ -67,7 +67,9 @@ pub struct DocumentStatusResponse {
     pub failure_code: Option<String>,
     pub failure_message: Option<String>,
     pub access_mode: String,
+    #[serde(serialize_with = "crate::utc_timestamp::serialize")]
     pub created_at: NaiveDateTime,
+    #[serde(serialize_with = "crate::utc_timestamp::serialize")]
     pub updated_at: NaiveDateTime,
     pub chunk_count: i64,
 }
@@ -196,6 +198,7 @@ pub struct PreviewDocumentMeta {
     pub id: Uuid,
     pub filename: String,
     pub content_type: Option<String>,
+    #[serde(serialize_with = "crate::utc_timestamp::serialize")]
     pub created_at: NaiveDateTime,
     pub size_bytes: Option<i64>,
     pub access_mode: String,
@@ -1850,8 +1853,8 @@ mod tests {
                 "failure_code": null,
                 "failure_message": null,
                 "access_mode": "workspace_default",
-                "created_at": "2026-08-07T08:00:00",
-                "updated_at": "2026-08-07T08:05:00",
+                "created_at": "2026-08-07T08:00:00Z",
+                "updated_at": "2026-08-07T08:05:00Z",
                 "chunk_count": 3
             })
         );

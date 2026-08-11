@@ -26,6 +26,7 @@ pub struct WorkspaceMemberResponse {
     pub id: String,
     pub email: String,
     pub role: String,
+    #[serde(serialize_with = "crate::utc_timestamp::serialize")]
     pub joined_at: NaiveDateTime,
 }
 

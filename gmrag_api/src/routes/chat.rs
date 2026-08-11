@@ -51,6 +51,7 @@ pub struct ChatHistoryMessageResponse {
     pub role: String,
     pub content: String,
     pub citations: Vec<Uuid>,
+    #[serde(serialize_with = "crate::utc_timestamp::serialize")]
     pub created_at: NaiveDateTime,
 }
 

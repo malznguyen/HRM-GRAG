@@ -11,7 +11,9 @@ pub struct DocumentDirectoryItem {
     pub processing_stage: String,
     pub failure_code: Option<String>,
     pub failure_message: Option<String>,
+    #[serde(serialize_with = "crate::utc_timestamp::serialize")]
     pub created_at: NaiveDateTime,
+    #[serde(serialize_with = "crate::utc_timestamp::serialize")]
     pub updated_at: NaiveDateTime,
     pub chunk_count: i64,
     pub size_bytes: Option<i64>,
@@ -33,6 +35,7 @@ pub struct DocumentDirectoryPage {
 pub struct DocumentShareItem {
     pub user_id: String,
     pub email: String,
+    #[serde(serialize_with = "crate::utc_timestamp::serialize_optional")]
     pub shared_at: Option<NaiveDateTime>,
 }
 

@@ -280,8 +280,8 @@ paths:
                     failure_code: null
                     failure_message: null
                     access_mode: workspace_default
-                    created_at: "2026-08-06T03:22:57.106555"
-                    updated_at: "2026-08-06T03:23:18.856347"
+                    created_at: "2026-08-06T03:22:57.106555Z"
+                    updated_at: "2026-08-06T03:23:18.856347Z"
                     chunk_count: 1
                 processing:
                   summary: Immediately after upload (constructed from the INSERT in routes/documents.rs)
@@ -293,8 +293,8 @@ paths:
                     failure_code: null
                     failure_message: null
                     access_mode: workspace_default
-                    created_at: "2026-08-06T03:22:57.106555"
-                    updated_at: "2026-08-06T03:22:57.106555"
+                    created_at: "2026-08-06T03:22:57.106555Z"
+                    updated_at: "2026-08-06T03:22:57.106555Z"
                     chunk_count: 0
                 needsOcr:
                   summary: Scanned PDF, terminal failure (code/message from ingestion/processor.rs)
@@ -306,8 +306,8 @@ paths:
                     failure_code: NEEDS_OCR
                     failure_message: Document requires OCR and no OCR provider is available
                     access_mode: workspace_default
-                    created_at: "2026-08-06T03:22:57.106555"
-                    updated_at: "2026-08-06T03:23:05.221904"
+                    created_at: "2026-08-06T03:22:57.106555Z"
+                    updated_at: "2026-08-06T03:23:05.221904Z"
                     chunk_count: 0
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403":
@@ -768,12 +768,12 @@ paths:
                       role: user
                       content: Giờ làm việc của công ty là mấy giờ?
                       citations: []
-                      created_at: "2026-08-10T07:15:42.125901"
+                      created_at: "2026-08-10T07:15:42.125901Z"
                     - id: 57b3e448-11c7-48ab-8e36-0f6957235522
                       role: assistant
                       content: "Giờ làm việc là 08:00–17:00.[chunk:3f601309-1f9e-4f88-9f16-1077bb849460]"
                       citations: [3f601309-1f9e-4f88-9f16-1077bb849460]
-                      created_at: "2026-08-10T07:15:43.601842"
+                      created_at: "2026-08-10T07:15:43.601842Z"
                 missing:
                   value: []
         "400":
@@ -822,7 +822,7 @@ paths:
                   value:
                     - id: df093a48-ed78-4109-ac96-a75be34ab35c
                       title: Giờ làm việc của công ty là mấy giờ?
-                      created_at: "2026-08-10T07:15:42.120314"
+                      created_at: "2026-08-10T07:15:42.120314Z"
                 none:
                   value: []
         "400":
@@ -869,12 +869,12 @@ paths:
                       role: user
                       content: Giờ làm việc của công ty là mấy giờ?
                       citations: []
-                      created_at: "2026-08-10T07:15:42.125901"
+                      created_at: "2026-08-10T07:15:42.125901Z"
                     - id: 57b3e448-11c7-48ab-8e36-0f6957235522
                       role: assistant
                       content: "Giờ làm việc là 08:00–17:00.[chunk:3f601309-1f9e-4f88-9f16-1077bb849460]"
                       citations: [3f601309-1f9e-4f88-9f16-1077bb849460]
-                      created_at: "2026-08-10T07:15:43.601842"
+                      created_at: "2026-08-10T07:15:43.601842Z"
                 missing:
                   value: []
         "400":
@@ -1349,17 +1349,18 @@ components:
         `workspace_default` — visible to every workspace member.
         `restricted` — visible only to explicitly granted viewers.
 
-    NaiveDateTime:
+    UtcDateTime:
       type: string
+      format: date-time
       description: |
-        Timestamp with **no timezone designator and no `Z` suffix** — the wire
-        format is `YYYY-MM-DDTHH:MM:SS.ffffff`, serialized from a PostgreSQL
-        `TIMESTAMP WITHOUT TIME ZONE`. It is UTC by convention. A strict
-        RFC 3339 / `OffsetDateTime` parser will reject it; parse it as a local
-        date-time (Java: `LocalDateTime.parse`) and attach UTC yourself.
-      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?$'
+        UTC RFC 3339 timestamp with an explicit `Z` suffix. PostgreSQL stores the
+        source value as `TIMESTAMP WITHOUT TIME ZONE` and Rust reads it as
+        `NaiveDateTime`; the HTTP response serializer attaches UTC without a
+        schema migration. Java clients should parse it as `Instant` or
+        `OffsetDateTime`, not `LocalDateTime`.
+      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$'
       examples:
-        - "2026-08-06T03:22:57.106555"
+        - "2026-08-06T03:22:57.106555Z"
 
     DocumentStatusResponse:
       type: object
@@ -1400,10 +1401,10 @@ components:
         access_mode:
           $ref: "#/components/schemas/DocumentAccessMode"
         created_at:
-          allOf: [{ $ref: "#/components/schemas/NaiveDateTime" }]
+          allOf: [{ $ref: "#/components/schemas/UtcDateTime" }]
           description: When the document row was inserted, i.e. upload time.
         updated_at:
-          allOf: [{ $ref: "#/components/schemas/NaiveDateTime" }]
+          allOf: [{ $ref: "#/components/schemas/UtcDateTime" }]
           description: |
             `MAX(ingestion_jobs.updated_at)` for this document, falling back to
             `created_at` when no job row exists. The `documents` table has no
@@ -1485,8 +1486,8 @@ components:
             - type: "null"
         failure_message:
           type: [string, "null"]
-        created_at: { $ref: "#/components/schemas/NaiveDateTime" }
-        updated_at: { $ref: "#/components/schemas/NaiveDateTime" }
+        created_at: { $ref: "#/components/schemas/UtcDateTime" }
+        updated_at: { $ref: "#/components/schemas/UtcDateTime" }
         chunk_count:
           type: integer
           format: int64
@@ -1547,7 +1548,7 @@ components:
             Derived from the first user message. At most 40 Unicode characters;
             `...` is appended when the source message is longer.
         created_at:
-          $ref: "#/components/schemas/NaiveDateTime"
+          $ref: "#/components/schemas/UtcDateTime"
 
     ChatHistoryMessage:
       type: object
@@ -1575,7 +1576,7 @@ components:
             type: string
             format: uuid
         created_at:
-          $ref: "#/components/schemas/NaiveDateTime"
+          $ref: "#/components/schemas/UtcDateTime"
 
     CitationsEvent:
       type: object
