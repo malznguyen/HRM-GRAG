@@ -11,8 +11,8 @@ Swagger UI và spec đều do chính API phục vụ, không tải CDN hay asset
 - UI: `http://<IP-máy-chạy-RAG>:18083/docs`
 - OpenAPI YAML: `http://<IP-máy-chạy-RAG>:18083/openapi.yaml`
 
-Swagger UI phù hợp để thử auth, upload, list, status và delete. Riêng chat SSE, UI có thể
-gửi request nhưng không hiển thị đúng luồng/event theo thời gian thực; dùng ví dụ trong
+Swagger UI phù hợp để thử auth, upload, list, status, chat history và delete. Riêng chat
+SSE, UI có thể gửi request nhưng không hiển thị đúng luồng/event theo thời gian thực; dùng ví dụ trong
 [`INTEGRATION_GUIDE.md`](./INTEGRATION_GUIDE.md#6-chat--phần-quan-trọng-nhất) để test chat.
 
 ## Địa chỉ API
@@ -32,7 +32,7 @@ khi có server chính thức, team RAG sẽ cung cấp base URL cố định.
 3. [`openapi.yaml`](./openapi.yaml) — spec nguồn để import vào công cụ khác khi cần.
 4. [`examples/`](./examples/) — có file `.http` và `smoke.sh` để chạy thử ngay.
 
-## Ba điều cần biết trước khi bắt đầu
+## Bốn điều cần biết trước khi bắt đầu
 
 1. Corpus đang **rỗng có chủ đích**. Phải upload tài liệu công ty đã được phê
    duyệt trước khi cho nhân viên sử dụng. Khi chưa có tài liệu, bot trả lời rằng
@@ -42,6 +42,9 @@ khi có server chính thức, team RAG sẽ cung cấp base URL cố định.
    `403 CHATBOT_UPLOAD_PERMISSION_REQUIRED` khi upload.
 3. `MANAGER` và `EMPLOYEE` không được xóa. DELETE trả `404 RESOURCE_NOT_FOUND`
    thay vì `403` là có chủ đích để không tiết lộ tài liệu có tồn tại hay không.
+4. Lịch sử chat đã có API list/read/delete. Mỗi token chỉ thấy và xóa session gắn
+   với chính `userid` của token; kể cả `ADMIN`/`HR` cũng không đọc/xóa thay user khác.
+   Xóa session xóa luôn messages nhờ `ON DELETE CASCADE`.
 
 | Role | Đọc/Chat | Upload | Xóa |
 |---|---|---|---|

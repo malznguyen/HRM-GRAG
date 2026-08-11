@@ -116,6 +116,30 @@ Accept: text/event-stream
 }
 
 
+### 6a. Liet ke session cua CHINH user trong token — khong co phan trang
+GET {{baseUrl}}/workspaces/{{workspaceId}}/chat/sessions
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### 6b. Doc messages qua route history tuong thich
+GET {{baseUrl}}/workspaces/{{workspaceId}}/chat/history?session_id={{sessionId}}
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### 6c. Doc messages qua route path — route nen dung cho code moi
+GET {{baseUrl}}/workspaces/{{workspaceId}}/chat/sessions/{{sessionId}}/messages
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### 6d. Xoa session cua CHINH user — CASCADE xoa toan bo messages
+# 204 No Content. Chay request nay sau khi da xem xong 6a–6c.
+DELETE {{baseUrl}}/workspaces/{{workspaceId}}/chat/sessions/{{sessionId}}
+Authorization: Bearer {{accessToken}}
+
+
 ### 7. Liet ke tai lieu (OPTIONAL — chi de doi soat)
 # Khong bat buoc cho tich hop. Dung khi HRM mat document_id.
 GET {{baseUrl}}/workspaces/{{workspaceId}}/documents?limit=20&offset=0

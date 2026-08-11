@@ -7,7 +7,7 @@ Kèm theo [`../INTEGRATION_GUIDE.md`](../INTEGRATION_GUIDE.md) và
 |---|---|
 | `hrm-rag.http` | Gọi thử từng endpoint trong IDE. Có sẵn cả các case lỗi |
 | `http-client.env.json` | Biến môi trường cho `hrm-rag.http` |
-| `smoke.sh` | Chạy một mạch end-to-end cả 5 việc, dùng để nghiệm thu |
+| `smoke.sh` | Chạy một mạch end-to-end, gồm cả 4 route chat history, dùng để nghiệm thu |
 
 ---
 
@@ -23,7 +23,9 @@ Cho **IntelliJ IDEA** (Tools → HTTP Client) hoặc **VS Code** + extension
 2. Mở `hrm-rag.http`, chọn environment `local` ở góc trên.
 3. Bấm ▶ bên trái từng request.
 
-Request 1–10 là luồng chính (health → upload → poll → chat → xóa). Request
+Request 1–10 và 6a–6d là luồng chính (health → upload → poll → chat → history → xóa).
+Các route history luôn thao tác trên session của `userid` trong token; 6d xóa session
+và toàn bộ messages của nó. Request
 `E1`–`E10` là các case lỗi — chạy để xác nhận client HRM xử lý đúng từng mã lỗi.
 Các case `E4c`/`E4d` và `E8`/`E8b` chứng minh `MANAGER`/`EMPLOYEE` đều chỉ là
 workspace `member`: upload mặc định bị `403`, DELETE bị `404 RESOURCE_NOT_FOUND`.
@@ -39,7 +41,7 @@ thư mục và bỏ file vào.
 
 ## `smoke.sh`
 
-Chạy tuần tự cả 5 việc và kiểm tra kết quả từng bước. Dùng khi muốn xác nhận
+Chạy tuần tự luồng document/chat và kiểm tra kết quả từng bước. Dùng khi muốn xác nhận
 "hệ thống thông không" trước khi bắt tay viết code Java.
 
 ```bash
@@ -66,14 +68,15 @@ Script làm gì:
 3. Poll trạng thái với chu kỳ tăng dần (2s → 5s → 30s), timeout 15 phút.
    Gặp `FAILED` thì giải thích `failure_code` và nói nên làm gì
 4. Chat SSE, in **nguyên văn stream**, rồi ráp lại đúng cách và in kết quả
-5. Xóa, và xác nhận đã xóa bằng cách poll lại (mong đợi `404`)
+5. Gọi đủ bốn route history: list session, đọc qua query, đọc qua path, xóa session
+6. Xóa document, và xác nhận đã xóa bằng cách poll lại (mong đợi `404`)
 
 Bước 4 chính là phần đáng xem nhất: nó in ra stream thô để bạn **tận mắt thấy**
 marker `[chunk:1]` bị cắt vụn qua nhiều event, rồi in text đã gom lại để thấy
 cách xử lý đúng. Đoạn Python trong script là bản tham chiếu tối giản của
 pseudocode Java ở mục 6.9 — logic giống hệt.
 
-Kết thúc, script tự xóa tài liệu vừa tạo nên không để lại rác.
+Kết thúc, script tự xóa session và tài liệu vừa tạo nên không để lại rác.
 
 ---
 

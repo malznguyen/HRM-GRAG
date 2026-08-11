@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Smoke test end-to-end cho phần API mà HRM tích hợp.
-# Chạy đúng 5 việc: health -> upload -> poll status -> chat (SSE) -> delete.
+# Chạy end-to-end: health -> upload -> poll -> chat -> 4 route history -> cleanup.
 #
 # Cách dùng:
 #   export RAG_BASE_URL="http://127.0.0.1:18083"
@@ -64,7 +64,7 @@ WS="${BASE_URL}/workspaces/${WORKSPACE_ID}"
 AUTH="Authorization: Bearer ${TOKEN}"
 
 # ---------------------------------------------------------------- 1. health
-step "1/5  Health check"
+step "1/9  Health check"
 
 health_body="$(curl -sS --max-time 10 "${BASE_URL}/health")" \
   || die "không gọi được ${BASE_URL}/health — API có đang chạy và có gọi được từ máy này không?"
@@ -75,7 +75,7 @@ echo "$health_body"
 green "OK — API sống, database kết nối được"
 
 # ---------------------------------------------------------------- 2. upload
-step "2/5  Upload tài liệu"
+step "2/9  Upload tài liệu"
 
 CLEANUP_FILE=""
 if [ -z "$UPLOAD_FILE" ]; then
@@ -118,7 +118,7 @@ green "OK — document_id = ${DOCUMENT_ID}"
 blue  "Nhắc lại: HRM PHẢI lưu document_id này vào database của mình (mục 5.2)."
 
 # ---------------------------------------------------------------- 3. poll
-step "3/5  Poll trạng thái (tối đa ${POLL_TIMEOUT_SECS}s)"
+step "3/9  Poll trạng thái (tối đa ${POLL_TIMEOUT_SECS}s)"
 
 started=$(date +%s)
 final_status=""
@@ -178,8 +178,9 @@ while :; do
 done
 
 # ---------------------------------------------------------------- 4. chat
-step "4/5  Chat (SSE)"
+step "4/9  Chat (SSE)"
 
+SESSION_ID=""
 if [ "$final_status" != "COMPLETED" ]; then
   red "Bỏ qua chat: tài liệu chưa COMPLETED nên chat không thấy nội dung này."
 else
@@ -288,8 +289,61 @@ PY
   [ "$chat_rc" -eq 0 ] && green "OK — chat stream hợp lệ" || red "Chat stream có vấn đề"
 fi
 
-# ---------------------------------------------------------------- 5. delete
-step "5/5  Xóa tài liệu"
+# ------------------------------------------------------- 5-8. chat history
+if [ -n "$SESSION_ID" ]; then
+  step "5/9  Đọc history bằng query session_id"
+  history_body="$(mktemp)"
+  history_code="$(curl -sS -o "$history_body" -w '%{http_code}' \
+    "${WS}/chat/history?session_id=${SESSION_ID}" -H "$AUTH")"
+  cat "$history_body"; echo
+  [ "$history_code" = "200" ] || die "chat/history trả HTTP ${history_code} — mong đợi 200"
+  history_count="$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$history_body")"
+  rm -f "$history_body"
+  [ "$history_count" -ge 1 ] || die "chat/history không có message của session vừa chat"
+  green "OK — history có ${history_count} message"
+
+  step "6/9  Liệt kê session của user hiện tại"
+  sessions_body="$(mktemp)"
+  sessions_code="$(curl -sS -o "$sessions_body" -w '%{http_code}' \
+    "${WS}/chat/sessions" -H "$AUTH")"
+  cat "$sessions_body"; echo
+  [ "$sessions_code" = "200" ] || die "chat/sessions trả HTTP ${sessions_code} — mong đợi 200"
+  python3 -c 'import json,sys; sid=sys.argv[1]; data=json.load(sys.stdin); sys.exit(0 if any(row.get("id") == sid for row in data) else 1)' \
+    "$SESSION_ID" < "$sessions_body" \
+    || die "chat/sessions không chứa session vừa chat"
+  rm -f "$sessions_body"
+  green "OK — tìm thấy session hiện tại trong danh sách"
+
+  step "7/9  Đọc messages bằng path session_id"
+  messages_body="$(mktemp)"
+  messages_code="$(curl -sS -o "$messages_body" -w '%{http_code}' \
+    "${WS}/chat/sessions/${SESSION_ID}/messages" -H "$AUTH")"
+  cat "$messages_body"; echo
+  [ "$messages_code" = "200" ] || die "session messages trả HTTP ${messages_code} — mong đợi 200"
+  messages_count="$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$messages_body")"
+  rm -f "$messages_body"
+  [ "$messages_count" -ge 1 ] || die "session messages không có message vừa chat"
+  green "OK — messages path có ${messages_count} message"
+
+  step "8/9  Xóa session và xác nhận CASCADE messages"
+  session_delete_code="$(curl -sS -o /dev/null -w '%{http_code}' \
+    -X DELETE "${WS}/chat/sessions/${SESSION_ID}" -H "$AUTH")"
+  [ "$session_delete_code" = "204" ] \
+    || die "delete chat session trả HTTP ${session_delete_code} — mong đợi 204"
+
+  after_session_body="$(mktemp)"
+  after_session_code="$(curl -sS -o "$after_session_body" -w '%{http_code}' \
+    "${WS}/chat/sessions/${SESSION_ID}/messages" -H "$AUTH")"
+  [ "$after_session_code" = "200" ] \
+    || die "đọc session đã xóa trả HTTP ${after_session_code} — mong đợi 200 []"
+  after_session_count="$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$after_session_body")"
+  rm -f "$after_session_body"
+  [ "$after_session_count" -eq 0 ] || die "session đã xóa nhưng vẫn còn messages"
+  green "OK — 204 và đọc lại trả []; session/messages đã sạch"
+fi
+
+# ---------------------------------------------------------------- 9. delete document
+step "9/9  Xóa tài liệu"
 
 del_code="$(curl -sS -o /dev/null -w '%{http_code}' \
   -X DELETE "${WS}/documents/${DOCUMENT_ID}" -H "$AUTH")"
@@ -306,4 +360,4 @@ green "OK — xác nhận đã xóa (404)"
 rm -f "$CLEANUP_FILE"
 
 step "Xong"
-green "Cả 5 việc đều chạy được."
+green "Luồng document/chat/history đều chạy được và dữ liệu test đã được xóa."

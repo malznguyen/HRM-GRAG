@@ -123,6 +123,10 @@ Toàn bộ endpoint HRM cần:
 | 4 | Chat (SSE) | `POST` | `/workspaces/hrm/chat` |
 | 5 | Health check | `GET` | `/health` |
 | — | *(optional)* Liệt kê tài liệu để đối soát | `GET` | `/workspaces/hrm/documents` |
+| 6 | Liệt kê session chat của user hiện tại | `GET` | `/workspaces/hrm/chat/sessions` |
+| 7 | Đọc messages của một session | `GET` | `/workspaces/hrm/chat/sessions/{session_id}/messages` |
+| 8 | Đọc messages qua route tương thích | `GET` | `/workspaces/hrm/chat/history?session_id={session_id}` |
+| 9 | Xóa session và toàn bộ messages | `DELETE` | `/workspaces/hrm/chat/sessions/{session_id}` |
 
 ### 1.5 Thử nhanh bằng Swagger UI
 
@@ -628,7 +632,7 @@ Cách chia đơn giản cho HRM:
 - **7 code còn lại** = lỗi hệ thống. Upload lại có thể thành công.
 
 > **Không có endpoint retry trong phạm vi tích hợp này.** Service *có* một route
-> retry cho admin nhưng nó nằm ngoài 5 việc HRM cần nên không đưa vào spec. Với
+> retry cho admin nhưng nó nằm ngoài integration surface bàn giao nên không đưa vào spec. Với
 > HRM, cách khôi phục một tài liệu `FAILED` là: xóa (mục 5) rồi upload lại.
 
 ### 4.5 Chu kỳ poll khuyến nghị
@@ -831,7 +835,8 @@ Cách hoạt động:
 - Bắt đầu hội thoại mới → HRM sinh một UUID v4 mới. Server thấy chưa tồn tại thì
   tự tạo session, lấy đoạn đầu câu hỏi làm tiêu đề.
 - Hỏi tiếp trong cùng hội thoại → gửi lại **đúng** `session_id` đó. Server nạp
-  lại toàn bộ lịch sử của session và đưa vào prompt.
+  tối đa **5 message gần nhất** của session vào prompt. Bốn route ở mục 6.13 vẫn
+  trả toàn bộ session/messages vì hiện chưa có phân trang.
 
 **Đó là toàn bộ cơ chế multi-turn.** HRM không cần và không nên tự gửi lại lịch
 sử hội thoại — server đã lưu và tự nạp. Chỉ cần gửi câu hỏi mới nhất.
@@ -1187,6 +1192,113 @@ curl -N -X POST \
 >
 > Code HRM phải xử lý cả hai đường.
 
+### 6.13 Liệt kê, đọc và xóa lịch sử chat
+
+Server lưu session và từng message trong PostgreSQL, gắn với canonical user ID lấy
+từ claim `userid`. Không có TTL hay job xóa tự động theo tuổi; dữ liệu tồn tại cho
+tới khi user xóa session, user/workspace/tenant bị xóa, hoặc vận hành dọn dữ liệu.
+
+#### Phân quyền — điểm phải hiểu đúng
+
+Cả bốn route dưới đây yêu cầu bearer token hợp lệ và relation `member` trên
+workspace, rồi khóa dữ liệu bằng **đúng `userid` của token**:
+
+- User chỉ liệt kê, đọc và xóa session của chính mình.
+- `ADMIN`/`HR` **không có quyền vượt cấp** để đọc hoặc xóa session của user khác;
+  role `admin` vẫn bị kiểm tra owner như mọi role khác.
+- Bốn handler này không kiểm tra permission `CHATBOT_USE`. Một workspace member đã
+  mất permission chat vẫn có thể đọc hoặc xóa dữ liệu cũ của chính mình.
+- Không có query param `user_id`. Muốn hiển thị lịch sử cho nhân viên nào, HRM gọi
+  bằng access token của chính nhân viên đó; không dùng một token service/admin để
+  đọc thay user khác.
+
+Không phát hiện lỗ hổng đọc/xóa chéo user trong code hiện tại: owner được kiểm tra
+trước và câu SQL đọc/xóa cũng ràng buộc đồng thời `workspace_id` + `user_id`.
+
+#### 6.13.1 Liệt kê session của user hiện tại
+
+```http
+GET /workspaces/hrm/chat/sessions
+Authorization: Bearer <ACCESS_TOKEN_CỦA_USER>
+```
+
+Không có phân trang. Response là mảng sắp xếp `created_at` mới nhất trước:
+
+```json
+[
+  {
+    "id": "df093a48-ed78-4109-ac96-a75be34ab35c",
+    "title": "Giờ làm việc của công ty là mấy giờ?",
+    "created_at": "2026-08-10T07:15:42.120314"
+  }
+]
+```
+
+`title` lấy từ câu hỏi đầu tiên, tối đa 40 ký tự Unicode; dài hơn thì server thêm
+`...`. Mảng rỗng nghĩa là user chưa có session trong workspace này. HRM không cần
+tự giữ bảng `user_id → session_ids`; lấy danh sách này khi mở màn hình lịch sử.
+
+#### 6.13.2 Đọc messages trong session
+
+Route nên dùng cho code mới:
+
+```http
+GET /workspaces/hrm/chat/sessions/<SESSION_ID>/messages
+Authorization: Bearer <ACCESS_TOKEN_CỦA_USER>
+```
+
+Route tương thích trả cùng schema và cùng dữ liệu:
+
+```http
+GET /workspaces/hrm/chat/history?session_id=<SESSION_ID>
+Authorization: Bearer <ACCESS_TOKEN_CỦA_USER>
+```
+
+Không có phân trang. Messages sắp xếp cũ nhất trước:
+
+```json
+[
+  {
+    "id": "f3f523dc-a9ea-4e35-8fbf-069127dd76f0",
+    "role": "user",
+    "content": "Giờ làm việc của công ty là mấy giờ?",
+    "citations": [],
+    "created_at": "2026-08-10T07:15:42.125901"
+  },
+  {
+    "id": "57b3e448-11c7-48ab-8e36-0f6957235522",
+    "role": "assistant",
+    "content": "Giờ làm việc là 08:00–17:00.[chunk:3f601309-1f9e-4f88-9f16-1077bb849460]",
+    "citations": ["3f601309-1f9e-4f88-9f16-1077bb849460"],
+    "created_at": "2026-08-10T07:15:43.601842"
+  }
+]
+```
+
+`citations` ở history là mảng **chunk UUID**, khác với object giàu thông tin của
+SSE `event: citations`. Khi đọc lại, server re-check ACL tài liệu: citation user
+không còn được xem sẽ bị loại và marker UUID tương ứng bị xóa khỏi `content`.
+
+Session không tồn tại trả `200 []` để hai route đọc có cùng hành vi. Session tồn
+tại nhưng thuộc user khác trả `403 FORBIDDEN`. `session_id` thiếu hoặc không phải
+UUID trả `400 INVALID_REQUEST`.
+
+#### 6.13.3 Xóa session
+
+```http
+DELETE /workspaces/hrm/chat/sessions/<SESSION_ID>
+Authorization: Bearer <ACCESS_TOKEN_CỦA_USER>
+```
+
+- Owner xóa thành công → `204 No Content`, body rỗng.
+- Không tồn tại → `404 RESOURCE_NOT_FOUND`.
+- Thuộc user khác → `403 FORBIDDEN`.
+- Không có quyền admin-delete: mỗi user chỉ xóa được session của mình.
+
+FK `chat_messages.session_id` khai báo `ON DELETE CASCADE`, nên xóa session sẽ xóa
+toàn bộ messages trong session đó trong cùng thao tác database. Route không xóa
+document, Qdrant point hoặc object MinIO.
+
 ---
 
 ## 7. Lỗi
@@ -1209,7 +1321,7 @@ tại, sai method:
 |---|---|
 | `error.code` | **Chuỗi ổn định, máy đọc. HRM phải branch theo field này** |
 | `error.message` | Tiếng Anh, cho người đọc. **Câu chữ không thuộc contract, có thể đổi** |
-| `error.details` | Chỉ xuất hiện ở một số endpoint ngoài phạm vi này. Bỏ qua |
+| `error.details` | Hiện xuất hiện khi toàn bộ file upload bị loại: đọc `error.details.rejected` theo mục 3.4. Các lỗi khác có thể bỏ qua field không biết |
 
 Ngoại lệ duy nhất: `204 No Content` (xóa thành công) có body rỗng.
 
@@ -1217,7 +1329,7 @@ Ngoại lệ duy nhất: `204 No Content` (xóa thành công) có body rỗng.
 
 ### 7.2 Bảng đầy đủ
 
-Toàn bộ mã lỗi có thể gặp trên 6 endpoint trong tài liệu này:
+Toàn bộ mã lỗi có thể gặp trên 10 endpoint trong tài liệu này:
 
 | HTTP | `code` | Nghĩa | HRM nên làm gì |
 |---|---|---|---|

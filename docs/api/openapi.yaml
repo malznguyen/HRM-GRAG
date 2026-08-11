@@ -2,12 +2,12 @@ openapi: 3.1.0
 
 info:
   title: HRM RAG API — HRM integration surface
-  version: "0.1.0-phase4"
-  summary: The five endpoints the HRM backend needs to upload, track, delete documents and run grounded chat.
+  version: "0.2.0-phase11"
+  summary: The HRM integration contract for documents, grounded chat and user-owned chat history.
   description: |
     This specification documents **only** the endpoints the HRM backend consumes.
     The running service registers more routes (members, tenants, sharing, graph,
-    chat sessions, preview, metrics, ...). They are intentionally excluded — see
+    preview, metrics, ...). They are intentionally excluded — see
     `docs/PHASE4_RESULT.md` for the exclusion list and the reasons.
 
     Everything here was derived from the Rust source in `gmrag_api/src`:
@@ -43,6 +43,8 @@ tags:
     description: Upload, processing status and deletion of source documents.
   - name: Chat
     description: Grounded question answering, streamed as Server-Sent Events.
+  - name: Chat history
+    description: List, read and delete chat sessions owned by the token subject.
 
 security:
   - HrmBearerAuth: []
@@ -723,6 +725,217 @@ paths:
                       code: GENERATION_SERVICE_UNAVAILABLE
                       message: Generation service unavailable
 
+  /workspaces/{workspace_id}/chat/history:
+    get:
+      tags: [Chat history]
+      operationId: getWorkspaceChatHistory
+      summary: Read all messages in one session using the compatibility query route
+      description: |
+        Compatibility form of the session messages endpoint. New clients should
+        prefer `/chat/sessions/{session_id}/messages`; both return the same schema,
+        ordering and authorization behaviour.
+
+        Requires the `member` relation on the workspace, then requires the session
+        owner to equal the canonical user id from the token's `userid` claim.
+        There is no admin override: `ADMIN` and `HR` can read only their own
+        sessions. This handler does not check `CHATBOT_USE`.
+
+        There is no pagination; all messages are returned oldest first. Citation
+        ACL is re-checked at read time. Inaccessible chunk UUIDs and their stored
+        UUID markers are removed from the returned message.
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - name: session_id
+          in: query
+          required: true
+          description: Client-generated session UUID owned by the current token subject.
+          schema: { type: string, format: uuid }
+          example: df093a48-ed78-4109-ac96-a75be34ab35c
+      responses:
+        "200":
+          description: |
+            All messages in ascending creation order. A missing session deliberately
+            returns an empty array, while a session owned by another user returns 403.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ChatHistoryMessage" }
+              examples:
+                conversation:
+                  value:
+                    - id: f3f523dc-a9ea-4e35-8fbf-069127dd76f0
+                      role: user
+                      content: Giờ làm việc của công ty là mấy giờ?
+                      citations: []
+                      created_at: "2026-08-10T07:15:42.125901"
+                    - id: 57b3e448-11c7-48ab-8e36-0f6957235522
+                      role: assistant
+                      content: "Giờ làm việc là 08:00–17:00.[chunk:3f601309-1f9e-4f88-9f16-1077bb849460]"
+                      citations: [3f601309-1f9e-4f88-9f16-1077bb849460]
+                      created_at: "2026-08-10T07:15:43.601842"
+                missing:
+                  value: []
+        "400":
+          description: |
+            `INVALID_REQUEST` — `session_id` is missing/not a UUID, the workspace
+            path cannot be parsed, or the HRM alias resolves outside the pinned scope.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            `FORBIDDEN` — the caller is not a workspace member or the session is
+            owned by another user. `HRM_ROLE_REQUIRED` may also be returned for an
+            unrecognised HRM role. There is no admin bypass.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspace_id}/chat/sessions:
+    get:
+      tags: [Chat history]
+      operationId: listWorkspaceChatSessions
+      summary: List every chat session owned by the current token subject
+      description: |
+        Requires workspace `member`; returns only rows whose `user_id` equals the
+        canonical `userid` from the bearer token. There is no `user_id` parameter
+        and no admin override. To show an employee's history, call with that
+        employee's token. This handler does not check `CHATBOT_USE`.
+
+        There is no pagination. Sessions are ordered newest first. The endpoint
+        lets HRM avoid maintaining a duplicate `user_id → session_ids` table.
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: All sessions owned by the caller, newest first; empty when none exist.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ChatSessionSummary" }
+              examples:
+                oneSession:
+                  value:
+                    - id: df093a48-ed78-4109-ac96-a75be34ab35c
+                      title: Giờ làm việc của công ty là mấy giờ?
+                      created_at: "2026-08-10T07:15:42.120314"
+                none:
+                  value: []
+        "400":
+          description: >-
+            `INVALID_REQUEST` or `HRM_SCOPE_MISMATCH` for an invalid/out-of-scope workspace path.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: >-
+            `FORBIDDEN` when not a workspace member; `HRM_ROLE_REQUIRED` for an unrecognised HRM role.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspace_id}/chat/sessions/{session_id}/messages:
+    get:
+      tags: [Chat history]
+      operationId: getWorkspaceChatSessionMessages
+      summary: Read all messages in a session owned by the current token subject
+      description: |
+        Preferred messages route for new clients. Authorization, response and
+        ordering are identical to `/chat/history?session_id=...`: workspace
+        `member` plus exact session ownership, no admin override, no
+        `CHATBOT_USE` check, no pagination, oldest message first, and citation ACL
+        re-checking at read time.
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "200":
+          description: All messages oldest first; a missing session returns an empty array.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ChatHistoryMessage" }
+              examples:
+                conversation:
+                  value:
+                    - id: f3f523dc-a9ea-4e35-8fbf-069127dd76f0
+                      role: user
+                      content: Giờ làm việc của công ty là mấy giờ?
+                      citations: []
+                      created_at: "2026-08-10T07:15:42.125901"
+                    - id: 57b3e448-11c7-48ab-8e36-0f6957235522
+                      role: assistant
+                      content: "Giờ làm việc là 08:00–17:00.[chunk:3f601309-1f9e-4f88-9f16-1077bb849460]"
+                      citations: [3f601309-1f9e-4f88-9f16-1077bb849460]
+                      created_at: "2026-08-10T07:15:43.601842"
+                missing:
+                  value: []
+        "400":
+          description: >-
+            `INVALID_REQUEST`/`HRM_SCOPE_MISMATCH` for an invalid UUID or workspace scope.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            `FORBIDDEN` when not a workspace member or when the session belongs to
+            another user; `HRM_ROLE_REQUIRED` for an unrecognised HRM role.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspace_id}/chat/sessions/{session_id}:
+    delete:
+      tags: [Chat history]
+      operationId: deleteWorkspaceChatSession
+      summary: Delete a session owned by the current token subject and cascade its messages
+      description: |
+        Requires workspace `member` and exact session ownership. No role has an
+        admin override; `ADMIN`/`HR` cannot delete another user's session. This
+        handler does not check `CHATBOT_USE`.
+
+        `chat_messages.session_id` references `chat_sessions.id` with `ON DELETE
+        CASCADE`, so successful deletion removes every message in the session.
+        Documents, Qdrant points and object-storage objects are unaffected.
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - $ref: "#/components/parameters/SessionId"
+      responses:
+        "204":
+          description: Session and all child messages deleted. Empty body.
+        "400":
+          description: >-
+            `INVALID_REQUEST`/`HRM_SCOPE_MISMATCH` for an invalid UUID or workspace scope.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            `FORBIDDEN` when not a workspace member or when the session belongs to
+            another user; `HRM_ROLE_REQUIRED` for an unrecognised HRM role.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: >-
+            `RESOURCE_NOT_FOUND` — no session with this id exists in this workspace.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                missing: { $ref: "#/components/examples/ResourceNotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
 components:
 
   securitySchemes:
@@ -752,7 +965,9 @@ components:
           * `permissions` — array of strings. Must contain `CHATBOT_USE` to call
             the chat endpoint and `CHATBOT_UPLOAD_DOCUMENT` to call the upload
             endpoint. Both checks are exact and case-sensitive. Non-array or
-            missing is treated as empty.
+            missing is treated as empty. The four chat-history handlers do not
+            check `CHATBOT_USE`; workspace membership plus exact session ownership
+            protects them so users can still read/delete their own stored data.
           * `email` — optional. Used to populate the user row; absent means a
             synthetic `<userid>@hrm.local` placeholder is stored.
           * `exp` — verified, with 60 seconds of clock leeway.
@@ -819,6 +1034,16 @@ components:
         type: string
         format: uuid
       example: 69f56ad1-f379-4705-9eb4-f58cbd269420
+
+    SessionId:
+      name: session_id
+      in: path
+      required: true
+      description: Client-generated chat session UUID. The current token subject must own it.
+      schema:
+        type: string
+        format: uuid
+      example: df093a48-ed78-4109-ac96-a75be34ab35c
 
   examples:
     ResourceNotFound:
@@ -931,7 +1156,9 @@ components:
               type: string
               description: Human-readable, sanitized. Wording is not part of the contract.
             details:
-              description: Omitted unless present. Not populated by any endpoint in this specification.
+              description: |
+                Omitted unless present. When every upload part is rejected,
+                `error.details.rejected` contains the per-file rejection array.
 
     HealthResponse:
       type: object
@@ -1303,7 +1530,52 @@ components:
           minLength: 1
           description: |
             The user's question. Trimmed server-side; empty or whitespace-only
-            gives `400`. No maximum length is enforced by the API.
+             gives `400`. No maximum length is enforced by the API.
+
+    ChatSessionSummary:
+      type: object
+      description: One session owned by the current token subject.
+      required: [id, title, created_at]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+          description: |
+            Derived from the first user message. At most 40 Unicode characters;
+            `...` is appended when the source message is longer.
+        created_at:
+          $ref: "#/components/schemas/NaiveDateTime"
+
+    ChatHistoryMessage:
+      type: object
+      description: |
+        A stored user or assistant message. Citation access is re-checked when
+        reading; UUIDs no longer visible to the caller and their stored UUID
+        markers are removed.
+      required: [id, role, content, citations, created_at]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          format: uuid
+        role:
+          type: string
+          enum: [user, assistant]
+        content:
+          type: string
+        citations:
+          type: array
+          description: |
+            Chunk UUIDs, not the rich citation objects emitted by the live SSE
+            stream. Empty for user messages and whenever no visible citation remains.
+          items:
+            type: string
+            format: uuid
+        created_at:
+          $ref: "#/components/schemas/NaiveDateTime"
 
     CitationsEvent:
       type: object
