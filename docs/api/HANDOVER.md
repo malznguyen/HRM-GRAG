@@ -44,7 +44,9 @@ khi có server chính thức, team RAG sẽ cung cấp base URL cố định.
    thay vì `403` là có chủ đích để không tiết lộ tài liệu có tồn tại hay không.
 4. Lịch sử chat đã có API list/read/delete. Mỗi token chỉ thấy và xóa session gắn
    với chính `userid` của token; kể cả `ADMIN`/`HR` cũng không đọc/xóa thay user khác.
-   Xóa session xóa luôn messages nhờ `ON DELETE CASCADE`.
+   Ba route GET dùng `limit`/`offset` (mặc định `20/0`, `limit` tối đa `100`) và trả
+   page object có `sessions` hoặc `messages`, cùng `total`, `limit`, `offset`. Xóa
+   session xóa luôn messages nhờ `ON DELETE CASCADE`.
 
 | Role | Đọc/Chat | Upload | Xóa |
 |---|---|---|---|
@@ -81,6 +83,8 @@ Kết quả mong đợi:
 - PDF scan chưa OCR được.
 - Chưa có prefix `/v1`.
 - Retrieval tối đa 5 đoạn/câu hỏi, chưa có reranker hoặc score threshold cứng.
+- Lịch sử chat giữ vĩnh viễn tới khi owner tự xóa; không có admin-delete. Nhân viên
+  đã nghỉ không còn token tự xóa nên cần quy trình dọn dẹp riêng ở phase sau.
 - Endpoint tạm dùng HTTP, chưa có TLS.
 
 Chi tiết xem [mục 8 trong `INTEGRATION_GUIDE.md`](./INTEGRATION_GUIDE.md#8-giới-hạn-hiện-tại).

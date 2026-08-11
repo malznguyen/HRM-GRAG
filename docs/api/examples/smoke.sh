@@ -302,10 +302,10 @@ if [ -n "$SESSION_ID" ]; then
   step "5/9  Đọc history bằng query session_id"
   history_body="$(mktemp)"
   history_code="$(curl -sS -o "$history_body" -w '%{http_code}' \
-    "${WS}/chat/history?session_id=${SESSION_ID}" -H "$AUTH")"
+    "${WS}/chat/history?session_id=${SESSION_ID}&limit=20&offset=0" -H "$AUTH")"
   cat "$history_body"; echo
   [ "$history_code" = "200" ] || die "chat/history trả HTTP ${history_code} — mong đợi 200"
-  history_count="$("$PYTHON_BIN" -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$history_body")"
+  history_count="$("$PYTHON_BIN" -c 'import json,sys; data=json.load(sys.stdin); assert data["limit"] == 20 and data["offset"] == 0 and data["total"] >= len(data["messages"]); print(len(data["messages"]))' < "$history_body")"
   rm -f "$history_body"
   [ "$history_count" -ge 1 ] || die "chat/history không có message của session vừa chat"
   green "OK — history có ${history_count} message"
@@ -313,10 +313,10 @@ if [ -n "$SESSION_ID" ]; then
   step "6/9  Liệt kê session của user hiện tại"
   sessions_body="$(mktemp)"
   sessions_code="$(curl -sS -o "$sessions_body" -w '%{http_code}' \
-    "${WS}/chat/sessions" -H "$AUTH")"
+    "${WS}/chat/sessions?limit=20&offset=0" -H "$AUTH")"
   cat "$sessions_body"; echo
   [ "$sessions_code" = "200" ] || die "chat/sessions trả HTTP ${sessions_code} — mong đợi 200"
-  "$PYTHON_BIN" -c 'import json,sys; sid=sys.argv[1]; data=json.load(sys.stdin); sys.exit(0 if any(row.get("id") == sid for row in data) else 1)' \
+  "$PYTHON_BIN" -c 'import json,sys; sid=sys.argv[1]; data=json.load(sys.stdin); ok=data["limit"] == 20 and data["offset"] == 0 and data["total"] >= len(data["sessions"]) and any(row.get("id") == sid for row in data["sessions"]); sys.exit(0 if ok else 1)' \
     "$SESSION_ID" < "$sessions_body" \
     || die "chat/sessions không chứa session vừa chat"
   rm -f "$sessions_body"
@@ -325,10 +325,10 @@ if [ -n "$SESSION_ID" ]; then
   step "7/9  Đọc messages bằng path session_id"
   messages_body="$(mktemp)"
   messages_code="$(curl -sS -o "$messages_body" -w '%{http_code}' \
-    "${WS}/chat/sessions/${SESSION_ID}/messages" -H "$AUTH")"
+    "${WS}/chat/sessions/${SESSION_ID}/messages?limit=20&offset=0" -H "$AUTH")"
   cat "$messages_body"; echo
   [ "$messages_code" = "200" ] || die "session messages trả HTTP ${messages_code} — mong đợi 200"
-  messages_count="$("$PYTHON_BIN" -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$messages_body")"
+  messages_count="$("$PYTHON_BIN" -c 'import json,sys; data=json.load(sys.stdin); assert data["limit"] == 20 and data["offset"] == 0 and data["total"] >= len(data["messages"]); print(len(data["messages"]))' < "$messages_body")"
   rm -f "$messages_body"
   [ "$messages_count" -ge 1 ] || die "session messages không có message vừa chat"
   green "OK — messages path có ${messages_count} message"
@@ -341,13 +341,13 @@ if [ -n "$SESSION_ID" ]; then
 
   after_session_body="$(mktemp)"
   after_session_code="$(curl -sS -o "$after_session_body" -w '%{http_code}' \
-    "${WS}/chat/sessions/${SESSION_ID}/messages" -H "$AUTH")"
+    "${WS}/chat/sessions/${SESSION_ID}/messages?limit=20&offset=0" -H "$AUTH")"
   [ "$after_session_code" = "200" ] \
-    || die "đọc session đã xóa trả HTTP ${after_session_code} — mong đợi 200 []"
-  after_session_count="$("$PYTHON_BIN" -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$after_session_body")"
+    || die "đọc session đã xóa trả HTTP ${after_session_code} — mong đợi 200 page rỗng"
+  after_session_count="$("$PYTHON_BIN" -c 'import json,sys; data=json.load(sys.stdin); assert data["total"] == 0 and data["limit"] == 20 and data["offset"] == 0; print(len(data["messages"]))' < "$after_session_body")"
   rm -f "$after_session_body"
   [ "$after_session_count" -eq 0 ] || die "session đã xóa nhưng vẫn còn messages"
-  green "OK — 204 và đọc lại trả []; session/messages đã sạch"
+  green "OK — 204 và đọc lại trả page rỗng; session/messages đã sạch"
 fi
 
 # ---------------------------------------------------------------- 9. delete document

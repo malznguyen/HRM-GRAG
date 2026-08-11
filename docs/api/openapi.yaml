@@ -729,7 +729,7 @@ paths:
     get:
       tags: [Chat history]
       operationId: getWorkspaceChatHistory
-      summary: Read all messages in one session using the compatibility query route
+      summary: Read one page of messages using the compatibility query route
       description: |
         Compatibility form of the session messages endpoint. New clients should
         prefer `/chat/sessions/{session_id}/messages`; both return the same schema,
@@ -740,9 +740,10 @@ paths:
         There is no admin override: `ADMIN` and `HR` can read only their own
         sessions. This handler does not check `CHATBOT_USE`.
 
-        There is no pagination; all messages are returned oldest first. Citation
-        ACL is re-checked at read time. Inaccessible chunk UUIDs and their stored
-        UUID markers are removed from the returned message.
+        Messages are paginated with `limit`/`offset` and returned oldest first,
+        with UUID as the stable timestamp tiebreaker. Citation ACL is re-checked
+        at read time. Inaccessible chunk UUIDs and their stored UUID markers are
+        removed from the returned message.
       parameters:
         - $ref: "#/components/parameters/WorkspaceId"
         - name: session_id
@@ -751,38 +752,55 @@ paths:
           description: Client-generated session UUID owned by the current token subject.
           schema: { type: string, format: uuid }
           example: df093a48-ed78-4109-ac96-a75be34ab35c
+        - $ref: "#/components/parameters/ChatPageLimit"
+        - $ref: "#/components/parameters/ChatPageOffset"
       responses:
         "200":
           description: |
-            All messages in ascending creation order. A missing session deliberately
-            returns an empty array, while a session owned by another user returns 403.
+            One page in ascending creation order. A missing session deliberately
+            returns an empty page with total 0, while a session owned by another
+            user returns 403.
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/ChatHistoryMessage" }
+              schema: { $ref: "#/components/schemas/ChatHistoryPage" }
               examples:
-                conversation:
+                conversationPage:
                   value:
-                    - id: f3f523dc-a9ea-4e35-8fbf-069127dd76f0
-                      role: user
-                      content: Giờ làm việc của công ty là mấy giờ?
-                      citations: []
-                      created_at: "2026-08-10T07:15:42.125901Z"
-                    - id: 57b3e448-11c7-48ab-8e36-0f6957235522
-                      role: assistant
-                      content: "Giờ làm việc là 08:00–17:00.[chunk:3f601309-1f9e-4f88-9f16-1077bb849460]"
-                      citations: [3f601309-1f9e-4f88-9f16-1077bb849460]
-                      created_at: "2026-08-10T07:15:43.601842Z"
+                    messages:
+                      - id: f3f523dc-a9ea-4e35-8fbf-069127dd76f0
+                        role: user
+                        content: Giờ làm việc của công ty là mấy giờ?
+                        citations: []
+                        created_at: "2026-08-10T07:15:42.125901Z"
+                      - id: 57b3e448-11c7-48ab-8e36-0f6957235522
+                        role: assistant
+                        content: "Giờ làm việc là 08:00–17:00.[chunk:3f601309-1f9e-4f88-9f16-1077bb849460]"
+                        citations: [3f601309-1f9e-4f88-9f16-1077bb849460]
+                        created_at: "2026-08-10T07:15:43.601842Z"
+                    total: 42
+                    limit: 20
+                    offset: 0
                 missing:
-                  value: []
+                  value:
+                    messages: []
+                    total: 0
+                    limit: 20
+                    offset: 0
         "400":
           description: |
             `INVALID_REQUEST` — `session_id` is missing/not a UUID, the workspace
-            path cannot be parsed, or the HRM alias resolves outside the pinned scope.
+            path cannot be parsed, `limit` is outside 0..100, `offset` is negative,
+            a paging value is not an integer, or the HRM alias resolves outside
+            the pinned scope.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                badPaging:
+                  value:
+                    error:
+                      code: INVALID_REQUEST
+                      message: limit must be between 0 and 100 and offset must be non-negative
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403":
           description: |
@@ -798,39 +816,56 @@ paths:
     get:
       tags: [Chat history]
       operationId: listWorkspaceChatSessions
-      summary: List every chat session owned by the current token subject
+      summary: List one page of chat sessions owned by the current token subject
       description: |
         Requires workspace `member`; returns only rows whose `user_id` equals the
         canonical `userid` from the bearer token. There is no `user_id` parameter
         and no admin override. To show an employee's history, call with that
         employee's token. This handler does not check `CHATBOT_USE`.
 
-        There is no pagination. Sessions are ordered newest first. The endpoint
-        lets HRM avoid maintaining a duplicate `user_id → session_ids` table.
+        Sessions are paginated with `limit`/`offset` and ordered newest first,
+        with UUID as the stable timestamp tiebreaker. The endpoint lets HRM avoid
+        maintaining a duplicate `user_id → session_ids` table.
       parameters:
         - $ref: "#/components/parameters/WorkspaceId"
+        - $ref: "#/components/parameters/ChatPageLimit"
+        - $ref: "#/components/parameters/ChatPageOffset"
       responses:
         "200":
-          description: All sessions owned by the caller, newest first; empty when none exist.
+          description: One page owned by the caller, newest first; `sessions` is empty when none exist.
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/ChatSessionSummary" }
+              schema: { $ref: "#/components/schemas/ChatSessionPage" }
               examples:
                 oneSession:
                   value:
-                    - id: df093a48-ed78-4109-ac96-a75be34ab35c
-                      title: Giờ làm việc của công ty là mấy giờ?
-                      created_at: "2026-08-10T07:15:42.120314Z"
+                    sessions:
+                      - id: df093a48-ed78-4109-ac96-a75be34ab35c
+                        title: Giờ làm việc của công ty là mấy giờ?
+                        created_at: "2026-08-10T07:15:42.120314Z"
+                    total: 1
+                    limit: 20
+                    offset: 0
                 none:
-                  value: []
+                  value:
+                    sessions: []
+                    total: 0
+                    limit: 20
+                    offset: 0
         "400":
-          description: >-
-            `INVALID_REQUEST` or `HRM_SCOPE_MISMATCH` for an invalid/out-of-scope workspace path.
+          description: |
+            `INVALID_REQUEST` for an invalid workspace path, `limit` outside
+            0..100, negative `offset`, or a non-integer paging value.
+            `HRM_SCOPE_MISMATCH` for an out-of-scope workspace path.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                badPaging:
+                  value:
+                    error:
+                      code: INVALID_REQUEST
+                      message: limit must be between 0 and 100 and offset must be non-negative
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403":
           description: >-
@@ -844,45 +879,61 @@ paths:
     get:
       tags: [Chat history]
       operationId: getWorkspaceChatSessionMessages
-      summary: Read all messages in a session owned by the current token subject
+      summary: Read one page of messages in a session owned by the current token subject
       description: |
         Preferred messages route for new clients. Authorization, response and
         ordering are identical to `/chat/history?session_id=...`: workspace
         `member` plus exact session ownership, no admin override, no
-        `CHATBOT_USE` check, no pagination, oldest message first, and citation ACL
-        re-checking at read time.
+        `CHATBOT_USE` check, `limit`/`offset` pagination, oldest message first
+        with UUID as tiebreaker, and citation ACL re-checking at read time.
       parameters:
         - $ref: "#/components/parameters/WorkspaceId"
         - $ref: "#/components/parameters/SessionId"
+        - $ref: "#/components/parameters/ChatPageLimit"
+        - $ref: "#/components/parameters/ChatPageOffset"
       responses:
         "200":
-          description: All messages oldest first; a missing session returns an empty array.
+          description: One page oldest first; a missing session returns an empty page with total 0.
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/ChatHistoryMessage" }
+              schema: { $ref: "#/components/schemas/ChatHistoryPage" }
               examples:
-                conversation:
+                conversationPage:
                   value:
-                    - id: f3f523dc-a9ea-4e35-8fbf-069127dd76f0
-                      role: user
-                      content: Giờ làm việc của công ty là mấy giờ?
-                      citations: []
-                      created_at: "2026-08-10T07:15:42.125901Z"
-                    - id: 57b3e448-11c7-48ab-8e36-0f6957235522
-                      role: assistant
-                      content: "Giờ làm việc là 08:00–17:00.[chunk:3f601309-1f9e-4f88-9f16-1077bb849460]"
-                      citations: [3f601309-1f9e-4f88-9f16-1077bb849460]
-                      created_at: "2026-08-10T07:15:43.601842Z"
+                    messages:
+                      - id: f3f523dc-a9ea-4e35-8fbf-069127dd76f0
+                        role: user
+                        content: Giờ làm việc của công ty là mấy giờ?
+                        citations: []
+                        created_at: "2026-08-10T07:15:42.125901Z"
+                      - id: 57b3e448-11c7-48ab-8e36-0f6957235522
+                        role: assistant
+                        content: "Giờ làm việc là 08:00–17:00.[chunk:3f601309-1f9e-4f88-9f16-1077bb849460]"
+                        citations: [3f601309-1f9e-4f88-9f16-1077bb849460]
+                        created_at: "2026-08-10T07:15:43.601842Z"
+                    total: 42
+                    limit: 20
+                    offset: 0
                 missing:
-                  value: []
+                  value:
+                    messages: []
+                    total: 0
+                    limit: 20
+                    offset: 0
         "400":
-          description: >-
-            `INVALID_REQUEST`/`HRM_SCOPE_MISMATCH` for an invalid UUID or workspace scope.
+          description: |
+            `INVALID_REQUEST` for an invalid UUID, `limit` outside 0..100,
+            negative `offset`, or a non-integer paging value.
+            `HRM_SCOPE_MISMATCH` for an invalid workspace scope.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                badPaging:
+                  value:
+                    error:
+                      code: INVALID_REQUEST
+                      message: limit must be between 0 and 100 and offset must be non-negative
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403":
           description: |
@@ -1044,6 +1095,29 @@ components:
         type: string
         format: uuid
       example: df093a48-ed78-4109-ac96-a75be34ab35c
+
+    ChatPageLimit:
+      name: limit
+      in: query
+      required: false
+      description: Page size. Must be between 0 and 100 inclusive; values above 100 are rejected, not capped.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+        maximum: 100
+        default: 20
+
+    ChatPageOffset:
+      name: offset
+      in: query
+      required: false
+      description: Number of rows to skip. Must be non-negative.
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+        default: 0
 
   examples:
     ResourceNotFound:
@@ -1550,6 +1624,30 @@ components:
         created_at:
           $ref: "#/components/schemas/UtcDateTime"
 
+    ChatSessionPage:
+      type: object
+      description: One stable offset page of sessions owned by the current token subject.
+      required: [sessions, total, limit, offset]
+      additionalProperties: false
+      properties:
+        sessions:
+          type: array
+          items: { $ref: "#/components/schemas/ChatSessionSummary" }
+        total:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Total matching sessions, not the number in this page.
+        limit:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 100
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+
     ChatHistoryMessage:
       type: object
       description: |
@@ -1577,6 +1675,30 @@ components:
             format: uuid
         created_at:
           $ref: "#/components/schemas/UtcDateTime"
+
+    ChatHistoryPage:
+      type: object
+      description: One stable offset page of messages owned by the current token subject.
+      required: [messages, total, limit, offset]
+      additionalProperties: false
+      properties:
+        messages:
+          type: array
+          items: { $ref: "#/components/schemas/ChatHistoryMessage" }
+        total:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Total messages in the owned session, not the number in this page.
+        limit:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 100
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
 
     CitationsEvent:
       type: object

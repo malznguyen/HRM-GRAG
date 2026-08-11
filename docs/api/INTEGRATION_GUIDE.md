@@ -836,8 +836,9 @@ Cách hoạt động:
 - Bắt đầu hội thoại mới → HRM sinh một UUID v4 mới. Server thấy chưa tồn tại thì
   tự tạo session, lấy đoạn đầu câu hỏi làm tiêu đề.
 - Hỏi tiếp trong cùng hội thoại → gửi lại **đúng** `session_id` đó. Server nạp
-  tối đa **5 message gần nhất** của session vào prompt. Bốn route ở mục 6.13 vẫn
-  trả toàn bộ session/messages vì hiện chưa có phân trang.
+  tối đa **5 message gần nhất** của session vào prompt. Ba route GET ở mục 6.13
+  trả lịch sử theo trang bằng `limit`/`offset`; việc phân trang này không đổi 5
+  message dùng làm context cho lượt chat mới.
 
 **Đó là toàn bộ cơ chế multi-turn.** HRM không cần và không nên tự gửi lại lịch
 sử hội thoại — server đã lưu và tự nạp. Chỉ cần gửi câu hỏi mới nhất.
@@ -1196,8 +1197,8 @@ curl -N -X POST \
 ### 6.13 Liệt kê, đọc và xóa lịch sử chat
 
 Server lưu session và từng message trong PostgreSQL, gắn với canonical user ID lấy
-từ claim `userid`. Không có TTL hay job xóa tự động theo tuổi; dữ liệu tồn tại cho
-tới khi user xóa session, user/workspace/tenant bị xóa, hoặc vận hành dọn dữ liệu.
+từ claim `userid`. Không có TTL hay job xóa tự động theo tuổi; lịch sử được giữ
+vĩnh viễn cho tới khi owner tự xóa session. Xem thêm ghi chú lưu trữ ở mục 8.8.
 
 #### Phân quyền — điểm phải hiểu đúng
 
@@ -1218,71 +1219,99 @@ trước và câu SQL đọc/xóa cũng ràng buộc đồng thời `workspace_i
 
 #### 6.13.1 Liệt kê session của user hiện tại
 
+Trang đầu:
+
 ```http
-GET /workspaces/hrm/chat/sessions
+GET /workspaces/hrm/chat/sessions?limit=20&offset=0
 Authorization: Bearer <ACCESS_TOKEN_CỦA_USER>
 ```
 
-Không có phân trang. Response là mảng sắp xếp `created_at` mới nhất trước:
+Trang kế tiếp:
+
+```http
+GET /workspaces/hrm/chat/sessions?limit=20&offset=20
+Authorization: Bearer <ACCESS_TOKEN_CỦA_USER>
+```
+
+Response là object page. `total` là tổng session thật của owner trong workspace,
+không phải số phần tử của trang hiện tại. Session sắp xếp mới nhất trước; UUID là
+tiebreaker ổn định khi nhiều row có cùng `created_at`:
 
 ```json
-[
-  {
-    "id": "df093a48-ed78-4109-ac96-a75be34ab35c",
-    "title": "Giờ làm việc của công ty là mấy giờ?",
-    "created_at": "2026-08-10T07:15:42.120314Z"
-  }
-]
+{
+  "sessions": [
+    {
+      "id": "df093a48-ed78-4109-ac96-a75be34ab35c",
+      "title": "Giờ làm việc của công ty là mấy giờ?",
+      "created_at": "2026-08-10T07:15:42.120314Z"
+    }
+  ],
+  "total": 41,
+  "limit": 20,
+  "offset": 0
+}
 ```
 
 `title` lấy từ câu hỏi đầu tiên, tối đa 40 ký tự Unicode; dài hơn thì server thêm
-`...`. Mảng rỗng nghĩa là user chưa có session trong workspace này. HRM không cần
-tự giữ bảng `user_id → session_ids`; lấy danh sách này khi mở màn hình lịch sử.
+`...`. `sessions: []` nghĩa là trang không có row (chưa có session hoặc offset đã
+vượt total). HRM không cần tự giữ bảng `user_id → session_ids`; lấy danh sách này
+khi mở màn hình lịch sử.
 
 #### 6.13.2 Đọc messages trong session
 
 Route nên dùng cho code mới:
 
 ```http
-GET /workspaces/hrm/chat/sessions/<SESSION_ID>/messages
+GET /workspaces/hrm/chat/sessions/<SESSION_ID>/messages?limit=20&offset=0
 Authorization: Bearer <ACCESS_TOKEN_CỦA_USER>
 ```
 
 Route tương thích trả cùng schema và cùng dữ liệu:
 
 ```http
-GET /workspaces/hrm/chat/history?session_id=<SESSION_ID>
+GET /workspaces/hrm/chat/history?session_id=<SESSION_ID>&limit=20&offset=0
 Authorization: Bearer <ACCESS_TOKEN_CỦA_USER>
 ```
 
-Không có phân trang. Messages sắp xếp cũ nhất trước:
+Trang message kế tiếp dùng `offset=20` trên cùng route. Messages sắp xếp cũ nhất
+trước; UUID là tiebreaker ổn định. Response của hai route có cùng page shape:
 
 ```json
-[
-  {
-    "id": "f3f523dc-a9ea-4e35-8fbf-069127dd76f0",
-    "role": "user",
-    "content": "Giờ làm việc của công ty là mấy giờ?",
-    "citations": [],
-    "created_at": "2026-08-10T07:15:42.125901Z"
-  },
-  {
-    "id": "57b3e448-11c7-48ab-8e36-0f6957235522",
-    "role": "assistant",
-    "content": "Giờ làm việc là 08:00–17:00.[chunk:3f601309-1f9e-4f88-9f16-1077bb849460]",
-    "citations": ["3f601309-1f9e-4f88-9f16-1077bb849460"],
-    "created_at": "2026-08-10T07:15:43.601842Z"
-  }
-]
+{
+  "messages": [
+    {
+      "id": "f3f523dc-a9ea-4e35-8fbf-069127dd76f0",
+      "role": "user",
+      "content": "Giờ làm việc của công ty là mấy giờ?",
+      "citations": [],
+      "created_at": "2026-08-10T07:15:42.125901Z"
+    },
+    {
+      "id": "57b3e448-11c7-48ab-8e36-0f6957235522",
+      "role": "assistant",
+      "content": "Giờ làm việc là 08:00–17:00.[chunk:3f601309-1f9e-4f88-9f16-1077bb849460]",
+      "citations": ["3f601309-1f9e-4f88-9f16-1077bb849460"],
+      "created_at": "2026-08-10T07:15:43.601842Z"
+    }
+  ],
+  "total": 42,
+  "limit": 20,
+  "offset": 0
+}
 ```
+
+Cả ba route GET dùng cùng convention: mặc định `limit=20`, `offset=0`;
+`0 <= limit <= 100`, `offset >= 0`. `limit > 100` không bị cap mà trả
+`400 INVALID_REQUEST`; số âm hoặc giá trị không phải integer cũng trả cùng code.
+`limit=0` hợp lệ và trả mảng trang rỗng trong khi `total` vẫn là tổng thật.
 
 `citations` ở history là mảng **chunk UUID**, khác với object giàu thông tin của
 SSE `event: citations`. Khi đọc lại, server re-check ACL tài liệu: citation user
 không còn được xem sẽ bị loại và marker UUID tương ứng bị xóa khỏi `content`.
 
-Session không tồn tại trả `200 []` để hai route đọc có cùng hành vi. Session tồn
-tại nhưng thuộc user khác trả `403 FORBIDDEN`. `session_id` thiếu hoặc không phải
-UUID trả `400 INVALID_REQUEST`.
+Session không tồn tại trả `200 {"messages":[],"total":0,"limit":L,"offset":O}`
+để hai route đọc có cùng hành vi. Session tồn tại nhưng thuộc user khác trả
+`403 FORBIDDEN`. `session_id` thiếu hoặc không phải UUID trả `400 INVALID_REQUEST`.
 
 #### 6.13.3 Xóa session
 
@@ -1505,6 +1534,13 @@ guard deterministic ở tầng retrieval: không có ngưỡng score buộc tr�
 
 9. **Câu trả lời được sinh bằng tiếng Việt hay tiếng Anh phụ thuộc LLM**, không
     có tham số ép ngôn ngữ.
+
+### 8.8 Lưu trữ lịch sử chat
+
+Lịch sử chat được giữ **vĩnh viễn** cho tới khi người dùng tự xóa session của mình.
+Route xóa là **owner-only** — không có API cho admin xóa thay. Nhân viên đã nghỉ việc
+sẽ không còn token để tự xóa, nên lịch sử của họ tồn tại cho tới khi có quy trình
+dọn dẹp riêng ở phase sau.
 
 ---
 

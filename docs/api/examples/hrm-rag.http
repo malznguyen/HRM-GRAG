@@ -116,20 +116,40 @@ Accept: text/event-stream
 }
 
 
-### 6a. Liet ke session cua CHINH user trong token — khong co phan trang
-GET {{baseUrl}}/workspaces/{{workspaceId}}/chat/sessions
+### 6a. Liet ke trang dau session cua CHINH user trong token
+# Response: { "sessions": [...], "total": N, "limit": 20, "offset": 0 }
+GET {{baseUrl}}/workspaces/{{workspaceId}}/chat/sessions?limit=20&offset=0
 Authorization: Bearer {{accessToken}}
 Accept: application/json
 
 
-### 6b. Doc messages qua route history tuong thich
-GET {{baseUrl}}/workspaces/{{workspaceId}}/chat/history?session_id={{sessionId}}
+### 6a.1 Liet ke trang session tiep theo
+GET {{baseUrl}}/workspaces/{{workspaceId}}/chat/sessions?limit=20&offset=20
 Authorization: Bearer {{accessToken}}
 Accept: application/json
 
 
-### 6c. Doc messages qua route path — route nen dung cho code moi
-GET {{baseUrl}}/workspaces/{{workspaceId}}/chat/sessions/{{sessionId}}/messages
+### 6b. Doc trang dau messages qua route history tuong thich
+# Response: { "messages": [...], "total": N, "limit": 20, "offset": 0 }
+GET {{baseUrl}}/workspaces/{{workspaceId}}/chat/history?session_id={{sessionId}}&limit=20&offset=0
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### 6b.1 Doc trang messages tiep theo qua route history
+GET {{baseUrl}}/workspaces/{{workspaceId}}/chat/history?session_id={{sessionId}}&limit=20&offset=20
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### 6c. Doc trang dau messages qua route path — route nen dung cho code moi
+GET {{baseUrl}}/workspaces/{{workspaceId}}/chat/sessions/{{sessionId}}/messages?limit=20&offset=0
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### 6c.1 Doc trang messages tiep theo qua route path
+GET {{baseUrl}}/workspaces/{{workspaceId}}/chat/sessions/{{sessionId}}/messages?limit=20&offset=20
 Authorization: Bearer {{accessToken}}
 Accept: application/json
 

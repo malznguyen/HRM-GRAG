@@ -24,7 +24,8 @@ Cho **IntelliJ IDEA** (Tools → HTTP Client) hoặc **VS Code** + extension
 
 Request 1–10 và 6a–6d là luồng chính (health → upload → poll → chat → history → xóa).
 Các route history luôn thao tác trên session của `userid` trong token; 6d xóa session
-và toàn bộ messages của nó. Request
+và toàn bộ messages của nó. Các request 6a–6c dùng `limit`/`offset` và đọc page object
+qua field `sessions` hoặc `messages`, cùng `total`, `limit`, `offset`. Request
 `E1`–`E12` là các case lỗi — chạy để xác nhận client HRM xử lý đúng từng mã lỗi.
 Các case `E4`/`E5` và `E9`/`E10` chứng minh `MANAGER`/`EMPLOYEE` đều chỉ là
 workspace `member`: upload mặc định bị `403`, DELETE bị `404 RESOURCE_NOT_FOUND`.
