@@ -50,6 +50,22 @@ docker compose -p hrm-rag ps
 docker compose -p hrm-rag logs --tail 100 ingestion-worker
 ```
 
+The default Compose file runs Ollama on CPU and therefore works on machines
+without a GPU. On a host with the NVIDIA Container Toolkit and a usable NVIDIA
+GPU, add the GPU override explicitly:
+
+```powershell
+# CPU-only (default)
+docker compose -p hrm-rag up -d
+
+# NVIDIA GPU
+docker compose -p hrm-rag -f docker-compose.yml -f docker-compose.gpu.yml up -d
+```
+
+The override keeps the GPU reservation in version control without making it a
+requirement for the default local environment. See
+`docs/OLLAMA_MODEL_SETUP.md` for model import and verification.
+
 Compose starts the application Postgres, OpenFGA Postgres/migration/server,
 MinIO and bucket initialization, Qdrant, Ollama, Keycloak, the durable
 `ingestion-worker`, the authz outbox worker, the Qdrant outbox worker, and the
@@ -60,9 +76,8 @@ Sources: `scripts/p0-bringup-migrate.ps1:40-46`,
 `docker-compose.yml:1-258`.
 
 The Ollama `Modelfile` requires a local `docker/ollama/model-q8_0.gguf` input.
-The surviving files do not contain the operator command that imports this file
-into Ollama, so that provisioning command is a documented gap rather than an
-invented README step.
+Import and verification commands are documented in
+`docs/OLLAMA_MODEL_SETUP.md`.
 
 Source: `docker/ollama/Modelfile:1-2`; the Compose mount and Ollama service are
 defined at `docker-compose.yml:97-118`.
