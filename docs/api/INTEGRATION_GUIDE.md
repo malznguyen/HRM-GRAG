@@ -119,6 +119,28 @@ Toàn bộ endpoint HRM cần:
 | 5 | Health check | `GET` | `/health` |
 | — | *(optional)* Liệt kê tài liệu để đối soát | `GET` | `/workspaces/hrm/documents` |
 
+### 1.5 Thử nhanh bằng Swagger UI
+
+Mở `http://<RAG_HOST>:18083/docs`. Swagger UI và `/openapi.yaml` được phục vụ từ cùng
+RAG API, dùng URL same-origin và toàn bộ asset đã đóng gói trong binary; trình duyệt
+không cần Internet và không cần mở rộng CORS.
+
+1. Bấm **Authorize**.
+2. Dán access token HRM vào ô bearer (chỉ token, không gõ thêm `Bearer `).
+3. Chọn operation, bấm **Try it out** rồi **Execute**. Các path workspace mẫu dùng alias
+   `hrm`, không cần tìm UUID.
+
+Swagger UI phù hợp để thử auth, list, upload, status và delete. Với `POST
+/workspaces/hrm/chat`, UI có thể kết nối và gửi bearer token nhưng thường buffer response;
+nó không phải công cụ quan sát đúng từng SSE event theo thời gian thực. Để test chat, dùng
+`examples/hrm-rag.http`, `examples/smoke.sh`, `curl -N` hoặc Spring `WebClient`, rồi làm
+đúng [mục 6.3](#63-response-là-sse-không-phải-json) đến
+[mục 6.5](#65-thứ-tự-event).
+
+Đặc biệt, không regex marker `[chunk:N]` trên từng mảnh Swagger/curl vừa hiển thị. Phải
+nối toàn bộ text event không tên, đợi `event: done`, rồi mới parse marker như
+[mục 6.4](#64-️-cảnh-báo-quan-trọng-nhất-marker-chunkn-bị-cắt-vụn).
+
 ---
 
 ## 2. Xác thực

@@ -1,18 +1,34 @@
 # Bàn giao tích hợp HRM RAG API
 
+## Mở cái này trước
+
+`http://<IP-máy-chạy-RAG>:18083/docs` — **mở cái này trước** để xem API và thử request
+ngay trên Swagger UI. Bấm **Authorize**, dán access token HRM (chỉ token, không tự thêm
+tiền tố `Bearer `), rồi dùng **Try it out**. Workspace mẫu đã điền sẵn alias `hrm`.
+
+Swagger UI và spec đều do chính API phục vụ, không tải CDN hay asset Internet:
+
+- UI: `http://<IP-máy-chạy-RAG>:18083/docs`
+- OpenAPI YAML: `http://<IP-máy-chạy-RAG>:18083/openapi.yaml`
+
+Swagger UI phù hợp để thử auth, upload, list, status và delete. Riêng chat SSE, UI có thể
+gửi request nhưng không hiển thị đúng luồng/event theo thời gian thực; dùng ví dụ trong
+[`INTEGRATION_GUIDE.md`](./INTEGRATION_GUIDE.md#6-chat--phần-quan-trọng-nhất) để test chat.
+
 ## Địa chỉ API local
 
 `http://127.0.0.1:18083`
 
-API hiện chỉ bind loopback trên máy dev, chưa mở ra LAN và chưa phải endpoint production.
-Khi có server chính thức, team RAG sẽ cung cấp base URL cố định.
+Để team HRM mở Swagger từ máy khác trong LAN test, máy chạy RAG phải dùng
+`API_BIND_ADDR=0.0.0.0:18083` và firewall chỉ mở port cho mạng test tin cậy. Đây chưa phải
+endpoint production; khi có server chính thức, team RAG sẽ cung cấp base URL cố định.
 
 ## Đọc theo thứ tự này
 
-1. [`INTEGRATION_GUIDE.md`](./INTEGRATION_GUIDE.md) — đọc trước, đặc biệt phần
-   xử lý SSE và citation.
-2. [`openapi.yaml`](./openapi.yaml) — import vào Postman hoặc Swagger.
-3. [`examples/`](./examples/) — có file `.http` và `smoke.sh` để chạy thử ngay.
+1. Swagger UI ở `/docs` — mở trước để xem và thử API.
+2. [`INTEGRATION_GUIDE.md`](./INTEGRATION_GUIDE.md) — đọc kỹ phần xử lý SSE và citation.
+3. [`openapi.yaml`](./openapi.yaml) — spec nguồn để import vào công cụ khác khi cần.
+4. [`examples/`](./examples/) — có file `.http` và `smoke.sh` để chạy thử ngay.
 
 ## Ba điều cần biết trước khi bắt đầu
 

@@ -55,7 +55,10 @@ git status --short
 ```
 
 Đảm bảo `API_BIND_ADDR=127.0.0.1:18083`; phase local không được bind API hoặc
-port Compose ra ngoài loopback.
+port Compose ra ngoài loopback. Giữ `DOCS_ENABLED=true` để phục vụ `/docs` và
+`/openapi.yaml` (đây cũng là giá trị mặc định khi biến không được khai báo). Đặt
+`DOCS_ENABLED=false` trong môi trường production cần tắt tài liệu công khai; khi đó cả hai
+route phải trả `404`.
 
 ## 3. Build và preflight
 
@@ -68,7 +71,7 @@ cargo test --lib
 Set-Location ..
 ```
 
-Baseline hiện tại: `173 passed; 0 failed; 5 ignored`.
+Baseline hiện tại: `180 passed; 0 failed; 5 ignored`.
 
 ## 4. Dựng hạ tầng và Ollama
 
@@ -143,9 +146,16 @@ cargo run --manifest-path .\gmrag_api\Cargo.toml --locked --bin gmrag_api
 ```powershell
 curl.exe -i http://127.0.0.1:18083/health
 curl.exe -i http://127.0.0.1:18083/ready
+curl.exe -i http://127.0.0.1:18083/openapi.yaml
+curl.exe -i http://127.0.0.1:18083/docs
 ```
 
-Cả hai phải 200 sau bootstrap OpenFGA. Tạo token HS512 test trong bộ nhớ từ
+Khi `DOCS_ENABLED=true`, cả bốn route trên phải trả `200` sau bootstrap OpenFGA.
+Swagger UI phải tải CSS/JS/spec từ chính host API, không gọi CDN hay validator Internet.
+Để kiểm tra kill switch, chạy một instance tạm với `DOCS_ENABLED=false` và xác nhận
+`/docs` cùng `/openapi.yaml` trả `404`, sau đó khôi phục cấu hình mong muốn.
+
+Tạo token HS512 test trong bộ nhớ từ
 `JWT_HMAC_SECRET`; không ghi token ra file hoặc report. Token cần issuer cấu
 hình, claim `userid`, `role=HR`, và permissions `CHATBOT_USE`,
 `CHATBOT_UPLOAD_DOCUMENT`.
