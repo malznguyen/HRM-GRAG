@@ -99,12 +99,17 @@ một job vào hàng đợi rồi trả về ngay. Đó là lý do bắt buộc 
 |---|---|
 | Default trong code (`main.rs`) | `127.0.0.1:8083` |
 | Giá trị trong `gmrag_api/.env.example` | `127.0.0.1:18083` |
-| Production cho HRM | **TODO: chưa quyết định** |
+| Deployment bàn giao LAN hiện tại | `0.0.0.0:18083` |
+| Production chính thức cho HRM | **TODO: chưa quyết định** |
 
-> **TODO — cần xác nhận:** hiện API chỉ bind `127.0.0.1`, tức là **chỉ gọi được
-> từ chính máy đó**. Chưa có reverse proxy, chưa mở port ra ngoài, chưa có TLS.
-> Trước khi HRM tích hợp thật, hai bên phải chốt: base URL, có HTTPS không, và
-> HRM backend gọi từ network nào.
+Deployment bàn giao hiện bind `0.0.0.0:18083`; firewall máy chủ đã mở inbound TCP
+port `18083`, nên máy khác trong LAN có thể gọi qua
+`http://<RAG_HOST>:18083`. Hai giá trị loopback trong bảng là default của source và
+file cấu hình mẫu, **không phải** trạng thái process đang bàn giao.
+
+Endpoint LAN hiện vẫn dùng HTTP, chưa có reverse proxy/TLS và chưa phải endpoint
+production chính thức. Trước khi lên production, hai bên vẫn phải chốt base URL,
+HTTPS và network được phép truy cập.
 
 **Không có version prefix.** Đường dẫn là `/health`, không phải `/v1/health`.
 
@@ -1332,13 +1337,16 @@ Hai điều cần biết:
 3. **Timestamp không có timezone.** Xem cảnh báo ở mục 4.1. Đây là lỗi runtime
    rất dễ dính.
 
-4. **API hiện bind `127.0.0.1`.** Chưa gọi được từ máy khác. Xem 1.4.
+4. **API đã mở cho LAN.** Deployment bàn giao bind `0.0.0.0:18083` và firewall
+   đã mở inbound TCP port `18083`; máy khác trong LAN gọi qua
+   `http://<RAG_HOST>:18083`. Endpoint hiện vẫn là HTTP, chưa phải URL production.
+   Xem 1.4.
 
-5. **Chưa chạy với shared secret thật của HRM.** Phase 5.1 đã verify đường đi đầy
-   đủ — HRM mode đọc từ `.env`, token HS512 ký bằng `JWT_HMAC_SECRET` trong `.env`
-   gọi chat được `200`, `MANAGER`/`EMPLOYEE` → member, `ADMIN`/`HR` → admin, thiếu `CHATBOT_USE` →
-   `403` — nhưng bằng một **secret tạm**. Đổi sang secret thật chỉ là thay đúng một
-   dòng `JWT_HMAC_SECRET` rồi restart; vẫn nên smoke test chung ngay sau khi đổi.
+5. **Đã verify end-to-end bằng token production thật của HRM và shared secret thật.**
+   Phase 6 xác nhận issuer `hrm-gm-group-access`, canonical user ID lấy từ `userid`,
+   role `HR` đồng bộ thành đúng một tuple `admin`; upload, poll, chat SSE/citation và
+   delete đều PASS. Không ghi token hoặc secret vào tài liệu. Xem
+   `docs/PHASE6_RESULT.md` để đọc bằng chứng đã khử dữ liệu bí mật.
 
 6. **Chat lọc theo tài liệu `COMPLETED` + `DONE`.** Tài liệu đang `PROCESSING`
    hoặc `FAILED` hoàn toàn vô hình với chat. Không có kết quả một phần.
@@ -1364,13 +1372,15 @@ Tick dần khi làm.
 ### Chuẩn bị (làm cùng team RAG)
 
 - [ ] Nhận **base URL** thật (host + port + có HTTPS hay không)
-- [ ] Xác nhận API đã bind ra ngoài `127.0.0.1`, HRM backend gọi tới được
+- [x] ~~Xác nhận API đã bind ra ngoài `127.0.0.1`~~ — deployment bàn giao bind
+      `0.0.0.0:18083`, firewall đã mở inbound TCP `18083`; gọi được qua LAN (mục 1.4)
 - [x] ~~Nhận **UUID workspace cố định**~~ — không còn cần: dùng alias `hrm` trong path (mục 2.5).
       Muốn gọi bằng UUID thì workspace là `fa76881f-6367-4b80-a89e-a3e01206a806`
 - [x] ~~Xác nhận team RAG đã bật `HRM_MODE=true`~~ — đã bật và verify từ `.env` (Phase 5.1)
-- [ ] Bàn giao **shared secret / JWKS** để RAG verify được token HRM (qua kênh bảo mật, **không** qua chat/email)
-- [ ] Xác nhận `JWT_ISSUER` khớp issuer của HRM
-- [ ] Xác nhận `JWT_SUBJECT_CLAIM=userid`
+- [x] ~~Bàn giao shared secret để RAG verify token HRM~~ — đã cấu hình và verify
+      end-to-end bằng token production thật ở Phase 6; secret không nằm trong repo/tài liệu
+- [x] ~~Xác nhận `JWT_ISSUER` khớp issuer của HRM~~ — `hrm-gm-group-access`
+- [x] ~~Xác nhận `JWT_SUBJECT_CLAIM=userid`~~ — canonical user ID đã được verify ở Phase 6
 
 ### Token
 
@@ -1444,7 +1454,8 @@ Tick dần khi làm.
 - [ ] Chốt cơ chế versioning API với team RAG (xem 8.4)
 - [ ] Chốt cách chống upload trùng phía HRM (xem 8.1)
 - [ ] Thống nhất với người dùng cuối rằng PDF scan chưa dùng được (xem 8.3)
-- [ ] Chạy smoke test chung end-to-end bằng token production thật (xem 8.6 mục 5)
+- [x] ~~Chạy smoke test chung end-to-end bằng token production thật~~ — upload,
+      chat/citation và delete đều PASS ở Phase 6 (xem 8.6 mục 5)
 
 ---
 

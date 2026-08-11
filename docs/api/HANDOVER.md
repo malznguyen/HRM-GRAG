@@ -15,13 +15,15 @@ Swagger UI phù hợp để thử auth, upload, list, status và delete. Riêng 
 gửi request nhưng không hiển thị đúng luồng/event theo thời gian thực; dùng ví dụ trong
 [`INTEGRATION_GUIDE.md`](./INTEGRATION_GUIDE.md#6-chat--phần-quan-trọng-nhất) để test chat.
 
-## Địa chỉ API local
+## Địa chỉ API
 
-`http://127.0.0.1:18083`
+- Ngay trên máy chạy RAG: `http://127.0.0.1:18083`
+- Từ máy khác trong LAN: `http://<RAG_HOST>:18083`
 
-Để team HRM mở Swagger từ máy khác trong LAN test, máy chạy RAG phải dùng
-`API_BIND_ADDR=0.0.0.0:18083` và firewall chỉ mở port cho mạng test tin cậy. Đây chưa phải
-endpoint production; khi có server chính thức, team RAG sẽ cung cấp base URL cố định.
+Deployment bàn giao hiện dùng `API_BIND_ADDR=0.0.0.0:18083`; firewall đã mở inbound
+TCP port `18083`, nên team HRM có thể mở Swagger và gọi API từ máy khác trong LAN.
+Đây chưa phải endpoint production: URL hiện dùng HTTP và chưa có TLS/reverse proxy;
+khi có server chính thức, team RAG sẽ cung cấp base URL cố định.
 
 ## Đọc theo thứ tự này
 
@@ -55,7 +57,7 @@ tài liệu không tồn tại; hãy ẩn thao tác upload/xóa theo role ngay t
 ## Test nhanh nhất
 
 ```bash
-curl http://127.0.0.1:18083/health
+curl http://<RAG_HOST>:18083/health
 ```
 
 Kết quả mong đợi:
