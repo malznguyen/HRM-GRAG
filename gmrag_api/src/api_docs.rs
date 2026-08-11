@@ -110,6 +110,10 @@ mod tests {
         assert!(OPENAPI_YAML.contains("HrmBearerAuth: []"));
         assert!(OPENAPI_YAML.contains("scheme: bearer"));
         assert!(OPENAPI_YAML.contains("example: hrm"));
+        assert!(OPENAPI_YAML.contains("**Swagger UI limitation:**"));
+        assert!(OPENAPI_YAML.contains("`docs/api/INTEGRATION_GUIDE.md`"));
+        assert!(OPENAPI_YAML.contains("`docs/api/examples/`"));
+        assert!(OPENAPI_YAML.contains("Concatenate the full answer before"));
     }
 
     #[tokio::test]

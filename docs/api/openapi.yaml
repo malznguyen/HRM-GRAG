@@ -494,9 +494,17 @@ paths:
         Requires the `member` relation on the workspace and, in HRM mode, the
         `CHATBOT_USE` entry in the token's `permissions` array.
 
+        **Swagger UI limitation:** Try it out is useful here only to verify
+        connectivity and bearer authentication. Swagger UI buffers an SSE
+        response and does not present the live stream or the named `citations`
+        and `done` events as a real SSE client would. For a correct streaming
+        test, use section 6 (especially 6.3-6.5) of
+        `docs/api/INTEGRATION_GUIDE.md` and the runnable clients under
+        `docs/api/examples/`.
+
         **The success response is `text/event-stream`, not JSON.** OpenAPI cannot
         describe event framing, so the schema below only names the payload shape
-        of the two *named* events. Read section 2.6 of
+        of the two *named* events. Read section 6 of
         `docs/api/INTEGRATION_GUIDE.md` before implementing — it contains a
         verbatim captured stream and the one mistake that will definitely break
         a first implementation.
