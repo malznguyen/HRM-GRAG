@@ -172,14 +172,26 @@ Ví dụ payload token hợp lệ:
 
 ### 2.3 Role → quyền
 
-| `role` trong token | Quyền phía RAG | Làm được gì |
-|---|---|---|
-| `ADMIN` | admin | Upload khi token có `CHATBOT_UPLOAD_DOCUMENT`; xóa, xem trạng thái, chat |
-| `HR` | admin | Upload khi token có `CHATBOT_UPLOAD_DOCUMENT`; xóa, xem trạng thái, chat |
-| `MANAGER` | admin | Xóa, xem trạng thái, chat. Seed mặc định thiếu `CHATBOT_UPLOAD_DOCUMENT`, nên **không upload** |
-| `EMPLOYEE` | member | Xem trạng thái, chat. **Không** upload kể cả khi được cấp riêng permission; **không** xóa |
-| Bất kỳ giá trị nào khác | — | `403 HRM_ROLE_REQUIRED` |
-| Thiếu / rỗng / không phải string | — | `403 HRM_ROLE_REQUIRED` |
+| Role | Đọc/Chat | Upload | Xóa |
+|---|---|---|---|
+| `ADMIN` | có | có | có |
+| `HR` | có | có | có |
+| `MANAGER` | có | không (`403`) | không (`404`) |
+| `EMPLOYEE` | có | không (`403`) | không (`404`) |
+
+Phía OpenFGA map `ADMIN`/`HR` → `admin` và `MANAGER`/`EMPLOYEE` → `member`.
+Với seed HRM mặc định, MANAGER và EMPLOYEE upload nhận
+`403 CHATBOT_UPLOAD_PERMISSION_REQUIRED`. Nếu được cấp riêng permission upload, họ vẫn là
+workspace `member` và nhận `403 WORKSPACE_ADMIN_REQUIRED` ở ACL kế tiếp.
+
+DELETE trả `404 RESOURCE_NOT_FOUND` thay vì `403` là có chủ đích, để không tiết lộ sự tồn tại
+của tài liệu với người không có quyền. Vì vậy HRM phải chặn nút xóa theo role, không suy luận
+"tài liệu không tồn tại" chỉ từ response `404`.
+
+| `role` không hợp lệ | Kết quả |
+|---|---|
+| Bất kỳ giá trị nào ngoài 4 role trên | `403 HRM_ROLE_REQUIRED` |
+| Thiếu / rỗng / không phải string | `403 HRM_ROLE_REQUIRED` |
 
 So khớp **phân biệt hoa thường và chính xác tuyệt đối**. `"Admin"`, `"admin"`,
 `"HR "` (có dấu cách thừa) đều **fail**. Không có role nào được suy diễn hay
@@ -287,8 +299,10 @@ Yêu cầu đồng thời:
 2. Caller có relation OpenFGA `admin` trên workspace. Có permission nhưng chỉ là
    `member` → `403 WORKSPACE_ADMIN_REQUIRED`.
 
-Seed HRM mặc định chỉ cấp permission upload cho `ADMIN` và `HR`; `MANAGER` không
-được upload trừ khi HRM cấp riêng permission này. Gate không áp dụng cho DELETE.
+Seed HRM mặc định chỉ cấp permission upload cho `ADMIN` và `HR`; `MANAGER` và
+`EMPLOYEE` nhận `403 CHATBOT_UPLOAD_PERMISSION_REQUIRED`. Kể cả khi được cấp riêng
+permission này, hai role vẫn là workspace `member` và bị ACL từ chối bằng
+`403 WORKSPACE_ADMIN_REQUIRED`. Gate không áp dụng cho DELETE.
 
 ### 3.1 Định dạng request
 
@@ -468,7 +482,7 @@ Gửi 2 file và **cả hai** đều bị loại — `400`, lý do nằm trong `
 GET /workspaces/hrm/documents/{document_id}
 ```
 
-Yêu cầu role member trở lên — `EMPLOYEE` gọi được.
+Yêu cầu role member trở lên — `MANAGER` và `EMPLOYEE` đều gọi được.
 
 ### 4.1 Response schema
 
@@ -745,7 +759,8 @@ nhau. Trước Phase 5 endpoint này trả `403 WORKSPACE_ADMIN_REQUIRED` khi th
 quyền — nghĩa là chỉ cần đổi `GET` thành `DELETE` trên cùng một URL là dò ra được
 tài liệu có tồn tại hay không, đúng thứ `GET` cố tình giấu. Nay không còn.
 
-> **Hệ quả cho HRM:** token `EMPLOYEE` bấm xóa sẽ nhận `404`, không phải `403`.
+> **Hệ quả cho HRM:** token `MANAGER` hoặc `EMPLOYEE` bấm xóa sẽ nhận
+> `404 RESOURCE_NOT_FOUND`, không phải `403`.
 > Không suy ra được "file không tồn tại" từ đó. Hãy chặn nút xóa ở phía HRM theo
 > role trong token thay vì dựa vào mã lỗi của RAG.
 
@@ -1299,7 +1314,7 @@ Hai điều cần biết:
 
 5. **Chưa chạy với shared secret thật của HRM.** Phase 5.1 đã verify đường đi đầy
    đủ — HRM mode đọc từ `.env`, token HS512 ký bằng `JWT_HMAC_SECRET` trong `.env`
-   gọi chat được `200`, `EMPLOYEE` → member, `HR` → admin, thiếu `CHATBOT_USE` →
+   gọi chat được `200`, `MANAGER`/`EMPLOYEE` → member, `ADMIN`/`HR` → admin, thiếu `CHATBOT_USE` →
    `403` — nhưng bằng một **secret tạm**. Đổi sang secret thật chỉ là thay đúng một
    dòng `JWT_HMAC_SECRET` rồi restart; vẫn nên smoke test chung ngay sau khi đổi.
 
@@ -1354,7 +1369,8 @@ Tick dần khi làm.
 - [ ] Upload một PDF có text → nhận `202` kèm `document_id`
 - [ ] **Đã lưu `document_id` vào database của HRM**
 - [ ] Upload bằng token thiếu `CHATBOT_UPLOAD_DOCUMENT` → nhận `403 CHATBOT_UPLOAD_PERMISSION_REQUIRED`
-- [ ] Upload bằng token `EMPLOYEE` có `CHATBOT_UPLOAD_DOCUMENT` → vẫn nhận `403 WORKSPACE_ADMIN_REQUIRED`
+- [ ] Upload bằng token `MANAGER` hoặc `EMPLOYEE` thiếu `CHATBOT_UPLOAD_DOCUMENT` → nhận `403 CHATBOT_UPLOAD_PERMISSION_REQUIRED`
+- [ ] Upload bằng token `MANAGER` hoặc `EMPLOYEE` có `CHATBOT_UPLOAD_DOCUMENT` → vẫn nhận `403 WORKSPACE_ADMIN_REQUIRED`
 - [ ] Upload file không hỗ trợ (ví dụ `.xlsx`) → nhận `400 INVALID_REQUEST`,
       `error.details.rejected[0].reason_code = UNSUPPORTED_MEDIA_TYPE`
 - [ ] Upload lô hỗn hợp (1 file tốt + 1 file `.xlsx`) → `202`, `documents` có 1 phần tử
@@ -1390,7 +1406,7 @@ Tick dần khi làm.
 - [ ] Xóa bằng `document_id` đã lưu → nhận `204`
 - [ ] Poll lại sau khi xóa → nhận `404`
 - [ ] Xóa hai lần → lần hai `404`, HRM coi là thành công
-- [ ] Xóa bằng token `EMPLOYEE` → nhận **`404`** (không phải `403` — xem 5.4).
+- [ ] Xóa bằng token `MANAGER` hoặc `EMPLOYEE` → nhận **`404 RESOURCE_NOT_FOUND`** (không phải `403` — xem 5.4).
       Chặn nút xóa theo `role` trong token, đừng dựa vào mã lỗi của RAG
 
 ### Xử lý lỗi

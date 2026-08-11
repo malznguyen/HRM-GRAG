@@ -184,6 +184,11 @@ Authorization: Bearer {{accessToken}}
 DELETE {{baseUrl}}/workspaces/{{workspaceId}}/documents/{{documentId}}
 Authorization: Bearer {{employeeToken}}
 
+### E4d. Xoa bang token MANAGER -> 404 RESOURCE_NOT_FOUND (khong phai 403)
+# Phase 9 map MANAGER -> member. 404 la co chu dich de khong lo document co ton tai.
+DELETE {{baseUrl}}/workspaces/{{workspaceId}}/documents/{{documentId}}
+Authorization: Bearer {{managerToken}}
+
 ### E5. message rong -> 400 INVALID_REQUEST
 POST {{baseUrl}}/workspaces/{{workspaceId}}/chat
 Authorization: Bearer {{accessToken}}
@@ -214,6 +219,19 @@ Content-Type: text/plain
 # Token EMPLOYEE seed mac dinh khong co CHATBOT_UPLOAD_DOCUMENT.
 POST {{baseUrl}}/workspaces/{{workspaceId}}/documents/upload
 Authorization: Bearer {{employeeToken}}
+Content-Type: multipart/form-data; boundary=RagBoundary
+
+--RagBoundary
+Content-Disposition: form-data; name="file"; filename="test.md"
+Content-Type: text/markdown
+
+# tai lieu thu
+--RagBoundary--
+
+### E8b. Upload bang token MANAGER seed mac dinh -> 403 CHATBOT_UPLOAD_PERMISSION_REQUIRED
+# Token MANAGER seed mac dinh khong co CHATBOT_UPLOAD_DOCUMENT.
+POST {{baseUrl}}/workspaces/{{workspaceId}}/documents/upload
+Authorization: Bearer {{managerToken}}
 Content-Type: multipart/form-data; boundary=RagBoundary
 
 --RagBoundary

@@ -6,6 +6,7 @@
 # Cách dùng:
 #   export RAG_BASE_URL="http://127.0.0.1:18083"
 #   export RAG_TOKEN="<token ADMIN/HR có CHATBOT_USE + CHATBOT_UPLOAD_DOCUMENT>"
+#   # MANAGER/EMPLOYEE không dùng được cho smoke: upload=403, DELETE=404.
 #   # RAG_WORKSPACE_ID mặc định là alias "hrm"; đặt UUID đầy đủ nếu muốn.
 #   export RAG_WORKSPACE_ID="hrm"
 #   ./smoke.sh [đường-dẫn-file-để-upload]

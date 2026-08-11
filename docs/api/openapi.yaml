@@ -342,6 +342,12 @@ paths:
         Requires the `admin` relation on the workspace. This is a hard delete,
         not a soft delete or an archive.
 
+        In HRM mode only `ADMIN` and `HR` map to `admin`. `MANAGER` and
+        `EMPLOYEE` map to `member`, so their DELETE request is denied as
+        `404 RESOURCE_NOT_FOUND` (not `403`). This deliberate concealment makes
+        a missing document indistinguishable from an existing document the
+        caller cannot manage.
+
         Removed synchronously, inside one transaction: the OpenFGA relationship
         tuples (revoked *before* the SQL commit), the `documents` row, its
         chunks by cascade, and the graph provenance rows. Two durable outbox
@@ -734,8 +740,8 @@ components:
           * subject — the claim named by `JWT_SUBJECT_CLAIM`. For HRM this is
             `userid`, not `sub`. Its value becomes the canonical user id in both
             SQL and OpenFGA. Must be a non-empty string.
-          * `role` — string. `ADMIN`, `HR` and `MANAGER` map to workspace admin;
-            `EMPLOYEE` maps to workspace member. Any other value, an empty
+          * `role` — string. `ADMIN` and `HR` map to workspace admin;
+            `MANAGER` and `EMPLOYEE` map to workspace member. Any other value, an empty
             string, a non-string, or a missing claim gives
             `403 HRM_ROLE_REQUIRED`.
           * `permissions` — array of strings. Must contain `CHATBOT_USE` to call
@@ -749,6 +755,22 @@ components:
           * `aud` — verified against `JWT_AUDIENCE` only when
             `JWT_VERIFY_AUDIENCE=true`. The HRM deployment sets it to `false`,
             so a token with no `aud` is accepted.
+
+        Role capability matrix (default HRM permissions):
+
+        | Role | Read/chat | Upload | Delete |
+        |---|---|---|---|
+        | `ADMIN` | yes | yes | yes |
+        | `HR` | yes | yes | yes |
+        | `MANAGER` | yes | no (`403`) | no (`404`) |
+        | `EMPLOYEE` | yes | no (`403`) | no (`404`) |
+
+        The default MANAGER/EMPLOYEE upload error is
+        `403 CHATBOT_UPLOAD_PERMISSION_REQUIRED`. If either role is explicitly
+        granted `CHATBOT_UPLOAD_DOCUMENT`, the subsequent workspace ACL still
+        rejects it with `403 WORKSPACE_ADMIN_REQUIRED`. DELETE intentionally
+        returns `404 RESOURCE_NOT_FOUND` instead of `403` so an unauthorized
+        caller cannot learn whether the document exists.
 
         Every rejection is reported to the client as a generic
         `401 INVALID_TOKEN`; the specific reason (expired, algorithm mismatch,

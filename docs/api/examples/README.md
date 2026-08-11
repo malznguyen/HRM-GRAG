@@ -16,7 +16,8 @@ Kèm theo [`../INTEGRATION_GUIDE.md`](../INTEGRATION_GUIDE.md) và
 Cho **IntelliJ IDEA** (Tools → HTTP Client) hoặc **VS Code** + extension
 *REST Client*. Tiện nhất cho dev Java vì chạy thẳng trong IDE.
 
-1. Mở `http-client.env.json`, điền `baseUrl` và `accessToken`. `workspaceId` để
+1. Mở `http-client.env.json`, điền `baseUrl`, `accessToken`, `managerToken` và
+   `employeeToken`. `workspaceId` để
    sẵn là alias `hrm` — server tự resolve về workspace đã ghim, không cần điền
    UUID. Muốn gọi tường minh thì thay bằng UUID đầy đủ, vẫn chạy y hệt.
 2. Mở `hrm-rag.http`, chọn environment `local` ở góc trên.
@@ -24,6 +25,8 @@ Cho **IntelliJ IDEA** (Tools → HTTP Client) hoặc **VS Code** + extension
 
 Request 1–10 là luồng chính (health → upload → poll → chat → xóa). Request
 `E1`–`E10` là các case lỗi — chạy để xác nhận client HRM xử lý đúng từng mã lỗi.
+Các case `E4c`/`E4d` và `E8`/`E8b` chứng minh `MANAGER`/`EMPLOYEE` đều chỉ là
+workspace `member`: upload mặc định bị `403`, DELETE bị `404 RESOURCE_NOT_FOUND`.
 
 Request số 2 upload file `./fixtures/noi-quy-cong-ty.pdf`. Thư mục `fixtures/`
 **không** có sẵn trong repo — tự trỏ sang một file thật trên máy bạn, hoặc tạo
@@ -49,6 +52,9 @@ export RAG_WORKSPACE_ID="hrm"
 ./smoke.sh                          # tự tạo file .md mẫu để upload
 ./smoke.sh /duong/dan/tai-lieu.pdf  # hoặc upload file của bạn
 ```
+
+Smoke cần token `ADMIN` hoặc `HR`. Token `MANAGER`/`EMPLOYEE` chỉ đọc/chat được;
+upload nhận `403` và DELETE nhận `404` theo cơ chế che giấu sự tồn tại tài liệu.
 
 Cần `bash`, `curl`, `python3`. Không cần `jq`, không cài thêm gì.
 Chạy được trên Linux, macOS và Git Bash trên Windows.

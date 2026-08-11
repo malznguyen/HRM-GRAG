@@ -1,12 +1,11 @@
 # Bàn giao tích hợp HRM RAG API
 
-## Địa chỉ API tạm thời
+## Địa chỉ API local
 
-`http://192.168.169.150:18083`
+`http://127.0.0.1:18083`
 
-Đây là môi trường tạm trên máy dev trong mạng LAN nội bộ. Địa chỉ chỉ hoạt động
-trong giờ máy được bật và có thể thay đổi khi mạng cấp lại IP. Khi có server chính
-thức, team RAG sẽ cung cấp base URL cố định.
+API hiện chỉ bind loopback trên máy dev, chưa mở ra LAN và chưa phải endpoint production.
+Khi có server chính thức, team RAG sẽ cung cấp base URL cố định.
 
 ## Đọc theo thứ tự này
 
@@ -23,13 +22,24 @@ thức, team RAG sẽ cung cấp base URL cố định.
 2. Upload yêu cầu exact permission `CHATBOT_UPLOAD_DOCUMENT`. Theo seed hiện tại,
    chỉ `HR` và `ADMIN` có permission này. `MANAGER` và `EMPLOYEE` mặc định nhận
    `403 CHATBOT_UPLOAD_PERMISSION_REQUIRED` khi upload.
-3. IP trên là môi trường tạm trên máy dev, không phải endpoint production. Dịch
-   vụ chỉ chạy khi máy dev và API đang bật.
+3. `MANAGER` và `EMPLOYEE` không được xóa. DELETE trả `404 RESOURCE_NOT_FOUND`
+   thay vì `403` là có chủ đích để không tiết lộ tài liệu có tồn tại hay không.
+
+| Role | Đọc/Chat | Upload | Xóa |
+|---|---|---|---|
+| `ADMIN` | có | có | có |
+| `HR` | có | có | có |
+| `MANAGER` | có | không (`403`) | không (`404`) |
+| `EMPLOYEE` | có | không (`403`) | không (`404`) |
+
+MANAGER/EMPLOYEE mặc định nhận `403 CHATBOT_UPLOAD_PERMISSION_REQUIRED` khi upload và
+`404 RESOURCE_NOT_FOUND` khi DELETE. Không được hiểu response DELETE `404` là bằng chứng
+tài liệu không tồn tại; hãy ẩn thao tác upload/xóa theo role ngay tại HRM.
 
 ## Test nhanh nhất
 
 ```bash
-curl http://192.168.169.150:18083/health
+curl http://127.0.0.1:18083/health
 ```
 
 Kết quả mong đợi:
@@ -38,11 +48,9 @@ Kết quả mong đợi:
 {"status":"ok","db":"connected"}
 ```
 
-## Hai câu cần team HRM trả lời
+## Một câu cần team HRM trả lời
 
-1. `CHATBOT_UPLOAD_DOCUMENT` có bao gồm quyền **xóa** tài liệu, hay chỉ upload?
-   Câu trả lời quyết định có áp dụng permission gate cho DELETE hay không.
-2. Branch HRM nào đang deploy? Snapshot source đã đọc còn hardcode issuer
+1. Branch HRM nào đang deploy? Snapshot source đã đọc còn hardcode issuer
    `restaurant-access`, trong khi token production đã kiểm chứng dùng
    `hrm-gm-group-access`.
 
