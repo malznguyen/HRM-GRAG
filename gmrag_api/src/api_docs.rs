@@ -104,6 +104,14 @@ mod tests {
         assert!(!enabled_value(Some("0")));
     }
 
+    #[test]
+    fn embedded_spec_uses_same_origin_bearer_auth_and_hrm_alias() {
+        assert!(OPENAPI_YAML.contains("servers:\n  - url: /\n"));
+        assert!(OPENAPI_YAML.contains("HrmBearerAuth: []"));
+        assert!(OPENAPI_YAML.contains("scheme: bearer"));
+        assert!(OPENAPI_YAML.contains("example: hrm"));
+    }
+
     #[tokio::test]
     async fn enabled_router_serves_embedded_spec_ui_and_assets() {
         let app = router::<()>(true);

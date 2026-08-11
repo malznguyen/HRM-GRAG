@@ -31,16 +31,10 @@ info:
     identifier: LicenseRef-Proprietary
 
 servers:
-  - url: http://{host}:{port}
+  - url: /
     description: >-
-      Bind address comes from `API_BIND_ADDR`. Code default is `127.0.0.1:8083`;
-      the value shipped in `gmrag_api/.env.example` is `127.0.0.1:18083`.
-      TODO: the production base URL for HRM has not been decided yet.
-    variables:
-      host:
-        default: "127.0.0.1"
-      port:
-        default: "18083"
+      Same origin that served this specification and Swagger UI. No host, IP or
+      port is fixed here, so Try it out follows the current deployment address.
 
 tags:
   - name: Health
@@ -730,6 +724,9 @@ components:
       bearerFormat: JWT
       description: |
         `Authorization: Bearer <access token issued by HRM>`.
+
+        In Swagger UI, select **Authorize** and paste the access token itself;
+        the HTTP bearer security scheme adds the `Bearer ` prefix.
 
         The RAG service does not issue tokens and has no login endpoint. It
         verifies a token minted by the HRM identity provider, using the
