@@ -24,6 +24,7 @@ tokio = { version = "1.52.3", features = ["full"] }
 tower-http = { version = "0.6.11", features = ["cors"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+utoipa-swagger-ui = { version = "=9.0.2", default-features = false, features = ["vendored"] }
 uuid = { version = "1.23.2", features = ["v4", "serde"] }
 text-splitter = { version = "0.30.1", features = ["tiktoken-rs"] }
 tiktoken-rs = "0.11.0"
@@ -33,6 +34,9 @@ metrics = "0.24.2"
 metrics-exporter-prometheus = "0.17.2"
 quick-xml = "0.41.0"
 zip = { version = "6.0.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+[dev-dependencies]
+tower = { version = "=0.5.3", features = ["util"] }
 
 [[bin]]
 name = "delete-tenant"

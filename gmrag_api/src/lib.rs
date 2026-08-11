@@ -1,3 +1,4 @@
+mod api_docs;
 pub mod api_error;
 pub mod audit;
 pub mod auth;
@@ -319,6 +320,7 @@ fn routed_app(state: AppState) -> Router {
     telemetry::init_metrics_recorder();
 
     Router::new()
+        .merge(api_docs::router(api_docs::enabled_from_env()))
         .route("/health", get(health))
         .route("/ready", get(ready))
         .route("/metrics", get(metrics))
