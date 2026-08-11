@@ -1437,7 +1437,39 @@ Hai điều cần biết:
   nhiều instance thì mỗi instance đếm riêng — tức là giới hạn thực tế bị nhân
   lên theo số instance. Không nên coi đây là cơ chế bảo vệ nghiêm túc.
 
-### 8.6 Những điều khác nên biết trước
+### 8.6 Giới hạn retrieval: top-K, reranker và refusal
+
+Giá trị hiệu lực hiện tại là **`QDRANT_TOP_K=5`**: code fallback về `5`, file
+`.env.example` ghi `5`, và deployment hiện không override biến này. Với mỗi câu hỏi,
+API gửi `limit=5` sang Qdrant, nên lấy **tối đa 5 đoạn** trước khi re-check ACL;
+sau ACL có thể còn ít hơn 5.
+
+Pipeline hiện là một tầng vector search thẳng:
+
+- **Không có reranker/cross-encoder** hoặc bước xếp hạng thứ hai.
+- **Không có score threshold cứng.** Request search không gửi `score_threshold`,
+  response code cũng không đọc score để loại kết quả yếu.
+- Vì vậy, nếu Qdrant trả candidate, tối đa 5 đoạn đó được đưa tiếp vào prompt dù
+  độ liên quan có thể thấp; ngược lại, đoạn quan trọng đứng từ vị trí 6 trở đi sẽ
+  không tới được LLM.
+
+Ảnh hưởng dễ thấy nhất: câu hỏi cần tổng hợp từ nhiều **Điều**, nhiều chương hoặc
+nhiều tài liệu có thể trả lời thiếu ý. Dấu hiệu vận hành là người dùng phản ánh
+“bot trả lời thiếu ý” dù từng ý riêng lẻ có trong corpus — trường hợp này nhiều
+khả năng do giới hạn retrieval, **không nên kết luận ngay là LLM trả lời sai**.
+
+Hướng xử lý ở phase sau:
+
+1. **Nhanh:** tăng `QDRANT_TOP_K` để đưa thêm đoạn vào prompt. Đổi lại prompt dài
+   hơn, latency/token/noise tăng và đoạn yếu cũng nhiều hơn.
+2. **Đúng hơn:** retrieve một tập candidate rộng, thêm reranker rồi chỉ đưa các
+   đoạn xếp hạng tốt nhất vào prompt.
+
+Bot từ chối khi không tìm thấy thông tin hiện dựa vào chỉ dẫn **system prompt**.
+Phase 7.3 đã xác nhận corpus rỗng thì bot từ chối đúng, nhưng đây chưa phải một
+guard deterministic ở tầng retrieval: không có ngưỡng score buộc trả kết quả rỗng.
+
+### 8.7 Những điều khác nên biết trước
 
 Đọc được trong code, HRM nên nắm:
 
@@ -1465,16 +1497,13 @@ Hai điều cần biết:
 6. **Chat lọc theo tài liệu `COMPLETED` + `DONE`.** Tài liệu đang `PROCESSING`
    hoặc `FAILED` hoàn toàn vô hình với chat. Không có kết quả một phần.
 
-7. **Retrieval lấy tối đa 5 đoạn mỗi câu hỏi** (`QDRANT_TOP_K=5`). Câu hỏi cần
-   tổng hợp từ nhiều tài liệu có thể trả lời thiếu.
-
-8. **Chưa có kiểm soát độ dài `message`.** API không giới hạn, nhưng câu quá dài
+7. **Chưa có kiểm soát độ dài `message`.** API không giới hạn, nhưng câu quá dài
    sẽ bị LLM từ chối hoặc cắt. HRM nên tự giới hạn ở UI.
 
-9. **Model trả lời và model embedding cấu hình phía server.** HRM không chọn được
+8. **Model trả lời và model embedding cấu hình phía server.** HRM không chọn được
    model, không chỉnh được temperature, không sửa được system prompt.
 
-10. **Câu trả lời được sinh bằng tiếng Việt hay tiếng Anh phụ thuộc LLM**, không
+9. **Câu trả lời được sinh bằng tiếng Việt hay tiếng Anh phụ thuộc LLM**, không
     có tham số ép ngôn ngữ.
 
 ---
@@ -1570,7 +1599,7 @@ Tick dần khi làm.
 - [ ] Chốt cách chống upload trùng phía HRM (xem 8.1)
 - [ ] Thống nhất với người dùng cuối rằng PDF scan chưa dùng được (xem 8.3)
 - [x] ~~Chạy smoke test chung end-to-end bằng token production thật~~ — upload,
-      chat/citation và delete đều PASS ở Phase 6 (xem 8.6 mục 5)
+      chat/citation và delete đều PASS ở Phase 6 (xem 8.7 mục 5)
 
 ---
 

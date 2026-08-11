@@ -80,6 +80,7 @@ Kết quả mong đợi:
 - Chưa có idempotency cho upload.
 - PDF scan chưa OCR được.
 - Chưa có prefix `/v1`.
+- Retrieval tối đa 5 đoạn/câu hỏi, chưa có reranker hoặc score threshold cứng.
 - Endpoint tạm dùng HTTP, chưa có TLS.
 
 Chi tiết xem [mục 8 trong `INTEGRATION_GUIDE.md`](./INTEGRATION_GUIDE.md#8-giới-hạn-hiện-tại).
