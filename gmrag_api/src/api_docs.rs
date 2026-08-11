@@ -13,7 +13,7 @@ const OPENAPI_YAML: &str = include_str!("../../docs/api/openapi.yaml");
 const DOCS_BASE: &str = r#"<base href="/docs/">"#;
 
 static SWAGGER_CONFIG: LazyLock<Arc<Config<'static>>> =
-    LazyLock::new(|| Arc::new(Config::from("/openapi.yaml")));
+    LazyLock::new(|| Arc::new(Config::from("/openapi.yaml").validator_url("none")));
 
 pub fn enabled_from_env() -> bool {
     enabled_value(std::env::var("DOCS_ENABLED").ok().as_deref())
@@ -161,6 +161,22 @@ mod tests {
             asset.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/css"
         );
+
+        let initializer = router::<()>(true)
+            .oneshot(
+                Request::get("/docs/swagger-initializer.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(initializer.status(), StatusCode::OK);
+        let initializer_body = axum::body::to_bytes(initializer.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let initializer_javascript = String::from_utf8(initializer_body.to_vec()).unwrap();
+        assert!(initializer_javascript.contains(r#""url": "/openapi.yaml""#));
+        assert!(initializer_javascript.contains(r#""validatorUrl": "none""#));
     }
 
     #[tokio::test]
