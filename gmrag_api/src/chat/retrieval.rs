@@ -49,6 +49,14 @@ pub struct StoredChatMessage {
     pub created_at: NaiveDateTime,
 }
 
+#[derive(Debug)]
+pub struct StoredChatMessagePage {
+    pub messages: Vec<StoredChatMessage>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 pub async fn fetch_chunks_by_ids(
     pool: &PgPool,
     workspace_id: Uuid,
@@ -255,8 +263,26 @@ pub async fn fetch_session_chat_messages(
     session_id: Uuid,
     workspace_id: Uuid,
     user_id: &str,
-) -> Result<Vec<StoredChatMessage>, sqlx::Error> {
-    sqlx::query_as(
+    limit: i64,
+    offset: i64,
+) -> Result<StoredChatMessagePage, sqlx::Error> {
+    let total = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)::bigint
+        FROM chat_messages cm
+        INNER JOIN chat_sessions cs ON cs.id = cm.session_id
+        WHERE cm.session_id = $1
+          AND cs.workspace_id = $2
+          AND cs.user_id = $3
+        "#,
+    )
+    .bind(session_id)
+    .bind(workspace_id)
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    let messages = sqlx::query_as(
         r#"
         SELECT cm.id, cm.role, cm.content, cm.citations, cm.created_at
         FROM chat_messages cm
@@ -264,12 +290,22 @@ pub async fn fetch_session_chat_messages(
         WHERE cm.session_id = $1
           AND cs.workspace_id = $2
           AND cs.user_id = $3
-        ORDER BY cm.created_at ASC
+        ORDER BY cm.created_at ASC, cm.id ASC
+        LIMIT $4 OFFSET $5
         "#,
     )
     .bind(session_id)
     .bind(workspace_id)
     .bind(user_id)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
-    .await
+    .await?;
+
+    Ok(StoredChatMessagePage {
+        messages,
+        total,
+        limit,
+        offset,
+    })
 }

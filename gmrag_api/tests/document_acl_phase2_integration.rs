@@ -1,5 +1,6 @@
 mod support;
 
+use std::collections::HashSet;
 use std::sync::{Arc, OnceLock};
 
 use axum::{
@@ -847,7 +848,7 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         .unwrap();
     assert_eq!(member_history.status(), reqwest::StatusCode::OK);
     let member_history_json: Value = member_history.json().await.unwrap();
-    let member_first_citations = member_history_json
+    let member_first_citations = member_history_json["messages"]
         .as_array()
         .and_then(|arr| arr.first())
         .and_then(|msg| msg.get("citations"))
@@ -933,7 +934,7 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         .unwrap();
     assert_eq!(live_history.status(), reqwest::StatusCode::OK);
     let live_history_json: Value = live_history.json().await.unwrap();
-    let assistant_msg = live_history_json
+    let assistant_msg = live_history_json["messages"]
         .as_array()
         .unwrap()
         .iter()
@@ -950,6 +951,308 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
     assert_eq!(citations, vec![public_chunk_id.to_string()]);
     let assistant_content = assistant_msg["content"].as_str().unwrap_or_default();
     assert!(!assistant_content.contains("secret beta content"));
+}
+
+#[tokio::test]
+async fn chat_history_pagination_is_stable_complete_and_owner_scoped() {
+    let _guard = phase2_test_lock().lock().await;
+    let server = TestServer::bootstrap().await;
+    let client = Client::new();
+
+    let tenant_id = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
+    let user_a = format!("phase12-user-a-{}", Uuid::new_v4());
+    let user_b = format!("phase12-user-b-{}", Uuid::new_v4());
+
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(tenant_id)
+        .bind(format!("Phase 12 Tenant {tenant_id}"))
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO workspaces (id, tenant_id, name) VALUES ($1, $2, $3)")
+        .bind(workspace_id)
+        .bind(tenant_id)
+        .bind(format!("Phase 12 Workspace {workspace_id}"))
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    for (user_id, label) in [(&user_a, "a"), (&user_b, "b")] {
+        sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
+            .bind(user_id)
+            .bind(format!("phase12-{label}-{}@example.test", Uuid::new_v4()))
+            .execute(&server.pool)
+            .await
+            .unwrap();
+        server
+            .state
+            .authz_client
+            .write_tuple(
+                &format!("user:{user_id}"),
+                Relation::Member,
+                &Object::Workspace(workspace_id),
+            )
+            .await
+            .unwrap();
+    }
+
+    for index in 0..7 {
+        sqlx::query(
+            r#"
+            INSERT INTO chat_sessions (id, workspace_id, user_id, title, created_at)
+            VALUES ($1, $2, $3, $4, TIMESTAMP '2026-01-01 00:00:00')
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(workspace_id)
+        .bind(&user_a)
+        .bind(format!("A session {index}"))
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    }
+
+    let user_b_session = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO chat_sessions (id, workspace_id, user_id, title, created_at)
+        VALUES ($1, $2, $3, 'B session', TIMESTAMP '2026-01-01 00:00:00')
+        "#,
+    )
+    .bind(user_b_session)
+    .bind(workspace_id)
+    .bind(&user_b)
+    .execute(&server.pool)
+    .await
+    .unwrap();
+
+    let expected_session_ids: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT id FROM chat_sessions
+        WHERE workspace_id = $1 AND user_id = $2
+        ORDER BY created_at DESC, id DESC
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(&user_a)
+    .fetch_all(&server.pool)
+    .await
+    .unwrap();
+
+    let default_sessions = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/chat/sessions",
+            server.addr
+        ))
+        .bearer_auth(&user_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(default_sessions.status(), reqwest::StatusCode::OK);
+    let default_sessions: Value = default_sessions.json().await.unwrap();
+    assert_eq!(default_sessions["total"], 7);
+    assert_eq!(default_sessions["limit"], 20);
+    assert_eq!(default_sessions["offset"], 0);
+    assert_eq!(default_sessions["sessions"].as_array().unwrap().len(), 7);
+
+    let mut paged_session_ids = Vec::new();
+    for offset in [0, 3, 6] {
+        let response = client
+            .get(format!(
+                "{}/workspaces/{workspace_id}/chat/sessions?limit=3&offset={offset}",
+                server.addr
+            ))
+            .bearer_auth(&user_a)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let page: Value = response.json().await.unwrap();
+        assert_eq!(page["total"], 7);
+        assert_eq!(page["limit"], 3);
+        assert_eq!(page["offset"], offset);
+        paged_session_ids.extend(
+            page["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| Uuid::parse_str(row["id"].as_str().unwrap()).unwrap()),
+        );
+    }
+    assert_eq!(paged_session_ids, expected_session_ids);
+    assert_eq!(
+        paged_session_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>()
+            .len(),
+        7
+    );
+
+    let beyond_sessions = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/chat/sessions?limit=3&offset=99",
+            server.addr
+        ))
+        .bearer_auth(&user_a)
+        .send()
+        .await
+        .unwrap();
+    let beyond_sessions: Value = beyond_sessions.json().await.unwrap();
+    assert_eq!(beyond_sessions["total"], 7);
+    assert_eq!(beyond_sessions["sessions"], json!([]));
+
+    for query in ["limit=101", "limit=-1", "offset=-1", "limit=not-a-number"] {
+        let invalid = client
+            .get(format!(
+                "{}/workspaces/{workspace_id}/chat/sessions?{query}",
+                server.addr
+            ))
+            .bearer_auth(&user_a)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+        let error: Value = invalid.json().await.unwrap();
+        assert_eq!(error["error"]["code"], "INVALID_REQUEST");
+    }
+
+    let user_b_sessions = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/chat/sessions?limit=100&offset=0",
+            server.addr
+        ))
+        .bearer_auth(&user_b)
+        .send()
+        .await
+        .unwrap();
+    let user_b_sessions: Value = user_b_sessions.json().await.unwrap();
+    assert_eq!(user_b_sessions["total"], 1);
+    assert_eq!(
+        user_b_sessions["sessions"][0]["id"],
+        user_b_session.to_string()
+    );
+    assert!(
+        !user_b_sessions
+            .to_string()
+            .contains(&expected_session_ids[0].to_string())
+    );
+
+    let message_session = expected_session_ids[0];
+    for index in 0..7 {
+        sqlx::query(
+            r#"
+            INSERT INTO chat_messages (id, session_id, role, content, citations, created_at)
+            VALUES ($1, $2, 'user', $3, '[]'::jsonb, TIMESTAMP '2026-01-01 00:00:00')
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(message_session)
+        .bind(format!("message {index}"))
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    }
+    let expected_message_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM chat_messages WHERE session_id = $1 ORDER BY created_at ASC, id ASC",
+    )
+    .bind(message_session)
+    .fetch_all(&server.pool)
+    .await
+    .unwrap();
+
+    for (path, separator) in [
+        (
+            format!("chat/history?session_id={message_session}"),
+            '&',
+        ),
+        (format!("chat/sessions/{message_session}/messages"), '?'),
+    ] {
+        let default_page = client
+            .get(format!("{}/workspaces/{workspace_id}/{path}", server.addr))
+            .bearer_auth(&user_a)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(default_page.status(), reqwest::StatusCode::OK);
+        let default_page: Value = default_page.json().await.unwrap();
+        assert_eq!(default_page["total"], 7);
+        assert_eq!(default_page["limit"], 20);
+        assert_eq!(default_page["offset"], 0);
+
+        let mut paged_message_ids = Vec::new();
+        for offset in [0, 3, 6] {
+            let response = client
+                .get(format!(
+                    "{}/workspaces/{workspace_id}/{path}{separator}limit=3&offset={offset}",
+                    server.addr
+                ))
+                .bearer_auth(&user_a)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let page: Value = response.json().await.unwrap();
+            assert_eq!(page["total"], 7);
+            paged_message_ids.extend(
+                page["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| Uuid::parse_str(row["id"].as_str().unwrap()).unwrap()),
+            );
+        }
+        assert_eq!(paged_message_ids, expected_message_ids);
+        assert_eq!(
+            paged_message_ids
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                .len(),
+            7
+        );
+
+        let beyond = client
+            .get(format!(
+                "{}/workspaces/{workspace_id}/{path}{separator}limit=3&offset=99",
+                server.addr
+            ))
+            .bearer_auth(&user_a)
+            .send()
+            .await
+            .unwrap();
+        let beyond: Value = beyond.json().await.unwrap();
+        assert_eq!(beyond["total"], 7);
+        assert_eq!(beyond["messages"], json!([]));
+    }
+
+    let missing_session = Uuid::new_v4();
+    let missing = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/chat/history?session_id={missing_session}&limit=3&offset=6",
+            server.addr
+        ))
+        .bearer_auth(&user_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), reqwest::StatusCode::OK);
+    let missing: Value = missing.json().await.unwrap();
+    assert_eq!(missing["messages"], json!([]));
+    assert_eq!(missing["total"], 0);
+    assert_eq!(missing["limit"], 3);
+    assert_eq!(missing["offset"], 6);
+
+    let other_owner = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/chat/sessions/{user_b_session}/messages?limit=3&offset=0",
+            server.addr
+        ))
+        .bearer_auth(&user_a)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other_owner.status(), reqwest::StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

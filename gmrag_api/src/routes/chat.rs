@@ -22,7 +22,7 @@ use crate::api_error::ApiError;
 use crate::auth::authz::{Authz, AuthzClient, Object, Relation};
 use crate::auth::hrm::HrmChatPermission;
 use crate::chat::deepseek::{DeepseekTokenParser, deepseek_stream_idle_timeout, next_stream_token};
-use crate::chat::retrieval::{StoredChatMessage, fetch_session_chat_messages};
+use crate::chat::retrieval::{StoredChatMessagePage, fetch_session_chat_messages};
 use crate::chat::{
     ChatPipelineError, SessionError, build_chat_context, delete_chat_session, ensure_chat_session,
     filter_citation_ids_for_user, filter_citations_for_user, insert_chat_message,
@@ -33,10 +33,20 @@ use crate::state::AppState;
 
 const MAX_CITATION_IDS: usize = 64;
 const CITATION_SNIPPET_CHARS: usize = 280;
+const DEFAULT_CHAT_PAGE_LIMIT: i64 = 20;
+const MAX_CHAT_PAGE_LIMIT: i64 = 100;
 
 #[derive(Deserialize)]
 pub struct ChatHistoryQuery {
     pub session_id: Uuid,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Deserialize)]
+pub struct ChatPaginationQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -53,6 +63,14 @@ pub struct ChatHistoryMessageResponse {
     pub citations: Vec<Uuid>,
     #[serde(serialize_with = "crate::utc_timestamp::serialize")]
     pub created_at: NaiveDateTime,
+}
+
+#[derive(Serialize)]
+pub struct ChatHistoryPageResponse {
+    pub messages: Vec<ChatHistoryMessageResponse>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
 }
 
 #[derive(Deserialize)]
@@ -337,6 +355,7 @@ pub async fn list_workspace_chat_sessions(
     State(state): State<AppState>,
     authz: Authz,
     Path(workspace_id): Path<Uuid>,
+    Query(query): Query<ChatPaginationQuery>,
 ) -> impl IntoResponse {
     if let Err(err) = authz
         .require_relation(Relation::Member, &Object::Workspace(workspace_id))
@@ -345,7 +364,12 @@ pub async fn list_workspace_chat_sessions(
         return err.into_response();
     }
 
-    match list_user_chat_sessions(&state.pool, workspace_id, &authz.user_id).await {
+    let (limit, offset) = match chat_page_window(query.limit, query.offset) {
+        Ok(window) => window,
+        Err(err) => return err.into_response(),
+    };
+
+    match list_user_chat_sessions(&state.pool, workspace_id, &authz.user_id, limit, offset).await {
         Ok(sessions) => Json(sessions).into_response(),
         Err(err) => {
             tracing::error!(error = %err, "Failed to list chat sessions");
@@ -358,6 +382,7 @@ pub async fn get_workspace_chat_session_messages(
     State(state): State<AppState>,
     authz: Authz,
     Path(path): Path<WorkspaceChatSessionPath>,
+    Query(query): Query<ChatPaginationQuery>,
 ) -> impl IntoResponse {
     if let Err(err) = authz
         .require_relation(Relation::Member, &Object::Workspace(path.workspace_id))
@@ -365,6 +390,11 @@ pub async fn get_workspace_chat_session_messages(
     {
         return err.into_response();
     }
+
+    let (limit, offset) = match chat_page_window(query.limit, query.offset) {
+        Ok(window) => window,
+        Err(err) => return err.into_response(),
+    };
 
     match verify_chat_session_owner(
         &state.pool,
@@ -375,7 +405,7 @@ pub async fn get_workspace_chat_session_messages(
     .await
     {
         Ok(true) => {}
-        Ok(false) => return Json(Vec::<ChatHistoryMessageResponse>::new()).into_response(),
+        Ok(false) => return Json(empty_chat_history_page(limit, offset)).into_response(),
         Err(SessionError::Forbidden) => {
             return (StatusCode::FORBIDDEN, "Chat session not accessible").into_response();
         }
@@ -390,14 +420,15 @@ pub async fn get_workspace_chat_session_messages(
         path.session_id,
         path.workspace_id,
         &authz.user_id,
+        limit,
+        offset,
     )
     .await
     {
-        Ok(rows) => {
-            match build_history_messages_with_acl(&state, path.workspace_id, &authz.user_id, rows)
-                .await
+        Ok(page) => {
+            match build_history_page_with_acl(&state, path.workspace_id, &authz.user_id, page).await
             {
-                Ok(messages) => Json(messages).into_response(),
+                Ok(page) => Json(page).into_response(),
                 Err(err) => {
                     tracing::error!(error = %err, "Failed to filter citation ACL for session messages");
                     StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -456,11 +487,16 @@ pub async fn workspace_chat_history(
         return err.into_response();
     }
 
+    let (limit, offset) = match chat_page_window(query.limit, query.offset) {
+        Ok(window) => window,
+        Err(err) => return err.into_response(),
+    };
+
     match verify_chat_session_owner(&state.pool, query.session_id, workspace_id, &authz.user_id)
         .await
     {
         Ok(true) => {}
-        Ok(false) => return Json(Vec::<ChatHistoryMessageResponse>::new()).into_response(),
+        Ok(false) => return Json(empty_chat_history_page(limit, offset)).into_response(),
         Err(SessionError::Forbidden) => {
             return (StatusCode::FORBIDDEN, "Chat session not accessible").into_response();
         }
@@ -470,13 +506,19 @@ pub async fn workspace_chat_history(
         }
     }
 
-    match fetch_session_chat_messages(&state.pool, query.session_id, workspace_id, &authz.user_id)
-        .await
+    match fetch_session_chat_messages(
+        &state.pool,
+        query.session_id,
+        workspace_id,
+        &authz.user_id,
+        limit,
+        offset,
+    )
+    .await
     {
-        Ok(rows) => {
-            match build_history_messages_with_acl(&state, workspace_id, &authz.user_id, rows).await
-            {
-                Ok(messages) => Json(messages).into_response(),
+        Ok(page) => {
+            match build_history_page_with_acl(&state, workspace_id, &authz.user_id, page).await {
+                Ok(page) => Json(page).into_response(),
                 Err(err) => {
                     tracing::error!(error = %err, "Failed to filter citation ACL for chat history");
                     StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -759,15 +801,37 @@ pub async fn workspace_chat(
         .into_response()
 }
 
-async fn build_history_messages_with_acl(
+fn chat_page_window(limit: Option<i64>, offset: Option<i64>) -> Result<(i64, i64), ApiError> {
+    let limit = limit.unwrap_or(DEFAULT_CHAT_PAGE_LIMIT);
+    let offset = offset.unwrap_or(0);
+    if !(0..=MAX_CHAT_PAGE_LIMIT).contains(&limit) || offset < 0 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_REQUEST",
+            "limit must be between 0 and 100 and offset must be non-negative",
+        ));
+    }
+    Ok((limit, offset))
+}
+
+fn empty_chat_history_page(limit: i64, offset: i64) -> ChatHistoryPageResponse {
+    ChatHistoryPageResponse {
+        messages: Vec::new(),
+        total: 0,
+        limit,
+        offset,
+    }
+}
+
+async fn build_history_page_with_acl(
     state: &AppState,
     workspace_id: Uuid,
     user_id: &str,
-    rows: Vec<StoredChatMessage>,
-) -> Result<Vec<ChatHistoryMessageResponse>, ChatPipelineError> {
-    let mut messages = Vec::with_capacity(rows.len());
+    page: StoredChatMessagePage,
+) -> Result<ChatHistoryPageResponse, ChatPipelineError> {
+    let mut messages = Vec::with_capacity(page.messages.len());
 
-    for row in rows {
+    for row in page.messages {
         let (content, citations) = filter_citations_for_user(
             &state.pool,
             &state.authz_client,
@@ -787,7 +851,12 @@ async fn build_history_messages_with_acl(
         });
     }
 
-    Ok(messages)
+    Ok(ChatHistoryPageResponse {
+        messages,
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+    })
 }
 
 fn chat_pipeline_error_response(err: ChatPipelineError) -> axum::response::Response {
@@ -826,6 +895,22 @@ mod tests {
     impl Drop for DropFlag {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn chat_pagination_uses_document_directory_convention() {
+        assert_eq!(chat_page_window(None, None).unwrap(), (20, 0));
+        assert_eq!(chat_page_window(Some(0), Some(7)).unwrap(), (0, 7));
+        assert_eq!(chat_page_window(Some(100), Some(0)).unwrap(), (100, 0));
+    }
+
+    #[test]
+    fn chat_pagination_rejects_out_of_range_values() {
+        for (limit, offset) in [(Some(-1), None), (Some(101), None), (None, Some(-1))] {
+            let err = chat_page_window(limit, offset).unwrap_err();
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+            assert_eq!(err.code, "INVALID_REQUEST");
         }
     }
 

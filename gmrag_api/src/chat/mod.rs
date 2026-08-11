@@ -582,23 +582,55 @@ pub struct ChatSessionSummary {
     pub created_at: NaiveDateTime,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ChatSessionPage {
+    pub sessions: Vec<ChatSessionSummary>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 pub async fn list_user_chat_sessions(
     pool: &PgPool,
     workspace_id: Uuid,
     user_id: &str,
-) -> Result<Vec<ChatSessionSummary>, sqlx::Error> {
-    sqlx::query_as(
+    limit: i64,
+    offset: i64,
+) -> Result<ChatSessionPage, sqlx::Error> {
+    let total = sqlx::query_scalar::<_, i64>(
         r#"
-        SELECT id, title, created_at
+        SELECT COUNT(*)::bigint
         FROM chat_sessions
         WHERE workspace_id = $1 AND user_id = $2
-        ORDER BY created_at DESC
         "#,
     )
     .bind(workspace_id)
     .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+
+    let sessions = sqlx::query_as(
+        r#"
+        SELECT id, title, created_at
+        FROM chat_sessions
+        WHERE workspace_id = $1 AND user_id = $2
+        ORDER BY created_at DESC, id DESC
+        LIMIT $3 OFFSET $4
+        "#,
+    )
+    .bind(workspace_id)
+    .bind(user_id)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
-    .await
+    .await?;
+
+    Ok(ChatSessionPage {
+        sessions,
+        total,
+        limit,
+        offset,
+    })
 }
 
 pub async fn verify_chat_session_owner(
