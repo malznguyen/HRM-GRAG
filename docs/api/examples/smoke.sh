@@ -4,24 +4,23 @@
 # Chạy end-to-end: health -> upload -> poll -> chat -> 4 route history -> cleanup.
 #
 # Cách dùng:
-#   export RAG_BASE_URL="http://127.0.0.1:18083"
+#   export RAG_BASE_URL="<RAG_BASE_URL>"
 #   export RAG_TOKEN="<token ADMIN/HR có CHATBOT_USE + CHATBOT_UPLOAD_DOCUMENT>"
 #   # MANAGER/EMPLOYEE không dùng được cho smoke: upload=403, DELETE=404.
-#   # RAG_WORKSPACE_ID mặc định là alias "hrm"; đặt UUID đầy đủ nếu muốn.
-#   export RAG_WORKSPACE_ID="hrm"
+#   # Script luôn dùng alias workspace "hrm".
 #   ./smoke.sh [đường-dẫn-file-để-upload]
 #
 # Không có file truyền vào thì script tự tạo một file .md tạm.
 #
 # KHÔNG hard-code token vào script này.
 #
-# Yêu cầu: bash, curl, python3 (chỉ dùng để đọc JSON — không cài thêm gì).
+# Yêu cầu: bash, curl, Python 3 qua lệnh `python3` hoặc `python`.
 
 set -uo pipefail
 
-BASE_URL="${RAG_BASE_URL:-http://127.0.0.1:18083}"
-# Alias "hrm" chạy được khi server bật HRM_MODE; UUID đầy đủ vẫn luôn dùng được.
-WORKSPACE_ID="${RAG_WORKSPACE_ID:-hrm}"
+BASE_URL="${RAG_BASE_URL:-}"
+BASE_URL="${BASE_URL%/}"
+WORKSPACE_ID="hrm"
 TOKEN="${RAG_TOKEN:-}"
 UPLOAD_FILE="${1:-}"
 
@@ -34,9 +33,19 @@ step()  { printf '\n\033[1m=== %s ===\033[0m\n' "$*"; }
 
 die() { red "FAIL: $*"; exit 1; }
 
+# Git Bash trên Windows có thể thấy App Execution Alias `python3` nhưng alias đó
+# không chạy. Probe thực sự rồi fallback sang `python`.
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; assert sys.version_info.major == 3' >/dev/null 2>&1; then
+  PYTHON_BIN="python3"
+elif command -v python >/dev/null 2>&1 && python -c 'import sys; assert sys.version_info.major == 3' >/dev/null 2>&1; then
+  PYTHON_BIN="python"
+else
+  die "cần Python 3 qua lệnh python3 hoặc python để đọc JSON"
+fi
+
 # Đọc một field từ JSON trên stdin. Không cần jq.
 json_get() {
-  python3 -c "
+  "$PYTHON_BIN" -c "
 import json,sys
 try:
     d = json.load(sys.stdin)
@@ -54,11 +63,10 @@ print(d)
 " "$1" 2>/dev/null
 }
 
-[ -n "$WORKSPACE_ID" ] || die "RAG_WORKSPACE_ID rỗng. Bỏ trống để dùng alias 'hrm', hoặc đặt UUID workspace (xem mục 2.5 của INTEGRATION_GUIDE.md)."
+[ -n "$BASE_URL" ]     || die "Chưa đặt RAG_BASE_URL."
 [ -n "$TOKEN" ]        || die "Chưa đặt RAG_TOKEN."
 
 command -v curl    >/dev/null || die "cần curl"
-command -v python3 >/dev/null || die "cần python3 để đọc JSON"
 
 WS="${BASE_URL}/workspaces/${WORKSPACE_ID}"
 AUTH="Authorization: Bearer ${TOKEN}"
@@ -184,7 +192,7 @@ SESSION_ID=""
 if [ "$final_status" != "COMPLETED" ]; then
   red "Bỏ qua chat: tài liệu chưa COMPLETED nên chat không thấy nội dung này."
 else
-  SESSION_ID="$(python3 -c 'import uuid;print(uuid.uuid4())')"
+  SESSION_ID="$("$PYTHON_BIN" -c 'import uuid;print(uuid.uuid4())')"
   blue "session_id (client tự sinh) = ${SESSION_ID}"
 
   sse_raw="$(mktemp)"
@@ -214,7 +222,7 @@ else
   # Ráp lại đúng cách: gom TOÀN BỘ text rồi mới parse marker (mục 6.4).
   # PYTHONIOENCODING cần thiết trên Git Bash/Windows, nơi stdout mặc định là
   # cp1252 và sẽ ném UnicodeEncodeError khi in tiếng Việt.
-  PYTHONIOENCODING=utf-8 python3 - "$sse_raw" <<'PY'
+  PYTHONIOENCODING=utf-8 "$PYTHON_BIN" - "$sse_raw" <<'PY'
 import json, re, sys
 
 raw = open(sys.argv[1], encoding="utf-8").read()
@@ -297,7 +305,7 @@ if [ -n "$SESSION_ID" ]; then
     "${WS}/chat/history?session_id=${SESSION_ID}" -H "$AUTH")"
   cat "$history_body"; echo
   [ "$history_code" = "200" ] || die "chat/history trả HTTP ${history_code} — mong đợi 200"
-  history_count="$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$history_body")"
+  history_count="$("$PYTHON_BIN" -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$history_body")"
   rm -f "$history_body"
   [ "$history_count" -ge 1 ] || die "chat/history không có message của session vừa chat"
   green "OK — history có ${history_count} message"
@@ -308,7 +316,7 @@ if [ -n "$SESSION_ID" ]; then
     "${WS}/chat/sessions" -H "$AUTH")"
   cat "$sessions_body"; echo
   [ "$sessions_code" = "200" ] || die "chat/sessions trả HTTP ${sessions_code} — mong đợi 200"
-  python3 -c 'import json,sys; sid=sys.argv[1]; data=json.load(sys.stdin); sys.exit(0 if any(row.get("id") == sid for row in data) else 1)' \
+  "$PYTHON_BIN" -c 'import json,sys; sid=sys.argv[1]; data=json.load(sys.stdin); sys.exit(0 if any(row.get("id") == sid for row in data) else 1)' \
     "$SESSION_ID" < "$sessions_body" \
     || die "chat/sessions không chứa session vừa chat"
   rm -f "$sessions_body"
@@ -320,7 +328,7 @@ if [ -n "$SESSION_ID" ]; then
     "${WS}/chat/sessions/${SESSION_ID}/messages" -H "$AUTH")"
   cat "$messages_body"; echo
   [ "$messages_code" = "200" ] || die "session messages trả HTTP ${messages_code} — mong đợi 200"
-  messages_count="$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$messages_body")"
+  messages_count="$("$PYTHON_BIN" -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$messages_body")"
   rm -f "$messages_body"
   [ "$messages_count" -ge 1 ] || die "session messages không có message vừa chat"
   green "OK — messages path có ${messages_count} message"
@@ -336,7 +344,7 @@ if [ -n "$SESSION_ID" ]; then
     "${WS}/chat/sessions/${SESSION_ID}/messages" -H "$AUTH")"
   [ "$after_session_code" = "200" ] \
     || die "đọc session đã xóa trả HTTP ${after_session_code} — mong đợi 200 []"
-  after_session_count="$(python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$after_session_body")"
+  after_session_count="$("$PYTHON_BIN" -c 'import json,sys; print(len(json.load(sys.stdin)))' < "$after_session_body")"
   rm -f "$after_session_body"
   [ "$after_session_count" -eq 0 ] || die "session đã xóa nhưng vẫn còn messages"
   green "OK — 204 và đọc lại trả []; session/messages đã sạch"

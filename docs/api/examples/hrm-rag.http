@@ -4,8 +4,8 @@
 # VS Code extension "REST Client".
 #
 # Biến lấy từ http-client.env.json — chọn environment `local` trước khi chạy.
-# {{workspaceId}} mặc định là alias `hrm`: server đang bật HRM_MODE sẽ resolve nó
-# về workspace đã ghim. Thay bằng UUID đầy đủ cũng chạy y hệt.
+# {{workspaceId}} là alias `hrm`: server đang bật HRM_MODE sẽ resolve nó
+# về workspace đã ghim.
 # Với VS Code REST Client, thay {{...}} bằng giá trị thật hoặc khai báo trong
 # settings.json (mục "rest-client.environmentVariables").
 #
@@ -189,31 +189,21 @@ GET {{baseUrl}}/workspaces/{{workspaceId}}/documents/{{documentId}}
 GET {{baseUrl}}/workspaces/{{workspaceId}}/documents/{{documentId}}
 Authorization: Bearer not-a-real-token
 
-### E3. Sai workspace -> 400 HRM_SCOPE_MISMATCH (chi khi HRM_MODE=true)
-GET {{baseUrl}}/workspaces/00000000-0000-0000-0000-000000000001/documents/{{documentId}}
+### E3. document_id khong ton tai -> 404 RESOURCE_NOT_FOUND
+GET {{baseUrl}}/workspaces/{{workspaceId}}/documents/{{missingDocumentId}}
 Authorization: Bearer {{accessToken}}
 
-### E4. document_id khong ton tai -> 404 RESOURCE_NOT_FOUND
-GET {{baseUrl}}/workspaces/{{workspaceId}}/documents/00000000-0000-0000-0000-000000000002
-Authorization: Bearer {{accessToken}}
-
-### E4b. Alias viet hoa -> KHONG resolve, 400 INVALID_REQUEST
-# Alias chi nhan dung chuoi thuong `hrm`. HRM / Hrm van la chuoi khong parse duoc
-# thanh UUID, nen tra ve 400 giong nhu truoc khi co alias.
-GET {{baseUrl}}/workspaces/HRM/documents/{{documentId}}
-Authorization: Bearer {{accessToken}}
-
-### E4c. Xoa bang token EMPLOYEE -> 404 RESOURCE_NOT_FOUND (khong phai 403)
+### E4. Xoa bang token EMPLOYEE -> 404 RESOURCE_NOT_FOUND (khong phai 403)
 # DELETE giau su ton tai giong het GET: khong co quyen va khong ton tai deu ra 404.
 DELETE {{baseUrl}}/workspaces/{{workspaceId}}/documents/{{documentId}}
 Authorization: Bearer {{employeeToken}}
 
-### E4d. Xoa bang token MANAGER -> 404 RESOURCE_NOT_FOUND (khong phai 403)
+### E5. Xoa bang token MANAGER -> 404 RESOURCE_NOT_FOUND (khong phai 403)
 # Phase 9 map MANAGER -> member. 404 la co chu dich de khong lo document co ton tai.
 DELETE {{baseUrl}}/workspaces/{{workspaceId}}/documents/{{documentId}}
 Authorization: Bearer {{managerToken}}
 
-### E5. message rong -> 400 INVALID_REQUEST
+### E6. message rong -> 400 INVALID_REQUEST
 POST {{baseUrl}}/workspaces/{{workspaceId}}/chat
 Authorization: Bearer {{accessToken}}
 Content-Type: application/json
@@ -223,7 +213,7 @@ Content-Type: application/json
   "message": "   "
 }
 
-### E6. Thieu field message -> 422 UNPROCESSABLE_ENTITY
+### E7. Thieu field message -> 422 UNPROCESSABLE_ENTITY
 POST {{baseUrl}}/workspaces/{{workspaceId}}/chat
 Authorization: Bearer {{accessToken}}
 Content-Type: application/json
@@ -232,14 +222,14 @@ Content-Type: application/json
   "session_id": "{{sessionId}}"
 }
 
-### E7. Sai Content-Type -> 415 UNSUPPORTED_MEDIA_TYPE
+### E8. Sai Content-Type -> 415 UNSUPPORTED_MEDIA_TYPE
 POST {{baseUrl}}/workspaces/{{workspaceId}}/chat
 Authorization: Bearer {{accessToken}}
 Content-Type: text/plain
 
 {"session_id":"{{sessionId}}","message":"xin chao"}
 
-### E8. Upload bang token EMPLOYEE seed mac dinh -> 403 CHATBOT_UPLOAD_PERMISSION_REQUIRED
+### E9. Upload bang token EMPLOYEE seed mac dinh -> 403 CHATBOT_UPLOAD_PERMISSION_REQUIRED
 # Token EMPLOYEE seed mac dinh khong co CHATBOT_UPLOAD_DOCUMENT.
 POST {{baseUrl}}/workspaces/{{workspaceId}}/documents/upload
 Authorization: Bearer {{employeeToken}}
@@ -252,7 +242,7 @@ Content-Type: text/markdown
 # tai lieu thu
 --RagBoundary--
 
-### E8b. Upload bang token MANAGER seed mac dinh -> 403 CHATBOT_UPLOAD_PERMISSION_REQUIRED
+### E10. Upload bang token MANAGER seed mac dinh -> 403 CHATBOT_UPLOAD_PERMISSION_REQUIRED
 # Token MANAGER seed mac dinh khong co CHATBOT_UPLOAD_DOCUMENT.
 POST {{baseUrl}}/workspaces/{{workspaceId}}/documents/upload
 Authorization: Bearer {{managerToken}}
@@ -265,12 +255,12 @@ Content-Type: text/markdown
 # tai lieu thu
 --RagBoundary--
 
-### E9. Sai HTTP method -> 405 METHOD_NOT_ALLOWED
+### E11. Sai HTTP method -> 405 METHOD_NOT_ALLOWED
 PUT {{baseUrl}}/workspaces/{{workspaceId}}/chat
 Authorization: Bearer {{accessToken}}
 Content-Type: application/json
 
 {}
 
-### E10. Route khong ton tai -> 404 RESOURCE_NOT_FOUND
+### E12. Route khong ton tai -> 404 RESOURCE_NOT_FOUND
 GET {{baseUrl}}/v1/health

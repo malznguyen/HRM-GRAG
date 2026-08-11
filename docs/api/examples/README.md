@@ -18,16 +18,15 @@ Cho **IntelliJ IDEA** (Tools → HTTP Client) hoặc **VS Code** + extension
 
 1. Mở `http-client.env.json`, điền `baseUrl`, `accessToken`, `managerToken` và
    `employeeToken`. `workspaceId` để
-   sẵn là alias `hrm` — server tự resolve về workspace đã ghim, không cần điền
-   UUID. Muốn gọi tường minh thì thay bằng UUID đầy đủ, vẫn chạy y hệt.
+   sẵn là alias `hrm` — server tự resolve về workspace đã ghim, không cần điền UUID.
 2. Mở `hrm-rag.http`, chọn environment `local` ở góc trên.
 3. Bấm ▶ bên trái từng request.
 
 Request 1–10 và 6a–6d là luồng chính (health → upload → poll → chat → history → xóa).
 Các route history luôn thao tác trên session của `userid` trong token; 6d xóa session
 và toàn bộ messages của nó. Request
-`E1`–`E10` là các case lỗi — chạy để xác nhận client HRM xử lý đúng từng mã lỗi.
-Các case `E4c`/`E4d` và `E8`/`E8b` chứng minh `MANAGER`/`EMPLOYEE` đều chỉ là
+`E1`–`E12` là các case lỗi — chạy để xác nhận client HRM xử lý đúng từng mã lỗi.
+Các case `E4`/`E5` và `E9`/`E10` chứng minh `MANAGER`/`EMPLOYEE` đều chỉ là
 workspace `member`: upload mặc định bị `403`, DELETE bị `404 RESOURCE_NOT_FOUND`.
 
 Request số 2 upload file `./fixtures/noi-quy-cong-ty.pdf`. Thư mục `fixtures/`
@@ -45,11 +44,8 @@ Chạy tuần tự luồng document/chat và kiểm tra kết quả từng bư�
 "hệ thống thông không" trước khi bắt tay viết code Java.
 
 ```bash
-export RAG_BASE_URL="http://127.0.0.1:18083"
+export RAG_BASE_URL="<RAG_BASE_URL>"
 export RAG_TOKEN="<token ADMIN/HR có CHATBOT_USE + CHATBOT_UPLOAD_DOCUMENT>"
-
-# Tuỳ chọn. Mặc định là alias "hrm"; đặt UUID đầy đủ nếu muốn gọi tường minh.
-export RAG_WORKSPACE_ID="hrm"
 
 ./smoke.sh                          # tự tạo file .md mẫu để upload
 ./smoke.sh /duong/dan/tai-lieu.pdf  # hoặc upload file của bạn
@@ -58,7 +54,7 @@ export RAG_WORKSPACE_ID="hrm"
 Smoke cần token `ADMIN` hoặc `HR`. Token `MANAGER`/`EMPLOYEE` chỉ đọc/chat được;
 upload nhận `403` và DELETE nhận `404` theo cơ chế che giấu sự tồn tại tài liệu.
 
-Cần `bash`, `curl`, `python3`. Không cần `jq`, không cài thêm gì.
+Cần `bash`, `curl`, Python 3 qua lệnh `python3` hoặc `python`. Không cần `jq`, không cài thêm gì.
 Chạy được trên Linux, macOS và Git Bash trên Windows.
 
 Script làm gì:
@@ -85,6 +81,6 @@ Kết thúc, script tự xóa session và tài liệu vừa tạo nên không đ
 - **Không commit token thật.** `http-client.env.json` chỉ chứa placeholder —
   giữ nguyên như vậy. Muốn dùng thật thì tạo `http-client.private.env.json`
   (IntelliJ tự ưu tiên file này và nó nằm trong `.gitignore` mặc định).
-- `smoke.sh` đọc token từ biến môi trường, không hard-code. Đừng sửa lại.
+- `smoke.sh` đọc URL/token từ biến môi trường và luôn gọi alias `hrm`, không hard-code. Đừng sửa lại.
 - Ví dụ trong `hrm-rag.http` dùng placeholder `REPLACE_WITH_...` — nếu thấy
   giá trị trông giống token thật trong diff thì đó là nhầm lẫn, phải revert.
