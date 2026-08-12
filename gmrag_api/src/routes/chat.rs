@@ -25,9 +25,10 @@ use crate::chat::deepseek::{DeepseekTokenParser, deepseek_stream_idle_timeout, n
 use crate::chat::retrieval::{StoredChatMessagePage, fetch_session_chat_messages};
 use crate::chat::{
     ChatPipelineError, SessionError, build_chat_context, delete_chat_session, ensure_chat_session,
-    filter_citation_ids_for_user, filter_citations_for_user, insert_chat_message,
-    list_user_chat_sessions, prepare_deepseek_stream, resolve_chunk_index_citations,
-    truncate_session_title, verify_chat_session_owner,
+    filter_citation_ids_for_user, filter_citations_for_allowed_ids, filter_citations_for_user,
+    insert_chat_message, list_user_chat_sessions, prepare_deepseek_stream,
+    resolve_chunk_index_citations, truncate_session_title, update_chat_session_title,
+    verify_chat_session_owner,
 };
 use crate::state::AppState;
 
@@ -35,6 +36,7 @@ const MAX_CITATION_IDS: usize = 64;
 const CITATION_SNIPPET_CHARS: usize = 280;
 const DEFAULT_CHAT_PAGE_LIMIT: i64 = 20;
 const MAX_CHAT_PAGE_LIMIT: i64 = 100;
+const MAX_SESSION_TITLE_CHARS: usize = 200;
 
 #[derive(Deserialize)]
 pub struct ChatHistoryQuery {
@@ -60,7 +62,7 @@ pub struct ChatHistoryMessageResponse {
     pub id: Uuid,
     pub role: String,
     pub content: String,
-    pub citations: Vec<Uuid>,
+    pub citations: Vec<HistoryCitation>,
     #[serde(serialize_with = "crate::utc_timestamp::serialize")]
     pub created_at: NaiveDateTime,
 }
@@ -77,6 +79,11 @@ pub struct ChatHistoryPageResponse {
 pub struct ChatRequest {
     pub session_id: Uuid,
     pub message: String,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateChatSessionTitleRequest {
+    pub title: String,
 }
 
 /// Danh sách chunk cần phân giải thành thông tin nguồn hiển thị.
@@ -99,6 +106,14 @@ pub struct ResolvedCitation {
     pub document_name: String,
     pub snippet: String,
     pub chunk_index: i32,
+}
+
+#[derive(Serialize)]
+pub struct HistoryCitation {
+    pub chunk_id: Uuid,
+    pub document_id: Uuid,
+    pub document_name: String,
+    pub snippet: String,
 }
 
 #[derive(Serialize)]
@@ -127,6 +142,37 @@ struct CitationHydrationRow {
     document_name: String,
     original_text: String,
     chunk_index: i32,
+}
+
+#[derive(Clone)]
+struct HydratedCitation {
+    chunk_id: Uuid,
+    document_id: Uuid,
+    document_name: String,
+    original_text: String,
+    snippet: String,
+    chunk_index: i32,
+}
+
+impl HydratedCitation {
+    fn into_resolved(self) -> ResolvedCitation {
+        ResolvedCitation {
+            chunk_id: self.chunk_id,
+            document_id: self.document_id,
+            document_name: self.document_name,
+            snippet: self.snippet,
+            chunk_index: self.chunk_index,
+        }
+    }
+
+    fn resolve_for_query(&self, query: Option<&str>) -> HistoryCitation {
+        HistoryCitation {
+            chunk_id: self.chunk_id,
+            document_id: self.document_id,
+            document_name: self.document_name.clone(),
+            snippet: select_citation_snippet(&self.original_text, query),
+        }
+    }
 }
 
 /// Phân giải citation theo lô và loại bỏ im lặng các chunk không thể xem.
@@ -161,8 +207,11 @@ pub async fn resolve_workspace_citations(
         }));
     }
 
-    let citations =
-        hydrate_citations(&state, workspace_id, &authz.user_id, allowed_ids, None).await?;
+    let citations = hydrate_citations(&state, workspace_id, &authz.user_id, allowed_ids, None)
+        .await?
+        .into_iter()
+        .map(HydratedCitation::into_resolved)
+        .collect();
     Ok(Json(ResolveCitationsResponse { citations }))
 }
 
@@ -227,7 +276,7 @@ async fn hydrate_citations(
     user_id: &str,
     allowed_ids: Vec<Uuid>,
     query: Option<&str>,
-) -> Result<Vec<ResolvedCitation>, ApiError> {
+) -> Result<Vec<HydratedCitation>, ApiError> {
     let rows: Vec<CitationHydrationRow> = sqlx::query_as(
         r#"
         SELECT
@@ -265,10 +314,11 @@ async fn hydrate_citations(
     Ok(allowed_ids
         .into_iter()
         .filter_map(|chunk_id| row_by_chunk.remove(&chunk_id))
-        .map(|row| ResolvedCitation {
+        .map(|row| HydratedCitation {
             chunk_id: row.chunk_id,
             document_id: row.document_id,
             document_name: row.document_name,
+            original_text: row.original_text.clone(),
             snippet: select_citation_snippet(&row.original_text, query),
             chunk_index: row.chunk_index,
         })
@@ -672,10 +722,7 @@ pub async fn get_workspace_chat_session_messages(
             match build_history_page_with_acl(&state, path.workspace_id, &authz.user_id, page).await
             {
                 Ok(page) => Json(page).into_response(),
-                Err(err) => {
-                    tracing::error!(error = %err, "Failed to filter citation ACL for session messages");
-                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                }
+                Err(err) => err.into_response(),
             }
         }
         Err(err) => {
@@ -715,6 +762,77 @@ pub async fn delete_workspace_chat_session(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+pub async fn patch_workspace_chat_session(
+    State(state): State<AppState>,
+    authz: Authz,
+    Path(path): Path<WorkspaceChatSessionPath>,
+    payload: Result<Json<UpdateChatSessionTitleRequest>, JsonRejection>,
+) -> impl IntoResponse {
+    if let Err(err) = authz
+        .require_relation(Relation::Member, &Object::Workspace(path.workspace_id))
+        .await
+    {
+        return err.into_response();
+    }
+
+    let Json(request) = match payload {
+        Ok(payload) => payload,
+        Err(_) => {
+            return ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "INVALID_REQUEST",
+                "title is required and must be a string",
+            )
+            .into_response();
+        }
+    };
+
+    let title = match validate_session_title(&request.title) {
+        Ok(title) => title,
+        Err(message) => {
+            return ApiError::new(StatusCode::BAD_REQUEST, "INVALID_REQUEST", message)
+                .into_response();
+        }
+    };
+
+    match update_chat_session_title(
+        &state.pool,
+        path.session_id,
+        path.workspace_id,
+        &authz.user_id,
+        &title,
+    )
+    .await
+    {
+        Ok(Some(session)) => Json(session).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(SessionError::Forbidden) => {
+            (StatusCode::FORBIDDEN, "Chat session not accessible").into_response()
+        }
+        Err(SessionError::Database(err)) => {
+            tracing::error!(error = %err, "Failed to update chat session title");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+fn validate_session_title(title: &str) -> Result<String, &'static str> {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return Err("title must not be empty");
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("title must not contain control characters");
+    }
+    if trimmed.chars().count() > MAX_SESSION_TITLE_CHARS {
+        return Err("title must contain at most 200 Unicode characters");
+    }
+
+    // HTML escaping is deliberately left to the client that renders this
+    // user-entered value; the API stores the trimmed Unicode string as-is.
+    Ok(trimmed.to_string())
 }
 
 pub async fn workspace_chat_history(
@@ -762,10 +880,7 @@ pub async fn workspace_chat_history(
         Ok(page) => {
             match build_history_page_with_acl(&state, workspace_id, &authz.user_id, page).await {
                 Ok(page) => Json(page).into_response(),
-                Err(err) => {
-                    tracing::error!(error = %err, "Failed to filter citation ACL for chat history");
-                    StatusCode::INTERNAL_SERVER_ERROR.into_response()
-                }
+                Err(err) => err.into_response(),
             }
         }
         Err(err) => {
@@ -1029,7 +1144,13 @@ pub async fn workspace_chat(
                 Vec::new()
             }
         };
-        let stream_citations = build_stream_citations(&citation_chunk_ids, hydrated_citations);
+        let stream_citations = build_stream_citations(
+            &citation_chunk_ids,
+            hydrated_citations
+                .into_iter()
+                .map(HydratedCitation::into_resolved)
+                .collect(),
+        );
         for payload in terminal_sse_events(stream_citations, session_id) {
             yield Ok::<Event, Infallible>(
                 Event::default().event(payload.event).data(payload.data),
@@ -1073,19 +1194,61 @@ async fn build_history_page_with_acl(
     workspace_id: Uuid,
     user_id: &str,
     page: StoredChatMessagePage,
-) -> Result<ChatHistoryPageResponse, ChatPipelineError> {
-    let mut messages = Vec::with_capacity(page.messages.len());
+) -> Result<ChatHistoryPageResponse, ApiError> {
+    // Read-time ACL is intentionally performed once for the union of all IDs
+    // on this page. The hydrated rows are then indexed and projected back to
+    // each message, so a page of 100 messages does not cause 100 hydration
+    // queries (or one query per citation).
+    let (page_chunk_ids, query_by_message_id) = history_citation_plan(&page.messages);
 
+    let allowed_ids = filter_citation_ids_for_user(
+        &state.pool,
+        &state.authz_client,
+        workspace_id,
+        user_id,
+        &page_chunk_ids,
+    )
+    .await
+    .map_err(|err| {
+        tracing::error!(error = %err, "Failed to re-check history citation ACL");
+        ApiError::from_status(StatusCode::INTERNAL_SERVER_ERROR)
+    })?;
+
+    // `hydrate_citations` remains the single source of document metadata and
+    // applies the same missing-row behavior as SSE/resolve. Passing `None`
+    // here gives us the raw prefix as a fallback while retaining the original
+    // text internally so each assistant message can select its own snippet.
+    let hydrated = if allowed_ids.is_empty() {
+        Vec::new()
+    } else {
+        hydrate_citations(state, workspace_id, user_id, allowed_ids, None).await?
+    };
+    let hydrated_by_chunk = hydrated
+        .into_iter()
+        .map(|citation| (citation.chunk_id, citation))
+        .collect::<HashMap<_, _>>();
+    let hydrated_ids = hydrated_by_chunk.keys().copied().collect::<Vec<_>>();
+
+    let mut messages = Vec::with_capacity(page.messages.len());
     for row in page.messages {
-        let (content, citations) = filter_citations_for_user(
-            &state.pool,
-            &state.authz_client,
-            workspace_id,
-            user_id,
-            &row.content,
-            &row.citations.0,
-        )
-        .await?;
+        let (content, visible_ids) = if row.role == "assistant" {
+            filter_citations_for_allowed_ids(&row.content, &row.citations.0, &hydrated_ids)
+        } else {
+            (row.content.clone(), Vec::new())
+        };
+        let query = query_by_message_id.get(&row.id).map(String::as_str);
+        let citations = if row.role == "assistant" {
+            visible_ids
+                .into_iter()
+                .filter_map(|chunk_id| {
+                    hydrated_by_chunk
+                        .get(&chunk_id)
+                        .map(|citation| citation.resolve_for_query(query))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         messages.push(ChatHistoryMessageResponse {
             id: row.id,
@@ -1102,6 +1265,28 @@ async fn build_history_page_with_acl(
         limit: page.limit,
         offset: page.offset,
     })
+}
+
+fn history_citation_plan(
+    rows: &[crate::chat::retrieval::StoredChatMessage],
+) -> (Vec<Uuid>, HashMap<Uuid, String>) {
+    let mut page_chunk_ids = Vec::new();
+    let mut seen_page_chunk_ids = HashSet::new();
+    let mut query_by_message_id = HashMap::new();
+
+    for (index, row) in rows.iter().enumerate() {
+        for chunk_id in &row.citations.0 {
+            if seen_page_chunk_ids.insert(*chunk_id) {
+                page_chunk_ids.push(*chunk_id);
+            }
+        }
+
+        if row.role == "assistant" && index > 0 && rows[index - 1].role == "user" {
+            query_by_message_id.insert(row.id, rows[index - 1].content.clone());
+        }
+    }
+
+    (page_chunk_ids, query_by_message_id)
 }
 
 fn chat_pipeline_error_response(err: ChatPipelineError) -> axum::response::Response {
@@ -1157,6 +1342,79 @@ mod tests {
             assert_eq!(err.status, StatusCode::BAD_REQUEST);
             assert_eq!(err.code, "INVALID_REQUEST");
         }
+    }
+
+    #[test]
+    fn session_title_validation_trims_unicode_and_counts_characters() {
+        assert_eq!(
+            validate_session_title("  Hỏi về nghỉ phép  ").unwrap(),
+            "Hỏi về nghỉ phép"
+        );
+        assert!(validate_session_title(&"đ".repeat(MAX_SESSION_TITLE_CHARS)).is_ok());
+        assert!(validate_session_title(&"đ".repeat(MAX_SESSION_TITLE_CHARS + 1)).is_err());
+    }
+
+    #[test]
+    fn session_title_validation_rejects_empty_and_control_characters() {
+        for title in ["", "   ", "một\ndòng", "một\tdòng", "một\rdòng"] {
+            let error = validate_session_title(title).unwrap_err();
+            assert!(!error.is_empty());
+        }
+    }
+
+    #[test]
+    fn history_citation_plan_deduplicates_ids_and_uses_immediately_previous_user_query() {
+        let first_chunk = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let second_chunk = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let rows = vec![
+            crate::chat::retrieval::StoredChatMessage {
+                id: Uuid::new_v4(),
+                role: "user".to_string(),
+                content: "Câu hỏi thứ nhất".to_string(),
+                citations: sqlx::types::Json(Vec::new()),
+                created_at: chrono::NaiveDateTime::MIN,
+            },
+            crate::chat::retrieval::StoredChatMessage {
+                id: Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap(),
+                role: "assistant".to_string(),
+                content: "Trả lời thứ nhất".to_string(),
+                citations: sqlx::types::Json(vec![first_chunk]),
+                created_at: chrono::NaiveDateTime::MIN,
+            },
+            crate::chat::retrieval::StoredChatMessage {
+                id: Uuid::new_v4(),
+                role: "user".to_string(),
+                content: "Câu hỏi thứ hai".to_string(),
+                citations: sqlx::types::Json(Vec::new()),
+                created_at: chrono::NaiveDateTime::MIN,
+            },
+            crate::chat::retrieval::StoredChatMessage {
+                id: Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap(),
+                role: "assistant".to_string(),
+                content: "Trả lời thứ hai".to_string(),
+                citations: sqlx::types::Json(vec![first_chunk, second_chunk, first_chunk]),
+                created_at: chrono::NaiveDateTime::MIN,
+            },
+        ];
+
+        let (chunk_ids, queries) = history_citation_plan(&rows);
+        assert_eq!(chunk_ids, vec![first_chunk, second_chunk]);
+        assert_eq!(queries[&rows[1].id], "Câu hỏi thứ nhất");
+        assert_eq!(queries[&rows[3].id], "Câu hỏi thứ hai");
+    }
+
+    #[test]
+    fn history_citation_plan_has_no_query_for_an_assistant_at_page_start() {
+        let row = crate::chat::retrieval::StoredChatMessage {
+            id: Uuid::new_v4(),
+            role: "assistant".to_string(),
+            content: "Trả lời ở đầu trang".to_string(),
+            citations: sqlx::types::Json(Vec::new()),
+            created_at: chrono::NaiveDateTime::MIN,
+        };
+
+        let (_, queries) = history_citation_plan(&[row]);
+        assert!(queries.is_empty());
     }
 
     #[test]

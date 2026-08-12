@@ -343,6 +343,24 @@ pub async fn filter_citations_for_user(
     let allowed =
         filter_citation_ids_for_user(pool, authz_client, workspace_id, user_id, citations).await?;
 
+    Ok(filter_citations_for_allowed_ids(
+        assistant_text,
+        citations,
+        &allowed,
+    ))
+}
+
+/// Applies the read-time ACL result to one persisted assistant message.
+///
+/// History callers pass the union of all citation IDs from the page to
+/// `filter_citation_ids_for_user` once, then use this pure projection for each
+/// message. This preserves the marker-removal behavior without issuing one
+/// authorization query per message.
+pub fn filter_citations_for_allowed_ids(
+    assistant_text: &str,
+    citations: &[Uuid],
+    allowed: &[Uuid],
+) -> (String, Vec<Uuid>) {
     let allowed_set: HashSet<Uuid> = allowed.iter().copied().collect();
     let mut sanitized = assistant_text.to_string();
     for citation in citations {
@@ -354,7 +372,15 @@ pub async fn filter_citations_for_user(
         sanitized = sanitized.replace(&marker, "");
     }
 
-    Ok((sanitized, allowed))
+    let mut visible = Vec::new();
+    let mut seen = HashSet::new();
+    for citation in citations {
+        if allowed_set.contains(citation) && seen.insert(*citation) {
+            visible.push(*citation);
+        }
+    }
+
+    (sanitized, visible)
 }
 
 async fn recheck_retrieved_chunks(
@@ -686,6 +712,35 @@ pub async fn delete_chat_session(
     Ok(result.rows_affected() > 0)
 }
 
+pub async fn update_chat_session_title(
+    pool: &PgPool,
+    session_id: Uuid,
+    workspace_id: Uuid,
+    user_id: &str,
+    title: &str,
+) -> Result<Option<ChatSessionSummary>, SessionError> {
+    match verify_chat_session_owner(pool, session_id, workspace_id, user_id).await? {
+        true => {}
+        false => return Ok(None),
+    }
+
+    sqlx::query_as(
+        r#"
+        UPDATE chat_sessions
+        SET title = $4
+        WHERE id = $1 AND workspace_id = $2 AND user_id = $3
+        RETURNING id, title, created_at
+        "#,
+    )
+    .bind(session_id)
+    .bind(workspace_id)
+    .bind(user_id)
+    .bind(title)
+    .fetch_optional(pool)
+    .await
+    .map_err(SessionError::Database)
+}
+
 pub async fn insert_chat_message(
     pool: &PgPool,
     session_id: Uuid,
@@ -751,5 +806,22 @@ mod tests {
         let text = format!("One.[chunk:{u1}] Two.[chunk:{u1}]");
 
         assert_eq!(extract_chunk_citations(&text), vec![u1]);
+    }
+
+    #[test]
+    fn filter_citations_for_allowed_ids_removes_hidden_markers_and_deduplicates_output() {
+        let visible = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let hidden = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let text =
+            format!("Visible.[chunk:{visible}] Hidden.[chunk:{hidden}] Again.[chunk:{visible}]");
+
+        let (sanitized, citations) =
+            filter_citations_for_allowed_ids(&text, &[visible, hidden, visible], &[visible]);
+
+        assert_eq!(
+            sanitized,
+            format!("Visible.[chunk:{visible}] Hidden. Again.[chunk:{visible}]")
+        );
+        assert_eq!(citations, vec![visible]);
     }
 }
