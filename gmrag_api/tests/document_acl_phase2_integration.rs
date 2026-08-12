@@ -941,14 +941,14 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
         .find(|msg| msg.get("role").and_then(Value::as_str) == Some("assistant"))
         .cloned()
         .unwrap();
-    let citations = assistant_msg["citations"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|value| value.as_str().map(str::to_string))
-        .collect::<Vec<_>>();
-    assert_eq!(citations, vec![public_chunk_id.to_string()]);
+    let citations = assistant_msg["citations"].as_array().unwrap();
+    assert_eq!(citations.len(), 1);
+    let citation_object = citations[0].as_object().unwrap();
+    assert_eq!(citation_object.len(), 4);
+    for key in ["chunk_id", "document_id", "document_name", "snippet"] {
+        assert!(citation_object.contains_key(key));
+    }
+    assert_eq!(citations[0]["chunk_id"], public_chunk_id.to_string());
     let assistant_content = assistant_msg["content"].as_str().unwrap_or_default();
     assert!(!assistant_content.contains("secret beta content"));
 }
@@ -1139,6 +1139,80 @@ async fn chat_history_pagination_is_stable_complete_and_owner_scoped() {
     );
 
     let message_session = expected_session_ids[0];
+
+    let renamed = client
+        .patch(format!(
+            "{}/workspaces/{workspace_id}/chat/sessions/{message_session}",
+            server.addr
+        ))
+        .bearer_auth(&user_a)
+        .json(&json!({ "title": "  Chính sách nghỉ phép  " }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(renamed.status(), reqwest::StatusCode::OK);
+    let renamed: Value = renamed.json().await.unwrap();
+    assert_eq!(renamed["id"], message_session.to_string());
+    assert_eq!(renamed["title"], "Chính sách nghỉ phép");
+
+    let idempotent = client
+        .patch(format!(
+            "{}/workspaces/{workspace_id}/chat/sessions/{message_session}",
+            server.addr
+        ))
+        .bearer_auth(&user_a)
+        .json(&json!({ "title": "Chính sách nghỉ phép" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(idempotent.status(), reqwest::StatusCode::OK);
+
+    for invalid_title in [
+        json!({}),
+        json!({ "title": 42 }),
+        json!({ "title": "   " }),
+        json!({ "title": "một\ndòng" }),
+    ] {
+        let invalid = client
+            .patch(format!(
+                "{}/workspaces/{workspace_id}/chat/sessions/{message_session}",
+                server.addr
+            ))
+            .bearer_auth(&user_a)
+            .json(&invalid_title)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+        let error: Value = invalid.json().await.unwrap();
+        assert_eq!(error["error"]["code"], "INVALID_REQUEST");
+    }
+
+    let other_owner = client
+        .patch(format!(
+            "{}/workspaces/{workspace_id}/chat/sessions/{message_session}",
+            server.addr
+        ))
+        .bearer_auth(&user_b)
+        .json(&json!({ "title": "Không được sửa" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(other_owner.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let missing_title_session = Uuid::new_v4();
+    let missing_title = client
+        .patch(format!(
+            "{}/workspaces/{workspace_id}/chat/sessions/{missing_title_session}",
+            server.addr
+        ))
+        .bearer_auth(&user_a)
+        .json(&json!({ "title": "Không tồn tại" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_title.status(), reqwest::StatusCode::NOT_FOUND);
+
     for index in 0..7 {
         sqlx::query(
             r#"
