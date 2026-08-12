@@ -519,7 +519,10 @@ paths:
            the captured stream, `[chunk:1]` arrived as six separate events:
            `[`, `ch`, `unk`, `:`, `1`, `]`. Concatenate the full answer before
            running any marker regex. Never parse per event.
-        3. `citations[].index` is the `N` in `[chunk:N]`, and it is 1-based.
+        3. `citations[].index` is the `N` in `[chunk:N]`, and it is 1-based. The
+           `citations` event is the retrieved candidate set (up to the current
+           `QDRANT_TOP_K=5`), not the cited set. Clients must filter it by the
+           markers found in the fully concatenated answer before showing sources.
 
         Ordering is guaranteed: text events, then exactly one `citations` event
         (with an empty array when nothing was retrieved), then exactly one
@@ -1704,9 +1707,14 @@ components:
       type: object
       description: |
         Payload of the single named `citations` event. Always sent, even when the
-        array is empty. Entries appear in retrieval order and cover only the
-        chunks the caller is allowed to see, so an index present in the answer
-        text may be absent here.
+        array is empty. The array is the retrieved candidate set for the question,
+        not the set of chunks cited by the generated answer. Entries appear in
+        retrieval order and cover only the chunks the caller is allowed to see;
+        the current `QDRANT_TOP_K` default is 5, so the array has at most 5 entries
+        before any smaller post-retrieval ACL result. Clients must concatenate all
+        unnamed answer events, find every `[chunk:N]` marker, and filter this array
+        by `index` before displaying sources. An answer with no marker must display
+        no source section, even if this array is non-empty.
       required: [citations]
       additionalProperties: false
       properties:

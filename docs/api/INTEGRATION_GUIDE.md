@@ -931,9 +931,14 @@ event: citations       ← LUÔN CÓ, đúng một lần
 event: done            ← LUÔN CÓ, đúng một lần, cuối cùng
 ```
 
-- `citations` **luôn được gửi**, kể cả khi không tìm thấy đoạn nào — khi đó là
-  mảng rỗng `{"citations":[]}`. Đừng viết code kiểu "không có citations thì
-  không có event citations".
+- `citations` **luôn được gửi**, kể cả khi không có đoạn nào sau retrieval/ACL —
+  khi đó là mảng rỗng `{"citations":[]}`. Khi có đoạn được truy xuất, mảng này
+  là **retrieved set** (các đoạn ứng viên đã truy xuất cho câu hỏi), **không phải
+  cited set** (các đoạn thật sự được LLM dùng và đánh marker trong câu trả lời).
+  Với cấu hình hiện tại, retrieved set có tối đa **5** phần tử (`QDRANT_TOP_K=5`);
+  ACL có thể làm số lượng thực tế ít hơn. Đừng viết code kiểu "không có citations
+  thì không có event citations", và **không hiển thị toàn bộ mảng này thành
+  'Nguồn tham khảo'**.
 - `done` luôn là event cuối. Nhận được `done` là biết stream đã xong bình thường.
 - Nếu kết nối đứt mà chưa thấy `done` → coi là lỗi, không phải kết thúc.
 
@@ -987,7 +992,23 @@ Nó **không** chứa thống kê token, thời gian xử lý hay thông tin gì
 > Ví dụ: mảng có thể là `[{index: 2}, {index: 4}]`. Phải tra cứu theo giá trị
 > `index`, tuyệt đối không dùng `citations.get(i)`.
 
-Hệ quả: câu trả lời có thể chứa `[chunk:3]` mà trong `citations` **không có**
+Quy trình đúng để hiển thị nguồn:
+
+1. Ráp toàn bộ text từ các event không tên theo đúng thứ tự nhận được.
+2. Tìm mọi marker `[chunk:N]` trong text đã ráp bằng regex `\[chunk:(\d+)\]`.
+3. Chỉ hiển thị citation có `index` nằm trong tập `N` tìm được; đây mới là cited set
+   cần trình bày cho người dùng.
+4. Nếu không tìm thấy marker nào thì không hiển thị mục nguồn.
+
+Marker có thể bị cắt qua nhiều SSE event, vì vậy **bắt buộc ráp text trước khi parse**.
+
+Ví dụ câu hỏi ngoài phạm vi: text chỉ là `Tôi không tìm thấy thông tin này trong
+các tài liệu bạn có quyền truy cập.` và không có marker nào, nhưng event `citations`
+có thể vẫn chứa 4 citation đã truy xuất (hoặc số lượng khác, tối đa 5). Nếu hiển thị
+cả 4 citation thành nguồn tham khảo thì người dùng sẽ hiểu nhầm rằng câu từ chối đã
+dựa trên các nguồn đó; client phải hiển thị 0 nguồn.
+
+Hệ quả khác: câu trả lời có thể chứa `[chunk:3]` mà trong `citations` **không có**
 `index = 3`. Xảy ra khi đoạn đó bị lọc vì phân quyền, hoặc khi LLM bịa ra số
 không tồn tại. **HRM phải xử lý được marker không map được** — cách an toàn là
 xóa marker đó khỏi text hiển thị.
@@ -1054,9 +1075,18 @@ data: df093a48-ed78-4109-ac96-a75be34ab35c
 ### 6.9 Pseudocode xử lý phía Java
 
 ```java
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
 // ---- Trạng thái tích luỹ trong suốt stream ----
 StringBuilder answerBuffer = new StringBuilder();   // gom TẤT CẢ text
-List<Citation> citations   = new ArrayList<>();
+List<Citation> retrievedCitations = new ArrayList<>();
 String         sessionId   = null;
 boolean        completed   = false;
 String         streamError = null;
@@ -1074,7 +1104,8 @@ for (ServerSentEvent event : stream) {
         // nhưng KHÔNG được thay marker ở bước này.
 
     } else if (name.equals("citations")) {
-        citations = objectMapper
+        // Đây là retrieved set, không phải danh sách nguồn đã được dùng.
+        retrievedCitations = objectMapper
             .readValue(event.data(), CitationsEnvelope.class)
             .citations();
 
@@ -1092,7 +1123,19 @@ if (!completed) {
 }
 
 // ---- Chỉ tới ĐÂY mới được parse marker ----
-String finalAnswer = renderCitations(answerBuffer.toString(), citations);
+String answerText = answerBuffer.toString();
+Set<Integer> citedIndexes = new HashSet<>();
+Matcher markerScan = CHUNK_MARKER.matcher(answerText);
+while (markerScan.find()) {
+    citedIndexes.add(Integer.parseInt(markerScan.group(1)));
+}
+
+// Lọc retrieved set theo đúng các marker thực sự xuất hiện trong answer.
+List<Citation> citedCitations = retrievedCitations.stream()
+    .filter(citation -> citedIndexes.contains(citation.index()))
+    .toList();
+
+String finalAnswer = renderCitations(answerText, citedCitations);
 
 
 // ---- Thay marker bằng link ----

@@ -32,7 +32,7 @@ khi có server chính thức, team RAG sẽ cung cấp base URL cố định.
 3. [`openapi.yaml`](./openapi.yaml) — spec nguồn để import vào công cụ khác khi cần.
 4. [`examples/`](./examples/) — có file `.http` và `smoke.sh` để chạy thử ngay.
 
-## Bốn điều cần biết trước khi bắt đầu
+## Năm điều cần biết trước khi bắt đầu
 
 1. Corpus đang **rỗng có chủ đích**. Phải upload tài liệu công ty đã được phê
    duyệt trước khi cho nhân viên sử dụng. Khi chưa có tài liệu, bot trả lời rằng
@@ -47,6 +47,9 @@ khi có server chính thức, team RAG sẽ cung cấp base URL cố định.
    Ba route GET dùng `limit`/`offset` (mặc định `20/0`, `limit` tối đa `100`) và trả
    page object có `sessions` hoặc `messages`, cùng `total`, `limit`, `offset`. Xóa
    session xóa luôn messages nhờ `ON DELETE CASCADE`.
+5. Cảnh báo citation: `event: citations` là toàn bộ retrieved set (tối đa 5), không
+   phải các nguồn đã được câu trả lời dùng; client phải lọc theo marker `[chunk:N]`
+   sau khi ráp toàn bộ text SSE rồi mới hiển thị nguồn.
 
 | Role | Đọc/Chat | Upload | Xóa |
 |---|---|---|---|
