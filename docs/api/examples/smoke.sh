@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Smoke test end-to-end cho phần API mà HRM tích hợp.
-# Chạy end-to-end: health -> upload -> poll -> chat -> 4 route history -> cleanup.
+# Chạy end-to-end: health -> upload -> poll -> chat -> history -> rename -> cleanup.
 #
 # Cách dùng:
 #   export RAG_BASE_URL="<RAG_BASE_URL>"
@@ -72,7 +72,7 @@ WS="${BASE_URL}/workspaces/${WORKSPACE_ID}"
 AUTH="Authorization: Bearer ${TOKEN}"
 
 # ---------------------------------------------------------------- 1. health
-step "1/9  Health check"
+step "1/10  Health check"
 
 health_body="$(curl -sS --max-time 10 "${BASE_URL}/health")" \
   || die "không gọi được ${BASE_URL}/health — API có đang chạy và có gọi được từ máy này không?"
@@ -297,20 +297,36 @@ PY
   [ "$chat_rc" -eq 0 ] && green "OK — chat stream hợp lệ" || red "Chat stream có vấn đề"
 fi
 
-# ------------------------------------------------------- 5-8. chat history
+# ------------------------------------------------------- 5-9. chat history + rename
 if [ -n "$SESSION_ID" ]; then
-  step "5/9  Đọc history bằng query session_id"
+  step "5/10  Đọc history bằng query session_id"
   history_body="$(mktemp)"
   history_code="$(curl -sS -o "$history_body" -w '%{http_code}' \
     "${WS}/chat/history?session_id=${SESSION_ID}&limit=20&offset=0" -H "$AUTH")"
   cat "$history_body"; echo
   [ "$history_code" = "200" ] || die "chat/history trả HTTP ${history_code} — mong đợi 200"
-  history_count="$("$PYTHON_BIN" -c 'import json,sys; data=json.load(sys.stdin); assert data["limit"] == 20 and data["offset"] == 0 and data["total"] >= len(data["messages"]); print(len(data["messages"]))' < "$history_body")"
+  history_count="$("$PYTHON_BIN" - "$history_body" <<'PY'
+import json, re, sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+assert data["limit"] == 20 and data["offset"] == 0 and data["total"] >= len(data["messages"])
+for message in data["messages"]:
+    if message["role"] == "user":
+        assert message["citations"] == []
+        continue
+    citation_ids = {citation["chunk_id"] for citation in message["citations"]}
+    assert all(set(citation) == {"chunk_id", "document_id", "document_name", "snippet"}
+               for citation in message["citations"])
+    marker_ids = set(re.findall(r"\[chunk:([0-9a-fA-F-]{36})\]", message["content"]))
+    assert marker_ids == citation_ids
+print(len(data["messages"]))
+PY
+)"
   rm -f "$history_body"
   [ "$history_count" -ge 1 ] || die "chat/history không có message của session vừa chat"
   green "OK — history có ${history_count} message"
 
-  step "6/9  Liệt kê session của user hiện tại"
+  step "6/10  Liệt kê session của user hiện tại"
   sessions_body="$(mktemp)"
   sessions_code="$(curl -sS -o "$sessions_body" -w '%{http_code}' \
     "${WS}/chat/sessions?limit=20&offset=0" -H "$AUTH")"
@@ -322,7 +338,21 @@ if [ -n "$SESSION_ID" ]; then
   rm -f "$sessions_body"
   green "OK — tìm thấy session hiện tại trong danh sách"
 
-  step "7/9  Đọc messages bằng path session_id"
+  step "7/10  Đổi tiêu đề session bằng PATCH"
+  title_body="$(mktemp)"
+  title_code="$(curl -sS -o "$title_body" -w '%{http_code}' \
+    -X PATCH "${WS}/chat/sessions/${SESSION_ID}" \
+    -H "$AUTH" -H 'Content-Type: application/json' \
+    --data '{"title":"Hỏi về chính sách làm thêm giờ"}')"
+  cat "$title_body"; echo
+  [ "$title_code" = "200" ] || die "PATCH title trả HTTP $title_code — mong đợi 200"
+  "$PYTHON_BIN" -c 'import json,sys; data=json.load(sys.stdin); assert data["id"] == sys.argv[1] and data["title"] == "Hỏi về chính sách làm thêm giờ"' \
+    "$SESSION_ID" < "$title_body" \
+    || die "PATCH title không trả session đã cập nhật"
+  rm -f "$title_body"
+  green "OK — title Unicode được cập nhật"
+
+  step "8/10  Đọc messages bằng path session_id"
   messages_body="$(mktemp)"
   messages_code="$(curl -sS -o "$messages_body" -w '%{http_code}' \
     "${WS}/chat/sessions/${SESSION_ID}/messages?limit=20&offset=0" -H "$AUTH")"
@@ -333,7 +363,7 @@ if [ -n "$SESSION_ID" ]; then
   [ "$messages_count" -ge 1 ] || die "session messages không có message vừa chat"
   green "OK — messages path có ${messages_count} message"
 
-  step "8/9  Xóa session và xác nhận CASCADE messages"
+  step "9/10  Xóa session và xác nhận CASCADE messages"
   session_delete_code="$(curl -sS -o /dev/null -w '%{http_code}' \
     -X DELETE "${WS}/chat/sessions/${SESSION_ID}" -H "$AUTH")"
   [ "$session_delete_code" = "204" ] \
@@ -350,8 +380,8 @@ if [ -n "$SESSION_ID" ]; then
   green "OK — 204 và đọc lại trả page rỗng; session/messages đã sạch"
 fi
 
-# ---------------------------------------------------------------- 9. delete document
-step "9/9  Xóa tài liệu"
+# ---------------------------------------------------------------- 10. delete document
+step "10/10  Xóa tài liệu"
 
 del_code="$(curl -sS -o /dev/null -w '%{http_code}' \
   -X DELETE "${WS}/documents/${DOCUMENT_ID}" -H "$AUTH")"

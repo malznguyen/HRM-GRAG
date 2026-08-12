@@ -42,11 +42,13 @@ khi có server chính thức, team RAG sẽ cung cấp base URL cố định.
    `403 CHATBOT_UPLOAD_PERMISSION_REQUIRED` khi upload.
 3. `MANAGER` và `EMPLOYEE` không được xóa. DELETE trả `404 RESOURCE_NOT_FOUND`
    thay vì `403` là có chủ đích để không tiết lộ tài liệu có tồn tại hay không.
-4. Lịch sử chat đã có API list/read/delete. Mỗi token chỉ thấy và xóa session gắn
-   với chính `userid` của token; kể cả `ADMIN`/`HR` cũng không đọc/xóa thay user khác.
-   Ba route GET dùng `limit`/`offset` (mặc định `20/0`, `limit` tối đa `100`) và trả
-   page object có `sessions` hoặc `messages`, cùng `total`, `limit`, `offset`. Xóa
-   session xóa luôn messages nhờ `ON DELETE CASCADE`.
+4. Lịch sử chat đã có API list/read/rename/delete. Mỗi token chỉ thấy, đổi title và
+   xóa session gắn với chính `userid` của token; kể cả `ADMIN`/`HR` cũng không đọc,
+   sửa hoặc xóa thay user khác. Ba route GET dùng `limit`/`offset` (mặc định `20/0`,
+   `limit` tối đa `100`) và trả page object có `sessions` hoặc `messages`, cùng
+   `total`, `limit`, `offset`. History trả citation object gồm `chunk_id`,
+   `document_id`, `document_name`, `snippet` và không cần gọi `/citations/resolve`;
+   xóa session xóa luôn messages nhờ `ON DELETE CASCADE`.
 5. Cảnh báo citation: `event: citations` là toàn bộ retrieved set (tối đa 5), không
    phải các nguồn đã được câu trả lời dùng; client phải lọc theo marker `[chunk:N]`
    sau khi ráp toàn bộ text SSE rồi mới hiển thị nguồn.

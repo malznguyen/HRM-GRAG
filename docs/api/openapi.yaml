@@ -746,7 +746,12 @@ paths:
         Messages are paginated with `limit`/`offset` and returned oldest first,
         with UUID as the stable timestamp tiebreaker. Citation ACL is re-checked
         at read time. Inaccessible chunk UUIDs and their stored UUID markers are
-        removed from the returned message.
+        removed from the returned message. Assistant citations are hydrated in
+        one batch for the whole page and contain `chunk_id`, `document_id`,
+        `document_name` and a query-centered `snippet`; history does not include
+        the stream-only `index` field. A snippet is centered on the user message
+        immediately preceding that assistant message. If that question is not
+        present on the page, the snippet falls back to the beginning of the chunk.
       parameters:
         - $ref: "#/components/parameters/WorkspaceId"
         - name: session_id
@@ -778,7 +783,11 @@ paths:
                       - id: 57b3e448-11c7-48ab-8e36-0f6957235522
                         role: assistant
                         content: "Giờ làm việc là 08:00–17:00.[chunk:3f601309-1f9e-4f88-9f16-1077bb849460]"
-                        citations: [3f601309-1f9e-4f88-9f16-1077bb849460]
+                        citations:
+                          - chunk_id: 3f601309-1f9e-4f88-9f16-1077bb849460
+                            document_id: 69f56ad1-f379-4705-9eb4-f58cbd269420
+                            document_name: noi-quy-cong-ty-smoke.md
+                            snippet: "…Điều 12. Thời giờ làm việc…"
                         created_at: "2026-08-10T07:15:43.601842Z"
                     total: 42
                     limit: 20
@@ -889,6 +898,10 @@ paths:
         `member` plus exact session ownership, no admin override, no
         `CHATBOT_USE` check, `limit`/`offset` pagination, oldest message first
         with UUID as tiebreaker, and citation ACL re-checking at read time.
+        History citations are rich four-field objects (without the stream-only
+        `index`) and are hydrated once for the complete page. Each assistant
+        snippet is selected using the immediately preceding user message on that
+        page; an unavailable question uses the beginning-of-chunk fallback.
       parameters:
         - $ref: "#/components/parameters/WorkspaceId"
         - $ref: "#/components/parameters/SessionId"
@@ -912,7 +925,11 @@ paths:
                       - id: 57b3e448-11c7-48ab-8e36-0f6957235522
                         role: assistant
                         content: "Giờ làm việc là 08:00–17:00.[chunk:3f601309-1f9e-4f88-9f16-1077bb849460]"
-                        citations: [3f601309-1f9e-4f88-9f16-1077bb849460]
+                        citations:
+                          - chunk_id: 3f601309-1f9e-4f88-9f16-1077bb849460
+                            document_id: 69f56ad1-f379-4705-9eb4-f58cbd269420
+                            document_name: noi-quy-cong-ty-smoke.md
+                            snippet: "…Điều 12. Thời giờ làm việc…"
                         created_at: "2026-08-10T07:15:43.601842Z"
                     total: 42
                     limit: 20
@@ -948,6 +965,71 @@ paths:
         "500": { $ref: "#/components/responses/InternalError" }
 
   /workspaces/{workspace_id}/chat/sessions/{session_id}:
+    patch:
+      tags: [Chat history]
+      operationId: updateWorkspaceChatSessionTitle
+      summary: Rename a session owned by the current token subject
+      description: |
+        Requires workspace `member` and exact session ownership, using the same
+        owner-only check and error behavior as `DELETE` on this path. There is no
+        admin override and no `CHATBOT_USE` check. The server trims leading and
+        trailing whitespace, rejects an empty result, rejects all Unicode control
+        characters so the title remains one line, and accepts at most 200 Unicode
+        characters (not bytes). The server stores the value as user input without
+        HTML escaping; clients must escape it when rendering.
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - $ref: "#/components/parameters/SessionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateChatSessionTitleRequest"
+            example:
+              title: Hỏi về chính sách làm thêm giờ
+      responses:
+        "200":
+          description: Updated session summary.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatSessionSummary" }
+              example:
+                id: df093a48-ed78-4109-ac96-a75be34ab35c
+                title: Hỏi về chính sách làm thêm giờ
+                created_at: "2026-08-10T07:15:42.120314Z"
+        "400":
+          description: >-
+            `INVALID_REQUEST` for malformed JSON, missing/non-string `title`, an
+            empty or whitespace-only title, a control character, or a title over
+            200 Unicode characters. `HRM_SCOPE_MISMATCH` may also apply to the path.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                invalidTitle:
+                  value:
+                    error:
+                      code: INVALID_REQUEST
+                      message: title must not be empty
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            `FORBIDDEN` when not a workspace member or when the session belongs to
+            another user; `HRM_ROLE_REQUIRED` for an unrecognised HRM role.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "404":
+          description: >-
+            `RESOURCE_NOT_FOUND` when no session with this id exists in this workspace,
+            matching DELETE behavior.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                missing: { $ref: "#/components/examples/ResourceNotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
     delete:
       tags: [Chat history]
       operationId: deleteWorkspaceChatSession
@@ -1622,8 +1704,9 @@ components:
         title:
           type: string
           description: |
-            Derived from the first user message. At most 40 Unicode characters;
-            `...` is appended when the source message is longer.
+            Initially derived from the first user message (at most 40 Unicode
+            characters plus `...` when truncated), and thereafter replaceable by
+            the owner through the PATCH session-title operation.
         created_at:
           $ref: "#/components/schemas/UtcDateTime"
 
@@ -1655,8 +1738,11 @@ components:
       type: object
       description: |
         A stored user or assistant message. Citation access is re-checked when
-        reading; UUIDs no longer visible to the caller and their stored UUID
-        markers are removed.
+        reading; inaccessible citations and their stored UUID markers are removed.
+        Assistant citations are hydrated once per page and use the same document
+        metadata as the stream, but history maps markers by `chunk_id` and does
+        not include the stream-only `index` field. User messages always have an
+        empty citations array.
       required: [id, role, content, citations, created_at]
       additionalProperties: false
       properties:
@@ -1671,11 +1757,10 @@ components:
         citations:
           type: array
           description: |
-            Chunk UUIDs, not the rich citation objects emitted by the live SSE
-            stream. Empty for user messages and whenever no visible citation remains.
-          items:
-            type: string
-            format: uuid
+            Rich citation objects. `chunk_id` matches `[chunk:<uuid>]` in the
+            message content. Empty for user messages and whenever no visible
+            citation remains.
+          items: { $ref: "#/components/schemas/HistoryCitation" }
         created_at:
           $ref: "#/components/schemas/UtcDateTime"
 
@@ -1702,6 +1787,41 @@ components:
           type: integer
           format: int64
           minimum: 0
+
+    HistoryCitation:
+      type: object
+      description: |
+        Citation returned by either history route. It deliberately has no
+        `index`; UUID markers in stored content map directly to `chunk_id`.
+      required: [chunk_id, document_id, document_name, snippet]
+      additionalProperties: false
+      properties:
+        chunk_id:
+          type: string
+          format: uuid
+        document_id:
+          type: string
+          format: uuid
+        document_name:
+          type: string
+        snippet:
+          type: string
+          description: |
+            Up to 280 Unicode characters centered on the preceding user question
+            when it is available on the page; otherwise the beginning of the chunk.
+
+    UpdateChatSessionTitleRequest:
+      type: object
+      additionalProperties: false
+      required: [title]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 200
+          description: >-
+            Trimmed single-line user input. The limit is 200 Unicode characters,
+            control characters are rejected, and HTML is not escaped by the server.
 
     CitationsEvent:
       type: object

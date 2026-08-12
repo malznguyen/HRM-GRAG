@@ -154,8 +154,19 @@ Authorization: Bearer {{accessToken}}
 Accept: application/json
 
 
-### 6d. Xoa session cua CHINH user — CASCADE xoa toan bo messages
-# 204 No Content. Chay request nay sau khi da xem xong 6a–6c.
+### 6d. Doi tieu de session cua CHINH user
+PATCH {{baseUrl}}/workspaces/{{workspaceId}}/chat/sessions/{{sessionId}}
+Authorization: Bearer {{accessToken}}
+Content-Type: application/json
+Accept: application/json
+
+{
+  "title": "Hoi ve chinh sach lam them gio"
+}
+
+
+### 6e. Xoa session cua CHINH user — CASCADE xoa toan bo messages
+# 204 No Content. Chay request nay sau khi da xem xong 6a–6d.
 DELETE {{baseUrl}}/workspaces/{{workspaceId}}/chat/sessions/{{sessionId}}
 Authorization: Bearer {{accessToken}}
 

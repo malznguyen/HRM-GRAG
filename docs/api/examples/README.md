@@ -7,7 +7,7 @@ Kèm theo [`../INTEGRATION_GUIDE.md`](../INTEGRATION_GUIDE.md) và
 |---|---|
 | `hrm-rag.http` | Gọi thử từng endpoint trong IDE. Có sẵn cả các case lỗi |
 | `http-client.env.json` | Biến môi trường cho `hrm-rag.http` |
-| `smoke.sh` | Chạy một mạch end-to-end, gồm cả 4 route chat history, dùng để nghiệm thu |
+| `smoke.sh` | Chạy một mạch end-to-end, gồm history citation object và PATCH title, dùng để nghiệm thu |
 
 ---
 
@@ -22,9 +22,10 @@ Cho **IntelliJ IDEA** (Tools → HTTP Client) hoặc **VS Code** + extension
 2. Mở `hrm-rag.http`, chọn environment `local` ở góc trên.
 3. Bấm ▶ bên trái từng request.
 
-Request 1–10 và 6a–6d là luồng chính (health → upload → poll → chat → history → xóa).
-Các route history luôn thao tác trên session của `userid` trong token; 6d xóa session
-và toàn bộ messages của nó. Các request 6a–6c dùng `limit`/`offset` và đọc page object
+Request 1–10 và 6a–6e là luồng chính (health → upload → poll → chat → history → đổi title → xóa).
+Các route history luôn thao tác trên session của `userid` trong token; 6e xóa session
+và toàn bộ messages của nó. Request 6d đổi title, trả lại session summary mới.
+Các request 6a–6c dùng `limit`/`offset` và đọc page object
 qua field `sessions` hoặc `messages`, cùng `total`, `limit`, `offset`. Request
 `E1`–`E12` là các case lỗi — chạy để xác nhận client HRM xử lý đúng từng mã lỗi.
 Các case `E4`/`E5` và `E9`/`E10` chứng minh `MANAGER`/`EMPLOYEE` đều chỉ là
@@ -65,7 +66,8 @@ Script làm gì:
 3. Poll trạng thái với chu kỳ tăng dần (2s → 5s → 30s), timeout 15 phút.
    Gặp `FAILED` thì giải thích `failure_code` và nói nên làm gì
 4. Chat SSE, in **nguyên văn stream**, rồi ráp lại đúng cách và in kết quả
-5. Gọi đủ bốn route history: list session, đọc qua query, đọc qua path, xóa session
+5. Gọi các route history: list session, đọc qua query/path, kiểm tra citation object,
+   PATCH title và xóa session
 6. Xóa document, và xác nhận đã xóa bằng cách poll lại (mong đợi `404`)
 
 Bước 4 chính là phần đáng xem nhất: nó in ra stream thô để bạn **tận mắt thấy**

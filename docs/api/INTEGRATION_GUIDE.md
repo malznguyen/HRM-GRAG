@@ -126,7 +126,8 @@ Toàn bộ endpoint HRM cần:
 | 6 | Liệt kê session chat của user hiện tại | `GET` | `/workspaces/hrm/chat/sessions` |
 | 7 | Đọc messages của một session | `GET` | `/workspaces/hrm/chat/sessions/{session_id}/messages` |
 | 8 | Đọc messages qua route tương thích | `GET` | `/workspaces/hrm/chat/history?session_id={session_id}` |
-| 9 | Xóa session và toàn bộ messages | `DELETE` | `/workspaces/hrm/chat/sessions/{session_id}` |
+| 9 | Đổi tiêu đề session | `PATCH` | `/workspaces/hrm/chat/sessions/{session_id}` |
+| 10 | Xóa session và toàn bộ messages | `DELETE` | `/workspaces/hrm/chat/sessions/{session_id}` |
 
 ### 1.5 Thử nhanh bằng Swagger UI
 
@@ -1245,7 +1246,7 @@ vĩnh viễn cho tới khi owner tự xóa session. Xem thêm ghi chú lưu tr�
 
 #### Phân quyền — điểm phải hiểu đúng
 
-Cả bốn route dưới đây yêu cầu bearer token hợp lệ và relation `member` trên
+Cả năm route dưới đây yêu cầu bearer token hợp lệ và relation `member` trên
 workspace, rồi khóa dữ liệu bằng **đúng `userid` của token**:
 
 - User chỉ liệt kê, đọc và xóa session của chính mình.
@@ -1295,10 +1296,10 @@ tiebreaker ổn định khi nhiều row có cùng `created_at`:
 }
 ```
 
-`title` lấy từ câu hỏi đầu tiên, tối đa 40 ký tự Unicode; dài hơn thì server thêm
-`...`. `sessions: []` nghĩa là trang không có row (chưa có session hoặc offset đã
-vượt total). HRM không cần tự giữ bảng `user_id → session_ids`; lấy danh sách này
-khi mở màn hình lịch sử.
+`title` ban đầu lấy từ câu hỏi đầu tiên, tối đa 40 ký tự Unicode; dài hơn thì server
+thêm `...`. Owner có thể thay title sau bằng PATCH ở mục 6.13.3. `sessions: []`
+nghĩa là trang không có row (chưa có session hoặc offset đã vượt total). HRM không
+cần tự giữ bảng `user_id → session_ids`; lấy danh sách này khi mở màn hình lịch sử.
 
 #### 6.13.2 Đọc messages trong session
 
@@ -1333,7 +1334,14 @@ trước; UUID là tiebreaker ổn định. Response của hai route có cùng p
       "id": "57b3e448-11c7-48ab-8e36-0f6957235522",
       "role": "assistant",
       "content": "Giờ làm việc là 08:00–17:00.[chunk:3f601309-1f9e-4f88-9f16-1077bb849460]",
-      "citations": ["3f601309-1f9e-4f88-9f16-1077bb849460"],
+      "citations": [
+        {
+          "chunk_id": "3f601309-1f9e-4f88-9f16-1077bb849460",
+          "document_id": "69f56ad1-f379-4705-9eb4-f58cbd269420",
+          "document_name": "noi-quy-cong-ty-smoke.md",
+          "snippet": "…Điều 12. Thời giờ làm việc…"
+        }
+      ],
       "created_at": "2026-08-10T07:15:43.601842Z"
     }
   ],
@@ -1348,15 +1356,102 @@ Cả ba route GET dùng cùng convention: mặc định `limit=20`, `offset=0`;
 `400 INVALID_REQUEST`; số âm hoặc giá trị không phải integer cũng trả cùng code.
 `limit=0` hợp lệ và trả mảng trang rỗng trong khi `total` vẫn là tổng thật.
 
-`citations` ở history là mảng **chunk UUID**, khác với object giàu thông tin của
-SSE `event: citations`. Khi đọc lại, server re-check ACL tài liệu: citation user
-không còn được xem sẽ bị loại và marker UUID tương ứng bị xóa khỏi `content`.
+`citations` ở history là mảng object giàu thông tin gồm đúng bốn trường
+`chunk_id`, `document_id`, `document_name`, `snippet`. Đây là breaking change có
+chủ đích từ mảng UUID cũ. `chunk_id` map trực tiếp với marker
+`[chunk:<uuid>]`; history **không có `index`** và client không cần gọi
+`POST /workspaces/{workspace_id}/citations/resolve` cho luồng này nữa. Endpoint
+resolve vẫn giữ nguyên cho các client/luồng cũ.
+
+Khi đọc lại, server re-check ACL cho toàn bộ citation ID của cả trang trong một
+lô, hydrate metadata một lần rồi phân phối object về từng message. Citation
+không còn được xem (hoặc chunk đã bị xóa) sẽ bị loại và marker UUID tương ứng bị
+xóa khỏi `content`. Message `role: "user"` luôn có `citations: []`.
+
+Snippet của assistant được căn theo nội dung message `user` ngay trước nó trong
+trang hiện tại, không dùng câu hỏi cuối session. Nếu assistant ở đầu trang hoặc
+không có user message ngay trước, server truyền query `None` và dùng fallback ở
+đầu chunk. Vì vậy khi phân trang, client nên giữ thứ tự message và không tự ghép
+snippet từ message khác.
+
+| | Stream | History |
+|---|---|---|
+| Marker | `[chunk:1]` (số) | `[chunk:<uuid>]` |
+| Regex | `\[chunk:(\d+)\]` | `\[chunk:([0-9a-fA-F-]{36})\]` |
+| Khóa map | `citations[].index` | `citations[].chunk_id` |
+| Trường `index` | có | không |
+
+Pseudocode Java cho nhánh history (không gọi `/citations/resolve`):
+
+```java
+record HistoryCitation(UUID chunkId, UUID documentId, String documentName, String snippet) {}
+record HistoryMessage(String role, String content, List<HistoryCitation> citations) {}
+
+String renderHistoryMessage(HistoryMessage message) {
+    if (!message.role().equals("assistant")) return escapeHtml(message.content());
+
+    Map<UUID, HistoryCitation> byChunkId = message.citations().stream()
+        .collect(Collectors.toMap(HistoryCitation::chunkId, Function.identity(), (first, ignored) -> first));
+    Matcher matcher = Pattern.compile("\\[chunk:([0-9a-fA-F-]{36})\\]")
+        .matcher(message.content());
+    StringBuffer html = new StringBuffer();
+    while (matcher.find()) {
+        UUID chunkId = UUID.fromString(matcher.group(1));
+        HistoryCitation citation = byChunkId.get(chunkId);
+        String replacement = citation == null
+            ? ""
+            : "<a href=\"#source-" + chunkId + "\">[" + escapeHtml(citation.documentName()) + "]</a>";
+        matcher.appendReplacement(html, Matcher.quoteReplacement(replacement));
+    }
+    matcher.appendTail(html);
+    return renderMarkdownSafely(html.toString());
+}
+```
+
+`content`, `documentName` và `snippet` đều có dữ liệu người dùng/tài liệu; client
+phải escape HTML khi render. Server không escape/encode HTML trong title hoặc
+citation fields.
 
 Session không tồn tại trả `200 {"messages":[],"total":0,"limit":L,"offset":O}`
 để hai route đọc có cùng hành vi. Session tồn tại nhưng thuộc user khác trả
 `403 FORBIDDEN`. `session_id` thiếu hoặc không phải UUID trả `400 INVALID_REQUEST`.
 
-#### 6.13.3 Xóa session
+#### 6.13.3 Đổi tiêu đề session
+
+Chỉ owner của session được đổi title. Cơ chế và mã lỗi ownership giống hệt
+`DELETE` bên dưới: session của user khác trả `403 FORBIDDEN`, session không tồn
+tại trả `404 RESOURCE_NOT_FOUND`, không có admin override.
+
+```http
+PATCH /workspaces/hrm/chat/sessions/<SESSION_ID>
+Authorization: Bearer <ACCESS_TOKEN_CỦA_USER>
+Content-Type: application/json
+
+{"title":"Hỏi về chính sách làm thêm giờ"}
+```
+
+Server trim khoảng trắng đầu/cuối, từ chối title rỗng, từ chối mọi control
+character (`\n`, `\r`, `\t`, …), và giới hạn **200 ký tự Unicode** (không phải
+byte). Title được lưu nguyên dạng sau trim; server không escape HTML. Client nên
+validate sớm để UX tốt hơn nhưng vẫn phải xử lý `400 INVALID_REQUEST`, đồng thời
+escape title khi render vì đây là dữ liệu người dùng nhập.
+
+Response `200` là session summary để cập nhật UI ngay:
+
+```json
+{
+  "id": "df093a48-ed78-4109-ac96-a75be34ab35c",
+  "title": "Hỏi về chính sách làm thêm giờ",
+  "created_at": "2026-08-10T07:15:42.120314Z"
+}
+```
+
+Lỗi chính: `400 INVALID_REQUEST` (body/title sai), `403 FORBIDDEN` (không phải
+owner hoặc không phải workspace member), `404 RESOURCE_NOT_FOUND` (session
+không tồn tại), `500 INTERNAL_ERROR`. Gọi PATCH lặp lại cùng title là
+idempotent.
+
+#### 6.13.4 Xóa session
 
 ```http
 DELETE /workspaces/hrm/chat/sessions/<SESSION_ID>
@@ -1402,7 +1497,7 @@ Ngoại lệ duy nhất: `204 No Content` (xóa thành công) có body rỗng.
 
 ### 7.2 Bảng đầy đủ
 
-Toàn bộ mã lỗi có thể gặp trên 10 endpoint trong tài liệu này:
+Toàn bộ mã lỗi có thể gặp trên 11 endpoint trong tài liệu này:
 
 | HTTP | `code` | Nghĩa | HRM nên làm gì |
 |---|---|---|---|
