@@ -161,7 +161,8 @@ pub async fn resolve_workspace_citations(
         }));
     }
 
-    let citations = hydrate_citations(&state, workspace_id, &authz.user_id, allowed_ids).await?;
+    let citations =
+        hydrate_citations(&state, workspace_id, &authz.user_id, allowed_ids, None).await?;
     Ok(Json(ResolveCitationsResponse { citations }))
 }
 
@@ -225,6 +226,7 @@ async fn hydrate_citations(
     workspace_id: Uuid,
     user_id: &str,
     allowed_ids: Vec<Uuid>,
+    query: Option<&str>,
 ) -> Result<Vec<ResolvedCitation>, ApiError> {
     let rows: Vec<CitationHydrationRow> = sqlx::query_as(
         r#"
@@ -267,12 +269,13 @@ async fn hydrate_citations(
             chunk_id: row.chunk_id,
             document_id: row.document_id,
             document_name: row.document_name,
-            snippet: truncate_citation_snippet(&row.original_text),
+            snippet: select_citation_snippet(&row.original_text, query),
             chunk_index: row.chunk_index,
         })
         .collect())
 }
 
+/// Keeps the pre-Phase-14 behavior for callers that do not have the question.
 fn truncate_citation_snippet(text: &str) -> String {
     let mut prefix = text
         .chars()
@@ -306,6 +309,246 @@ fn truncate_citation_snippet(text: &str) -> String {
 
     let mut snippet = prefix.into_iter().collect::<String>();
     snippet.push('…');
+    snippet
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SnippetRange {
+    start: usize,
+    end: usize,
+}
+
+/// Chooses a sentence/line around the strongest query match without adding a
+/// second retrieval or model round-trip. A tie deliberately falls back to the
+/// old prefix behavior: an ambiguous match is worse than a stable snippet.
+fn select_citation_snippet(text: &str, query: Option<&str>) -> String {
+    if text.trim().is_empty() {
+        return String::new();
+    }
+    if text.chars().count() <= CITATION_SNIPPET_CHARS {
+        return text.to_string();
+    }
+
+    let Some(query) = query else {
+        return truncate_citation_snippet(text);
+    };
+
+    let query_terms = snippet_keywords(query);
+    if query_terms.len() < 2 {
+        return truncate_citation_snippet(text);
+    }
+
+    let segments = split_snippet_segments(text);
+    if segments.is_empty() {
+        return truncate_citation_snippet(text);
+    }
+
+    let scores = segments
+        .iter()
+        .map(|segment| {
+            snippet_keywords(&text[segment.start..segment.end])
+                .intersection(&query_terms)
+                .count()
+        })
+        .collect::<Vec<_>>();
+
+    let Some((best_index, &best_score)) = scores.iter().enumerate().max_by_key(|(_, score)| *score)
+    else {
+        return truncate_citation_snippet(text);
+    };
+    if best_score == 0
+        || scores
+            .iter()
+            .enumerate()
+            .any(|(index, score)| index != best_index && *score == best_score)
+    {
+        return truncate_citation_snippet(text);
+    }
+
+    let (start, end) = expand_snippet_window(text, &segments, best_index);
+    let (start, end) = trim_snippet_range(text, start, end);
+    if start >= end {
+        return truncate_citation_snippet(text);
+    }
+
+    render_snippet_window(text, start, end)
+}
+
+fn snippet_keywords(text: &str) -> HashSet<String> {
+    let mut keywords = HashSet::new();
+    let mut word = String::new();
+
+    for character in text.chars() {
+        if character.is_alphanumeric() {
+            for lowered in character.to_lowercase() {
+                word.push(fold_vietnamese_character(lowered));
+            }
+        } else if !word.is_empty() {
+            keywords.insert(std::mem::take(&mut word));
+        }
+    }
+    if !word.is_empty() {
+        keywords.insert(word);
+    }
+
+    keywords
+}
+
+fn fold_vietnamese_character(character: char) -> char {
+    match character {
+        'à' | 'á' | 'ả' | 'ã' | 'ạ' | 'ă' | 'ằ' | 'ắ' | 'ẳ' | 'ẵ' | 'ặ' | 'â' | 'ầ' | 'ấ' | 'ẩ'
+        | 'ẫ' | 'ậ' => 'a',
+        'è' | 'é' | 'ẻ' | 'ẽ' | 'ẹ' | 'ê' | 'ề' | 'ế' | 'ể' | 'ễ' | 'ệ' => 'e',
+        'ì' | 'í' | 'ỉ' | 'ĩ' | 'ị' => 'i',
+        'ò' | 'ó' | 'ỏ' | 'õ' | 'ọ' | 'ô' | 'ồ' | 'ố' | 'ổ' | 'ỗ' | 'ộ' | 'ơ' | 'ờ' | 'ớ' | 'ở'
+        | 'ỡ' | 'ợ' => 'o',
+        'ù' | 'ú' | 'ủ' | 'ũ' | 'ụ' | 'ư' | 'ừ' | 'ứ' | 'ử' | 'ữ' | 'ự' => 'u',
+        'ỳ' | 'ý' | 'ỷ' | 'ỹ' | 'ỵ' => 'y',
+        'đ' => 'd',
+        character => character,
+    }
+}
+
+fn split_snippet_segments(text: &str) -> Vec<SnippetRange> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+
+    for (index, character) in text.char_indices() {
+        let end = index + character.len_utf8();
+        if character == '\n' || matches!(character, '.' | '!' | '?' | '。' | '！' | '？') {
+            if !text[start..end].trim().is_empty() {
+                ranges.push(SnippetRange { start, end });
+            }
+            start = end;
+        }
+    }
+
+    if start < text.len() && !text[start..].trim().is_empty() {
+        ranges.push(SnippetRange {
+            start,
+            end: text.len(),
+        });
+    }
+
+    ranges
+}
+
+fn expand_snippet_window(
+    text: &str,
+    segments: &[SnippetRange],
+    best_index: usize,
+) -> (usize, usize) {
+    let mut left = best_index;
+    let mut right = best_index;
+    let mut prefer_right = best_index > 0 && best_index + 1 < segments.len();
+
+    loop {
+        let current_start = segments[left].start;
+        let current_end = segments[right].end;
+        let prefix_chars = usize::from(!text[..current_start].trim().is_empty());
+        let suffix_chars = usize::from(!text[current_end..].trim().is_empty());
+        let available = CITATION_SNIPPET_CHARS.saturating_sub(prefix_chars + suffix_chars);
+
+        let left_candidate = (left > 0).then(|| {
+            let range = SnippetRange {
+                start: segments[left - 1].start,
+                end: current_end,
+            };
+            (range, snippet_range_char_count(text, range))
+        });
+        let right_candidate = (right + 1 < segments.len()).then(|| {
+            let range = SnippetRange {
+                start: current_start,
+                end: segments[right + 1].end,
+            };
+            (range, snippet_range_char_count(text, range))
+        });
+
+        let right_fits = right_candidate
+            .as_ref()
+            .is_some_and(|(_, length)| *length <= available);
+        let left_fits = left_candidate.as_ref().is_some_and(|(range, length)| {
+            *length <= available && !(range.start == 0 && best_index > 0)
+        });
+
+        if prefer_right && right_fits {
+            right += 1;
+            prefer_right = false;
+        } else if !prefer_right && left_fits {
+            left -= 1;
+            prefer_right = true;
+        } else if right_fits {
+            right += 1;
+            prefer_right = false;
+        } else if left_fits {
+            left -= 1;
+            prefer_right = true;
+        } else {
+            return (current_start, current_end);
+        }
+    }
+}
+
+fn snippet_range_char_count(text: &str, range: SnippetRange) -> usize {
+    text[range.start..range.end].chars().count()
+}
+
+fn trim_snippet_range(text: &str, mut start: usize, mut end: usize) -> (usize, usize) {
+    while start < end {
+        let character = text[start..end].chars().next().expect("range is non-empty");
+        if !character.is_whitespace() {
+            break;
+        }
+        start += character.len_utf8();
+    }
+    while start < end {
+        let character = text[..end].chars().next_back().expect("range is non-empty");
+        if !character.is_whitespace() {
+            break;
+        }
+        end -= character.len_utf8();
+    }
+    (start, end)
+}
+
+fn render_snippet_window(text: &str, start: usize, end: usize) -> String {
+    let (start, end) = trim_snippet_range(text, start, end);
+    let has_prefix = !text[..start].trim().is_empty();
+    let has_suffix = !text[end..].trim().is_empty();
+    let ellipsis_count = usize::from(has_prefix) + usize::from(has_suffix);
+    let content_limit = CITATION_SNIPPET_CHARS.saturating_sub(ellipsis_count);
+    let content = text[start..end].chars().collect::<Vec<_>>();
+
+    let mut visible = if content.len() <= content_limit {
+        content
+    } else {
+        let mut cut = content_limit;
+        while cut > 0 && !content[cut - 1].is_whitespace() {
+            cut -= 1;
+        }
+        if cut == 0 {
+            cut = content
+                .iter()
+                .enumerate()
+                .skip(content_limit)
+                .find(|(_, character)| character.is_whitespace())
+                .map(|(index, _)| index)
+                .unwrap_or(content_limit);
+        }
+        while cut > 0 && content[cut - 1].is_whitespace() {
+            cut -= 1;
+        }
+        content[..cut].to_vec()
+    };
+
+    let mut snippet = String::new();
+    if has_prefix {
+        snippet.push('…');
+    }
+    snippet.extend(visible.drain(..));
+    if has_suffix {
+        snippet.push('…');
+    }
     snippet
 }
 
@@ -704,6 +947,7 @@ pub async fn workspace_chat(
     let session_id = body.session_id;
     let chunk_ids = context.chunk_ids;
     let citation_chunk_ids = chunk_ids.clone();
+    let citation_query = message.clone();
     let citation_state = state.clone();
     let citation_user_id = authz.user_id.clone();
     let byte_stream = deepseek_response.bytes_stream();
@@ -772,6 +1016,7 @@ pub async fn workspace_chat(
             workspace_id_for_acl,
             &citation_user_id,
             citation_chunk_ids.clone(),
+            Some(&citation_query),
         )
         .await
         {
@@ -914,6 +1159,96 @@ mod tests {
         }
     }
 
+    #[test]
+    fn citation_snippet_selects_a_matching_segment_in_the_middle() {
+        let chunk = concat!(
+            "### Điều 12. An toàn và sức khỏe nghề nghiệp.\n",
+            "Nhân viên tuân thủ biển báo và quy trình sơ tán.\n",
+            "### Điều 16. Hỗ trợ bữa trưa.\n",
+            "Mức hỗ trợ bữa trưa là 35.000 đồng nếu nhân viên làm đủ sáu giờ trong ngày.\n",
+            "### Điều 18. Chăm sóc sức khỏe.\n",
+            "Nhân viên được khám sức khỏe định kỳ mỗi năm.\n",
+            "### Điều 20. Hỗ trợ ăn tối.\n",
+            "Ca làm thêm từ ba giờ được hỗ trợ một bữa ăn tối."
+        );
+
+        let query = "Mức hỗ trợ bữa trưa 35.000 đồng";
+        let snippet = select_citation_snippet(chunk, Some(query));
+
+        assert!(snippet.contains("Điều 16"));
+        assert!(snippet.contains("35.000 đồng"));
+        assert!(!snippet.starts_with("### Điều 12"));
+        assert!(snippet.starts_with('…'));
+    }
+
+    #[test]
+    fn citation_snippet_selects_a_matching_segment_at_the_end() {
+        let chunk = concat!(
+            "### Điều 18. Chăm sóc sức khỏe.\n",
+            "Nhân viên được khám sức khỏe định kỳ mỗi năm.\n",
+            "Hồ sơ sức khỏe được quản lý riêng, chỉ người có nhiệm vụ mới được tiếp cận và mọi thay đổi phải được ghi nhận theo quy trình nội bộ.\n",
+            "Các đầu mối liên quan phải bảo đảm thông tin được cập nhật đầy đủ, đúng thời hạn và không dùng hồ sơ cho mục đích ngoài phạm vi công việc.\n",
+            "### Điều 20. Hỗ trợ ăn tối.\n",
+            "Ca làm thêm vào cuối tuần từ ba giờ được hỗ trợ một bữa ăn tối 80.000 đồng."
+        );
+
+        let snippet = select_citation_snippet(
+            chunk,
+            Some("Điều kiện nhận hỗ trợ ăn tối 80.000 đồng cho ca làm thêm là gì?"),
+        );
+
+        assert!(snippet.contains("80.000 đồng"));
+        assert!(snippet.contains("Điều 20"));
+        assert!(!snippet.starts_with("### Điều 18"));
+        assert!(snippet.starts_with('…'));
+        assert!(!snippet.ends_with('…'));
+    }
+
+    #[test]
+    fn citation_snippet_falls_back_when_match_is_ambiguous() {
+        let chunk = "Nhân viên làm việc tại văn phòng.\nNhân viên làm việc từ xa.\n";
+        let expected = truncate_citation_snippet(chunk);
+
+        assert_eq!(
+            select_citation_snippet(chunk, Some("nhân viên làm việc")),
+            expected
+        );
+        assert_eq!(
+            select_citation_snippet(chunk, Some("đi")),
+            truncate_citation_snippet(chunk)
+        );
+    }
+
+    #[test]
+    fn citation_snippet_preserves_short_chunks_and_unicode_words() {
+        let short = "Điều 16. Hỗ trợ bữa trưa là 35.000 đồng.";
+        assert_eq!(
+            select_citation_snippet(short, Some("hỗ trợ bữa trưa")),
+            short
+        );
+
+        let chunk = concat!(
+            "### Điều 16. Hỗ trợ bữa trưa.\n",
+            "Quy định cũ về thời gian.\n",
+            "Nhân viên đủ điều kiện nhận hỗ trợ bữa trưa 35.000 đồng mỗi ngày.\n",
+            "Quy định kết thúc."
+        );
+        let snippet = select_citation_snippet(chunk, Some("hỗ trợ bữa trưa 35.000 đồng"));
+        assert!(snippet.contains("hỗ trợ bữa trưa 35.000 đồng"));
+        assert!(snippet.contains("Nhân viên"));
+        assert!(!snippet.contains("bữa trư…"));
+        assert!(snippet.chars().count() <= CITATION_SNIPPET_CHARS);
+    }
+
+    #[test]
+    fn citation_snippet_handles_empty_and_whitespace_chunks() {
+        assert_eq!(select_citation_snippet("", Some("câu hỏi bất kỳ")), "");
+        assert_eq!(
+            select_citation_snippet("   \n\t  ", Some("câu hỏi bất kỳ")),
+            ""
+        );
+    }
+
     /// Bảo vệ giả định của `PersistAssistantOnDrop`: generator bị drop giữa chừng
     /// (client disconnect) vẫn chạy `Drop` của giá trị nó sở hữu.
     #[tokio::test]
@@ -967,7 +1302,10 @@ mod tests {
         assert_eq!(events[1].event, "done");
         let payload: Value = serde_json::from_str(&events[0].data).unwrap();
         assert_eq!(payload["citations"][0]["index"], 2);
-        assert_eq!(payload["citations"][0]["chunk_id"], second_chunk.to_string());
+        assert_eq!(
+            payload["citations"][0]["chunk_id"],
+            second_chunk.to_string()
+        );
         assert_eq!(events[1].data, session_id.to_string());
     }
 
