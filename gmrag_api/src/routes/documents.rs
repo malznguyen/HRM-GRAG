@@ -1,7 +1,7 @@
 use axum::{
     Json,
     extract::{Multipart, Path, Query, State},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header},
     response::IntoResponse,
 };
 use chrono::NaiveDateTime;
@@ -32,6 +32,7 @@ use crate::retrieval::outbox::enqueue_delete_by_document_tx;
 use crate::state::AppState;
 use crate::storage::build_original_document_object_key;
 use crate::storage::outbox::enqueue_delete_object_tx;
+use crate::storage::StorageError;
 
 #[derive(Deserialize)]
 pub struct SetDocumentAccessModeRequest {
@@ -241,6 +242,78 @@ struct PreviewDocumentTarget {
     size_bytes: Option<i64>,
 }
 
+#[derive(sqlx::FromRow)]
+struct DocumentFileTarget {
+    status: String,
+    access_mode: String,
+    filename: String,
+    content_type: Option<String>,
+    size_bytes: Option<i64>,
+    object_key: String,
+}
+
+/// `Storage::get_original_document` đọc toàn bộ file vào RAM (không stream —
+/// xem `storage/mod.rs`), nên route `/file` phải chặn trước khi gọi nó thay vì
+/// để một file khổng lồ làm phồng bộ nhớ process. Dùng lại đúng ngưỡng upload
+/// (`DOCUMENT_MAX_UPLOAD_BYTES`, mặc định 50MB) thay vì bịa một hằng số riêng:
+/// không tài liệu hợp lệ nào có thể lớn hơn ngưỡng này, vì `upload_document`
+/// đã từ chối nó từ lúc nhận file. Nếu vẫn vượt ngưỡng ở đây, đó là dấu hiệu dữ
+/// liệu bất thường (ví dụ giới hạn bị hạ sau khi tài liệu đã upload) đáng log.
+fn document_file_serve_limit_bytes() -> i64 {
+    document_max_upload_bytes() as i64
+}
+
+fn document_not_ready_error() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "DOCUMENT_NOT_READY",
+        "Document is not ready yet; status must be COMPLETED",
+    )
+}
+
+/// Escape RFC 5987 `attr-char`: mọi byte không thuộc tập unreserved được
+/// percent-encode theo đúng octet UTF-8 của nó, nên tên file tiếng Việt có dấu
+/// (nhiều byte một ký tự) được mã hoá đúng, không vỡ.
+fn percent_encode_rfc5987(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(*byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+/// Fallback ASCII cho tham số `filename` không mã hoá — client cũ không hiểu
+/// `filename*=UTF-8''...` (RFC 6266) vẫn có một tên file dùng được, dù mất dấu.
+fn ascii_filename_fallback(filename: &str) -> String {
+    let sanitized: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_ascii() && c != '"' && c != '\\' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.trim().is_empty() {
+        "document".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn content_disposition_inline(filename: &str) -> String {
+    format!(
+        "inline; filename=\"{}\"; filename*=UTF-8''{}",
+        ascii_filename_fallback(filename),
+        percent_encode_rfc5987(filename)
+    )
+}
+
 pub async fn get_document_chunk(
     State(state): State<AppState>,
     authz: Authz,
@@ -416,7 +489,7 @@ pub async fn get_document_preview(
     }
 
     if preview_target.status != "COMPLETED" {
-        return StatusCode::CONFLICT.into_response();
+        return document_not_ready_error().into_response();
     }
 
     let document_meta = PreviewDocumentMeta {
@@ -442,6 +515,162 @@ pub async fn get_document_preview(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// Phục vụ bytes gốc của tài liệu (PDF/DOCX/TXT/MD đã upload), proxy qua API
+/// thay vì presigned URL — không mở MinIO ra ngoài, không cần CORS trên MinIO,
+/// không cần endpoint S3 công khai. Tái dùng nguyên khối phân quyền của
+/// `get_document_preview`: `Relation::Member` rồi `can_user_view_document`.
+/// Không viết logic ACL mới ở đây.
+pub async fn get_document_file(
+    State(state): State<AppState>,
+    authz: Authz,
+    Path((workspace_id, document_id)): Path<(Uuid, Uuid)>,
+) -> impl IntoResponse {
+    if let Err(err) = authz
+        .require_relation(Relation::Member, &Object::Workspace(workspace_id))
+        .await
+    {
+        return err.into_response();
+    }
+
+    let file_target: Result<Option<DocumentFileTarget>, sqlx::Error> = sqlx::query_as(
+        r#"
+        SELECT status, access_mode, filename, content_type, size_bytes, object_key
+        FROM documents
+        WHERE id = $1 AND workspace_id = $2
+        "#,
+    )
+    .bind(document_id)
+    .bind(workspace_id)
+    .fetch_optional(&state.pool)
+    .await;
+
+    let file_target = match file_target {
+        Ok(Some(target)) => target,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to verify document before serving file"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let access_mode = match parse_access_mode_or_500(
+        document_id,
+        &file_target.access_mode,
+        &authz,
+        workspace_id,
+        None,
+        "Failed to parse document access_mode before serving file",
+    ) {
+        Ok(mode) => mode,
+        Err(response) => return response,
+    };
+
+    let can_view = match can_user_view_document(
+        &state.authz_client,
+        &authz.user_id,
+        document_id,
+        access_mode,
+    )
+    .await
+    {
+        Ok(allowed) => allowed,
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to re-check document ACL before serving file"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    if !can_view {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    if file_target.status != "COMPLETED" {
+        return document_not_ready_error().into_response();
+    }
+
+    let size_limit = document_file_serve_limit_bytes();
+    if file_target.size_bytes.is_none_or(|size| size > size_limit || size < 0) {
+        error!(
+            user_id = %authz.user_id,
+            workspace_id = %workspace_id,
+            document_id = %document_id,
+            size_bytes = ?file_target.size_bytes,
+            size_limit_bytes = size_limit,
+            "Document size exceeds (or is missing for) the in-memory file-serving limit"
+        );
+        return ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DOCUMENT_FILE_TOO_LARGE",
+            "Original document exceeds the size limit for this endpoint",
+        )
+        .into_response();
+    }
+
+    let bytes = match state
+        .storage
+        .get_original_document(&file_target.object_key)
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(StorageError::ObjectNotFound { .. }) => {
+            error!(
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Original document object is missing from storage"
+            );
+            return ApiError::new(
+                StatusCode::GONE,
+                "DOCUMENT_OBJECT_MISSING",
+                "Original document object is missing",
+            )
+            .into_response();
+        }
+        Err(err) => {
+            error!(
+                error = %err,
+                user_id = %authz.user_id,
+                workspace_id = %workspace_id,
+                document_id = %document_id,
+                "Failed to read original document from storage"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let content_type = file_target
+        .content_type
+        .as_deref()
+        .unwrap_or("application/octet-stream");
+    let content_type_header = HeaderValue::from_str(content_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    let disposition_header =
+        HeaderValue::from_str(&content_disposition_inline(&file_target.filename))
+            .unwrap_or_else(|_| HeaderValue::from_static("inline"));
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type_header),
+            (header::CONTENT_DISPOSITION, disposition_header),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 fn parse_access_mode_or_500(

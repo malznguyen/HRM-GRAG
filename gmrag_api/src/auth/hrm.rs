@@ -1,6 +1,6 @@
+use crate::api_error::ApiError;
 use crate::auth::authz::{AuthzClient, AuthzError, Object, Relation, TupleKey};
 use crate::auth::jwt::JwtClaims;
-use crate::api_error::ApiError;
 use crate::invite::normalize_email;
 use crate::state::AppState;
 use axum::{
@@ -122,7 +122,10 @@ pub fn resolve_workspace_alias_path(path: &str, config: &HrmConfig) -> Option<St
 }
 
 pub fn ensure_scope(path: &str, config: &HrmConfig) -> Result<(), HrmScopeError> {
-    let segments: Vec<&str> = path.split('/').filter(|segment| !segment.is_empty()).collect();
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
     for pair in segments.windows(2) {
         let Some(candidate) = Uuid::parse_str(pair[1]).ok() else {
             continue;
@@ -429,13 +432,25 @@ mod tests {
             workspace_id: Uuid::parse_str("fa76881f-6367-4b80-a89e-a3e01206a806").unwrap(),
         };
 
-        assert!(ensure_scope("/workspaces/fa76881f-6367-4b80-a89e-a3e01206a806/chat", &config).is_ok());
+        assert!(
+            ensure_scope(
+                "/workspaces/fa76881f-6367-4b80-a89e-a3e01206a806/chat",
+                &config
+            )
+            .is_ok()
+        );
         assert!(matches!(
-            ensure_scope("/workspaces/00000000-0000-0000-0000-000000000001/chat", &config),
+            ensure_scope(
+                "/workspaces/00000000-0000-0000-0000-000000000001/chat",
+                &config
+            ),
             Err(HrmScopeError::Workspace(_))
         ));
         assert!(matches!(
-            ensure_scope("/tenants/00000000-0000-0000-0000-000000000001/workspaces", &config),
+            ensure_scope(
+                "/tenants/00000000-0000-0000-0000-000000000001/workspaces",
+                &config
+            ),
             Err(HrmScopeError::Tenant(_))
         ));
     }
@@ -461,6 +476,7 @@ mod tests {
             "/documents/2f1d4e3c-0000-4000-8000-000000000001",
             "/documents/2f1d4e3c-0000-4000-8000-000000000001/retry",
             "/documents/2f1d4e3c-0000-4000-8000-000000000001/preview",
+            "/documents/2f1d4e3c-0000-4000-8000-000000000001/file",
             "/chat",
             "/chat/history",
             "/chat/sessions",
@@ -594,9 +610,8 @@ mod tests {
 
     #[test]
     fn manager_to_hr_promotes_the_single_tuple() {
-        let object = Object::Workspace(
-            Uuid::parse_str("fa76881f-6367-4b80-a89e-a3e01206a806").unwrap(),
-        );
+        let object =
+            Object::Workspace(Uuid::parse_str("fa76881f-6367-4b80-a89e-a3e01206a806").unwrap());
         let desired_relation = HrmConfig::role_relation(Some(HRM_HR_ROLE)).unwrap();
         let plan = plan_tuple_sync(
             "user:role-change-1",
@@ -625,9 +640,8 @@ mod tests {
 
     #[test]
     fn hr_to_manager_demotes_the_single_tuple() {
-        let object = Object::Workspace(
-            Uuid::parse_str("fa76881f-6367-4b80-a89e-a3e01206a806").unwrap(),
-        );
+        let object =
+            Object::Workspace(Uuid::parse_str("fa76881f-6367-4b80-a89e-a3e01206a806").unwrap());
         let desired_relation = HrmConfig::role_relation(Some(HRM_MANAGER_ROLE)).unwrap();
         let plan = plan_tuple_sync(
             "user:role-change-2",

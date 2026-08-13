@@ -161,11 +161,46 @@ pub async fn method_not_allowed() -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{Router, body::Body, http::Request, routing::get};
+    use tower::ServiceExt;
 
     #[test]
     fn status_mapping_uses_stable_safe_codes() {
         let error = ApiError::from_status(StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(error.code, "INTERNAL_ERROR");
         assert_eq!(error.message, "Internal server error");
+    }
+
+    /// Xác nhận hành vi thật của middleware trên một handler trả `StatusCode` thô
+    /// (không đi qua `ApiError`) — đây là mẫu hình `get_document_preview` dùng cho
+    /// nhánh 409 trước Phase 17.2. Nếu middleware đã tự bọc JSON, việc sửa 17.2 chỉ
+    /// còn là đổi `code` generic "CONFLICT" thành mã ổn định theo ngữ nghĩa, không
+    /// phải thêm JSON body từ chỗ không có gì.
+    #[tokio::test]
+    async fn normalize_error_responses_wraps_a_bare_status_code_response() {
+        let app = Router::new()
+            .route(
+                "/bare-conflict",
+                get(|| async { StatusCode::CONFLICT.into_response() }),
+            )
+            .layer(axum::middleware::from_fn(normalize_error_responses));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/bare-conflict")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).expect(
+            "bare StatusCode response must still be normalized into a JSON error envelope",
+        );
+        assert_eq!(value["error"]["code"], "CONFLICT");
+        assert_eq!(value["error"]["message"], "The request conflicts with current state");
     }
 }
