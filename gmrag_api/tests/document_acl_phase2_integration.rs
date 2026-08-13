@@ -828,7 +828,7 @@ async fn phase2_document_acl_and_qdrant_enforcement() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO chat_messages (session_id, role, content, citations) VALUES ($1, 'assistant', $2, $3)",
+        "INSERT INTO chat_messages (session_id, message_sequence, role, content, citations) VALUES ($1, 2, 'assistant', $2, $3)",
     )
     .bind(history_session_member)
     .bind(format!("restricted citation [chunk:{restricted_chunk_id}]"))
@@ -1216,19 +1216,20 @@ async fn chat_history_pagination_is_stable_complete_and_owner_scoped() {
     for index in 0..7 {
         sqlx::query(
             r#"
-            INSERT INTO chat_messages (id, session_id, role, content, citations, created_at)
-            VALUES ($1, $2, 'user', $3, '[]'::jsonb, TIMESTAMP '2026-01-01 00:00:00')
+            INSERT INTO chat_messages (id, session_id, message_sequence, role, content, citations, created_at)
+            VALUES ($1, $2, $4, 'user', $3, '[]'::jsonb, TIMESTAMP '2026-01-01 00:00:00')
             "#,
         )
         .bind(Uuid::new_v4())
         .bind(message_session)
         .bind(format!("message {index}"))
+        .bind((index + 1) as i64)
         .execute(&server.pool)
         .await
         .unwrap();
     }
     let expected_message_ids: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM chat_messages WHERE session_id = $1 ORDER BY created_at ASC, id ASC",
+        "SELECT id FROM chat_messages WHERE session_id = $1 ORDER BY message_sequence ASC",
     )
     .bind(message_session)
     .fetch_all(&server.pool)
@@ -1801,6 +1802,283 @@ async fn phase2_access_mode_and_share_endpoints_allow_and_deny() {
         member_preview_after_unrestrict.status(),
         reqwest::StatusCode::OK
     );
+}
+
+/// Phase 17.1/17.2/17.5: `/file` phục vụ đúng bytes gốc từ storage, tái dùng
+/// nguyên khối ACL của `/preview` (member + `can_user_view_document`), và
+/// `/preview` khi chưa `COMPLETED` phải trả JSON body ổn định thay vì status
+/// thô rỗng.
+#[tokio::test]
+async fn document_file_endpoint_serves_bytes_enforces_acl_and_reports_stable_errors() {
+    let _guard = phase2_test_lock().lock().await;
+    let server = TestServer::bootstrap().await;
+
+    let tenant_id = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
+    let other_workspace_id = Uuid::new_v4();
+    let member_user = format!("phase17-file-member-{}", Uuid::new_v4());
+    let non_member_user = format!("phase17-file-nonmember-{}", Uuid::new_v4());
+
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, $2)")
+        .bind(tenant_id)
+        .bind(format!("Phase17 Tenant {tenant_id}"))
+        .execute(&server.pool)
+        .await
+        .unwrap();
+
+    for ws in [workspace_id, other_workspace_id] {
+        sqlx::query("INSERT INTO workspaces (id, tenant_id, name) VALUES ($1, $2, $3)")
+            .bind(ws)
+            .bind(tenant_id)
+            .bind(format!("Phase17 Workspace {ws}"))
+            .execute(&server.pool)
+            .await
+            .unwrap();
+    }
+
+    for user in [&member_user, &non_member_user] {
+        sqlx::query("INSERT INTO users (id, email) VALUES ($1, $2)")
+            .bind(user)
+            .bind(format!("{user}@test.local"))
+            .execute(&server.pool)
+            .await
+            .unwrap();
+    }
+
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, user_id, role) VALUES ($1, $2, 'MEMBER')",
+    )
+    .bind(workspace_id)
+    .bind(&member_user)
+    .execute(&server.pool)
+    .await
+    .unwrap();
+
+    server
+        .state
+        .authz_client
+        .write_tuple(
+            "platform:system",
+            Relation::Platform,
+            &Object::Tenant(tenant_id),
+        )
+        .await
+        .unwrap();
+    server
+        .state
+        .authz_client
+        .write_tuple(
+            &format!("tenant:{tenant_id}"),
+            Relation::Tenant,
+            &Object::Workspace(workspace_id),
+        )
+        .await
+        .unwrap();
+    server
+        .state
+        .authz_client
+        .write_tuple(
+            &format!("user:{member_user}"),
+            Relation::Member,
+            &Object::Workspace(workspace_id),
+        )
+        .await
+        .unwrap();
+
+    // Tên file tiếng Việt có dấu — đúng dạng corpus thật sẽ gặp, khác với
+    // `KIEMTHU-noi-quy-lao-dong-GMS.pdf` (ASCII) đang có trong corpus kiểm thử.
+    let filename = "Điều lệ công ty GMS (có dấu).pdf";
+    let file_bytes = b"%PDF-1.4 phase17 fake original bytes\n%%EOF".to_vec();
+    let object_key =
+        format!("tenants/phase17-test/workspaces/{workspace_id}/documents/original.pdf");
+
+    server
+        .state
+        .storage
+        .put_original_document(&object_key, &file_bytes, Some("application/pdf"))
+        .await
+        .unwrap();
+
+    let completed_doc_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO documents (
+            id, workspace_id, owner_id, filename, status, processing_stage,
+            access_mode, object_key, bucket, content_type, size_bytes,
+            checksum_sha256, storage_etag, uploaded_by
+        )
+        VALUES ($1, $2, $3, $4, 'COMPLETED', 'DONE', 'workspace_default', $5, $6, 'application/pdf', $7, 'phase17', NULL, $8)
+        "#,
+    )
+    .bind(completed_doc_id)
+    .bind(workspace_id)
+    .bind(&member_user)
+    .bind(filename)
+    .bind(&object_key)
+    .bind(server.state.storage.bucket())
+    .bind(file_bytes.len() as i64)
+    .bind(&member_user)
+    .execute(&server.pool)
+    .await
+    .unwrap();
+    write_tuple_idempotent(
+        &server.state,
+        &format!("workspace:{workspace_id}"),
+        Relation::Workspace,
+        &Object::Document(completed_doc_id),
+    )
+    .await;
+
+    let processing_doc_id = Uuid::new_v4();
+    insert_document(
+        &server.pool,
+        workspace_id,
+        processing_doc_id,
+        &member_user,
+        "still-processing.pdf",
+        "workspace_default",
+    )
+    .await;
+    sqlx::query("UPDATE documents SET status = 'PROCESSING' WHERE id = $1")
+        .bind(processing_doc_id)
+        .execute(&server.pool)
+        .await
+        .unwrap();
+    write_tuple_idempotent(
+        &server.state,
+        &format!("workspace:{workspace_id}"),
+        Relation::Workspace,
+        &Object::Document(processing_doc_id),
+    )
+    .await;
+
+    let other_workspace_doc_id = Uuid::new_v4();
+    insert_document(
+        &server.pool,
+        other_workspace_id,
+        other_workspace_doc_id,
+        &member_user,
+        "other-workspace.pdf",
+        "workspace_default",
+    )
+    .await;
+
+    let client = Client::new();
+
+    // 1. Thành công: bytes khớp nguyên văn, Content-Type từ DB, Content-Disposition
+    //    RFC 5987 xử lý được tên file tiếng Việt có dấu.
+    let ok_response = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents/{completed_doc_id}/file",
+            server.addr
+        ))
+        .bearer_auth(&member_user)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok_response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        ok_response.headers().get("content-type").unwrap(),
+        "application/pdf"
+    );
+    let disposition = ok_response
+        .headers()
+        .get("content-disposition")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(disposition.starts_with("inline; filename=\""));
+    assert!(disposition.contains("filename*=UTF-8''"));
+    // Percent-encoded UTF-8 bytes của "Điều" — xác nhận không vỡ dấu.
+    assert!(disposition.contains("%C4%90i%E1%BB%81u"));
+    let response_bytes = ok_response.bytes().await.unwrap();
+    assert_eq!(response_bytes.as_ref(), file_bytes.as_slice());
+
+    // 2. Không tồn tại -> 404.
+    let unknown_id = Uuid::new_v4();
+    let unknown_response = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents/{unknown_id}/file",
+            server.addr
+        ))
+        .bearer_auth(&member_user)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown_response.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // 3. Thuộc workspace khác -> 404, không phải 200/403 — chống dò document_id
+    //    qua workspace sai.
+    let cross_workspace_response = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents/{other_workspace_doc_id}/file",
+            server.addr
+        ))
+        .bearer_auth(&member_user)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        cross_workspace_response.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    // 4. Không phải member workspace -> 403 (quyết định Phase 17.3: giữ nguyên
+    //    hành vi hiện có của `/preview`, xem docs/PHASE17_RESULT.md mục 17.3).
+    let forbidden_response = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents/{completed_doc_id}/file",
+            server.addr
+        ))
+        .bearer_auth(&non_member_user)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        forbidden_response.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+
+    // 5. Chưa COMPLETED -> 409 với JSON body ổn định (Phase 17.2).
+    let not_ready_response = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents/{processing_doc_id}/file",
+            server.addr
+        ))
+        .bearer_auth(&member_user)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(not_ready_response.status(), reqwest::StatusCode::CONFLICT);
+    let not_ready_body: Value = not_ready_response.json().await.unwrap();
+    assert_eq!(not_ready_body["error"]["code"], "DOCUMENT_NOT_READY");
+    assert!(not_ready_body["error"]["message"].is_string());
+
+    // 6. `/preview` chưa COMPLETED cũng phải trả cùng mã lỗi ổn định, có JSON body
+    //    (trước Phase 17.2 handler trả `StatusCode::CONFLICT` thô).
+    let preview_not_ready = client
+        .get(format!(
+            "{}/workspaces/{workspace_id}/documents/{processing_doc_id}/preview",
+            server.addr
+        ))
+        .bearer_auth(&member_user)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preview_not_ready.status(), reqwest::StatusCode::CONFLICT);
+    let preview_not_ready_body: Value = preview_not_ready.json().await.unwrap();
+    assert_eq!(
+        preview_not_ready_body["error"]["code"],
+        "DOCUMENT_NOT_READY"
+    );
+    assert!(preview_not_ready_body["error"]["message"].is_string());
+
+    // 7. Alias `hrm` áp dụng cho `/file` giống mọi route workspace khác — kiểm
+    //    tra generic ở `auth/hrm.rs::workspace_alias_resolves_on_every_workspace_route`
+    //    (suffix "/documents/.../file" đã có trong danh sách đó); ở đây chỉ xác
+    //    nhận route hoạt động end-to-end qua UUID thật, việc alias tự áp dụng
+    //    cho mọi suffix không cần lặp lại bằng một server HRM_MODE riêng.
 }
 
 #[tokio::test]
@@ -3023,13 +3301,27 @@ fn init_test_env(qdrant_addr: &str, ollama_addr: &str, deepseek_addr: &str) {
         std::env::set_var("APP_ENV", "test");
         std::env::set_var("TEST_BYPASS_JWT", "1");
         std::env::set_var("TEST_BYPASS_KEYCLOAK", "1");
-        std::env::set_var("S3_ENDPOINT_URL", "http://localhost:9000");
-        std::env::set_var("S3_REGION", "us-east-1");
+        // Chỉ đặt mặc định khi biến chưa có sẵn (giống `S3_BUCKET` bên dưới): runner cô
+        // lập (`scripts/run-isolated-integration-tests.ps1`, hoặc thủ công khi host chưa
+        // có PowerShell 7) nạp credential MinIO thật của deployment qua `.env` trước khi
+        // gọi `cargo test`. Ghi đè cứng ở đây từng làm `Storage::put_original_document`/
+        // `get_original_document` xác thực sai — deployment này đổi `MINIO_ROOT_USER` khỏi
+        // `minioadmin` mặc định của docker-compose.
+        if std::env::var_os("S3_ENDPOINT_URL").is_none() {
+            std::env::set_var("S3_ENDPOINT_URL", "http://localhost:9000");
+        }
+        if std::env::var_os("S3_REGION").is_none() {
+            std::env::set_var("S3_REGION", "us-east-1");
+        }
         if std::env::var_os("S3_BUCKET").is_none() {
             std::env::set_var("S3_BUCKET", "gmrag-documents");
         }
-        std::env::set_var("S3_ACCESS_KEY_ID", "minioadmin");
-        std::env::set_var("S3_SECRET_ACCESS_KEY", "minioadmin");
+        if std::env::var_os("S3_ACCESS_KEY_ID").is_none() {
+            std::env::set_var("S3_ACCESS_KEY_ID", "minioadmin");
+        }
+        if std::env::var_os("S3_SECRET_ACCESS_KEY").is_none() {
+            std::env::set_var("S3_SECRET_ACCESS_KEY", "minioadmin");
+        }
         std::env::set_var("S3_FORCE_PATH_STYLE", "true");
         std::env::set_var("S3_PRESIGN_EXPIRY_SECS", "900");
         std::env::set_var("OLLAMA_EMBED_URL", format!("{ollama_addr}/api/embed"));
