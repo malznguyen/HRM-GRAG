@@ -171,6 +171,31 @@ DELETE {{baseUrl}}/workspaces/{{workspaceId}}/chat/sessions/{{sessionId}}
 Authorization: Bearer {{accessToken}}
 
 
+### 6f. Xem tai lieu dang text, cuon toi doan trich (Phase 17)
+# Tra toan van da trich xuat + mang chunk co chunk_index. Dung khi muon
+# highlight dung doan duoc trich trong ngu canh toan bo tai lieu.
+GET {{baseUrl}}/workspaces/{{workspaceId}}/documents/{{documentId}}/preview
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### 6g. Doc trong mot chunk, khong cat (Phase 17)
+# {{chunkId}} khong tu dong lay duoc tu response SSE cua request 4-6 (IDE nay
+# khong parse duoc event: citations) — copy tay mot chunk_id tu do, hoac tu
+# response cua 6b/6c (field citations[].chunk_id).
+GET {{baseUrl}}/workspaces/{{workspaceId}}/chunks/{{chunkId}}
+Authorization: Bearer {{accessToken}}
+Accept: application/json
+
+
+### 6h. Mo file PDF goc (Phase 17)
+# Proxy bytes qua API, khong phai presigned URL. Content-Disposition: inline
+# de trinh duyet render thay vi tai ve; Content-Type lay tu DB, khong doan tu
+# duoi file.
+GET {{baseUrl}}/workspaces/{{workspaceId}}/documents/{{documentId}}/file
+Authorization: Bearer {{accessToken}}
+
+
 ### 7. Liet ke tai lieu (OPTIONAL — chi de doi soat)
 # Khong bat buoc cho tich hop. Dung khi HRM mat document_id.
 GET {{baseUrl}}/workspaces/{{workspaceId}}/documents?limit=20&offset=0
@@ -295,3 +320,12 @@ Content-Type: application/json
 
 ### E12. Route khong ton tai -> 404 RESOURCE_NOT_FOUND
 GET {{baseUrl}}/v1/health
+
+### E13. /file voi document_id khong ton tai -> 404 RESOURCE_NOT_FOUND (Phase 17)
+GET {{baseUrl}}/workspaces/{{workspaceId}}/documents/{{missingDocumentId}}/file
+Authorization: Bearer {{accessToken}}
+
+### E14. /preview hoac /file khi document chua COMPLETED -> 409 DOCUMENT_NOT_READY (Phase 17)
+# Chay ngay sau request 2 (upload), TRUOC khi request 3 xac nhan COMPLETED.
+GET {{baseUrl}}/workspaces/{{workspaceId}}/documents/{{documentId}}/preview
+Authorization: Bearer {{accessToken}}

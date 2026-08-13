@@ -7,8 +7,10 @@ info:
   description: |
     This specification documents **only** the endpoints the HRM backend consumes.
     The running service registers more routes (members, tenants, sharing, graph,
-    preview, metrics, ...). They are intentionally excluded — see
-    `docs/PHASE4_RESULT.md` for the exclusion list and the reasons.
+    metrics, ...). They are intentionally excluded — see `docs/PHASE4_RESULT.md`
+    for the exclusion list and the reasons. `/preview`, `/chunks/{chunk_id}` and
+    `/file` were excluded there too but were added to this contract in Phase 17
+    (`docs/PHASE17_RESULT.md`) once HRM's document-viewer requirement was confirmed.
 
     Everything here was derived from the Rust source in `gmrag_api/src`:
     `lib.rs` (router), `routes/documents.rs`, `routes/chat.rs`,
@@ -411,6 +413,323 @@ paths:
                       code: INTERNAL_ERROR
                       message: Internal server error
 
+  /workspaces/{workspace_id}/documents/{document_id}/preview:
+    get:
+      tags: [Documents]
+      operationId: getDocumentPreview
+      summary: Read the full extracted text of a document, plus its chunks
+      description: |
+        Returns the document's **extracted text** (what the ingestion pipeline
+        pulled out of the PDF/DOCX/TXT/MD at upload time), joined from every
+        chunk, plus each chunk individually with its `chunk_index`. This is
+        **not** the original file — see `/file` below for that.
+
+        Authorization is two layers, same as every other document route:
+        `member` relation on the workspace, then per-document ACL via
+        `can_user_view_document`. A denied document ACL check returns `404`,
+        identical to an unknown document — see mục 4.7 of the integration
+        guide. A denied *workspace membership* check returns `403`, not `404`
+        (Phase 17.3 decision: kept as-is — see `GET /chunks/{chunk_id}` below
+        for the rationale, which applies identically here).
+
+        Not paginated — a document with many chunks produces a large payload
+        in one response.
+
+        Citation-to-document flow: given a citation's `document_id`, call this
+        endpoint, then locate `chunks[]` by `chunk_index` (or by `id` matching
+        the citation's `chunk_id`) to scroll to and highlight the cited
+        passage in context. See the flow description under `/file` below.
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - $ref: "#/components/parameters/DocumentId"
+      responses:
+        "200":
+          description: The document's extracted text and chunks.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DocumentPreviewResponse" }
+              examples:
+                completed:
+                  summary: Verbatim shape from document_acl_phase2_integration.rs (values illustrative)
+                  value:
+                    content: "Điều 1. Giờ làm việc...\n\nĐiều 2. Ngày nghỉ..."
+                    chunks:
+                      - chunk_index: 0
+                        text: "Điều 1. Giờ làm việc..."
+                        id: 903f3b06-f3c0-45d9-b2c3-06939a00dfeb
+                      - chunk_index: 1
+                        text: "Điều 2. Ngày nghỉ..."
+                        id: 69778d24-db1d-486f-ba5d-a926a32b472f
+                    document:
+                      id: 69f56ad1-f379-4705-9eb4-f58cbd269420
+                      filename: noi-quy-cong-ty-smoke.md
+                      content_type: text/markdown
+                      created_at: "2026-08-06T03:22:57.106555Z"
+                      size_bytes: 412
+                      access_mode: workspace_default
+                      status: COMPLETED
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: "`FORBIDDEN` — the caller is not a member of the workspace. See the `GET /chunks/{chunk_id}` 17.3 note below."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                notMember:
+                  value:
+                    error:
+                      code: FORBIDDEN
+                      message: Access denied
+        "404":
+          description: Unknown document, foreign workspace, or not viewable by this caller — deliberately indistinguishable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                notFound: { $ref: "#/components/examples/ResourceNotFound" }
+        "409": { $ref: "#/components/responses/DocumentNotReady" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /workspaces/{workspace_id}/documents/{document_id}/file:
+    get:
+      tags: [Documents]
+      operationId: getDocumentFile
+      summary: Download/embed the original document file (added in Phase 17.1)
+      description: |
+        Streams the **original bytes** of the file HRM uploaded (the PDF/DOCX/
+        TXT/MD itself, not extracted text), proxied through this API from the
+        object store. This route did not exist before Phase 17 —
+        `docs/INVESTIGATION_DOCUMENT_VIEWER.md` traced that no code path had
+        ever connected the storage read (`Storage::get_original_document`,
+        previously only called by the ingestion worker) to an HTTP handler.
+        The product decision (superseding the older note that HRM must keep
+        its own original files) is: HRM opens the PDF **from this system**,
+        not from SharePoint or its own store.
+
+        **Design: proxy bytes through the API, not a presigned URL.** A
+        presigned MinIO/S3 URL was considered and rejected: it would require a
+        public S3 endpoint distinct from the internal `S3_ENDPOINT_URL`
+        (currently a Docker-internal hostname), CORS configuration on MinIO
+        (none exists today), and it would bypass this API's authorization
+        layer for the actual byte transfer. Proxying keeps every read behind
+        the same ACL check as every other document route, and the corpus size
+        (tens of files) keeps the bandwidth/memory cost acceptable.
+
+        Authorization reuses the **exact same block** as `/preview` above —
+        `member` relation, then `can_user_view_document` — no new ACL logic
+        was written for this route.
+
+        **Memory note:** `Storage::get_original_document` reads the entire
+        object into RAM (no streaming read exists in the storage layer). This
+        route rejects with `500 DOCUMENT_FILE_TOO_LARGE` before attempting the
+        read if `documents.size_bytes` exceeds the same limit enforced at
+        upload time (`DOCUMENT_MAX_UPLOAD_BYTES`, default 50 MiB) — no
+        document that was ever accepted by `/upload` can exceed it, so this is
+        a defensive guard against configuration drift (the limit being lowered
+        after the document was uploaded), not an expected client-facing error.
+
+        **`/file` cannot jump to the page containing a specific citation** —
+        `document_chunks` has no page-number column. If HRM needs that, it is
+        out of scope for this phase; embed the whole file and let the user
+        scroll, or use `/preview` for an in-context, chunk-highlighted view
+        instead.
+
+        ### Citation-to-document flow
+
+        1. A chat citation carries both `chunk_id` and `document_id` already
+           (`event: citations`, `POST /citations/resolve` if used internally,
+           or a history citation) — no extra lookup is needed to start any of
+           the three flows below.
+        2. **Read the full cited passage:** `GET /chunks/{chunk_id}`.
+        3. **View in context, scrolled to the passage:** `GET
+           /documents/{document_id}/preview`, find the entry in `chunks[]`
+           whose `id` equals the citation's `chunk_id` (or match by
+           `chunk_index`), and highlight it — this is the same pattern
+           `gmrag_ui`'s document viewer already implements.
+        4. **Open the original file:** `GET /documents/{document_id}/file`,
+           embedded in an `<iframe>` or opened in a new tab. The response
+           `Content-Type` matches the stored file type (`application/pdf` for
+           the current corpus) and `Content-Disposition: inline` asks the
+           browser to render rather than force a download.
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - $ref: "#/components/parameters/DocumentId"
+      responses:
+        "200":
+          description: |
+            The original file bytes. `Content-Length` is derived by the HTTP
+            layer from the actual bytes served, not copied from the stored
+            `size_bytes` column, so it cannot drift from the real body.
+          headers:
+            Content-Type:
+              description: Taken verbatim from `documents.content_type` in the database — never guessed from the filename extension.
+              schema: { type: string }
+              example: application/pdf
+            Content-Disposition:
+              description: |
+                `inline; filename="<ascii-fallback>"; filename*=UTF-8''<percent-encoded-utf8>`
+                (RFC 6266 + RFC 5987). The quoted `filename` parameter is an
+                ASCII-only fallback for clients that don't parse `filename*`
+                (non-ASCII bytes replaced with `_`); `filename*` carries the
+                exact original name, percent-encoded per RFC 5987, and is what
+                a modern browser actually uses — Vietnamese diacritics survive
+                intact there.
+              schema: { type: string }
+              example: inline; filename="Dieu_le_cong_ty_GMS_co_dau.pdf"; filename*=UTF-8''%C4%90i%E1%BB%81u%20l%E1%BB%87%20c%C3%B4ng%20ty%20GMS%20%28c%C3%B3%20d%E1%BA%A5u%29.pdf
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: |
+            `FORBIDDEN` — the caller is not a member of the workspace.
+
+            Phase 17.3 decision: this is **kept as `403`, not folded into
+            `404`**, unlike the document-ACL denial below. Rationale:
+            workspace membership is a fact about the caller's own relationship
+            to a workspace the caller already chose in the URL — it reveals
+            nothing about whether any particular `document_id` exists.
+            Changing this to `404` would only be needed if the same caller
+            could otherwise learn something about documents in a workspace
+            they cannot access at all, which is not the case here. `/preview`
+            and `/chunks/{chunk_id}` already behaved this way before Phase 17
+            (confirmed by `document_acl_phase2_integration.rs`); this route
+            matches them for consistency instead of introducing a third
+            behaviour.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                notMember:
+                  value:
+                    error:
+                      code: FORBIDDEN
+                      message: Access denied
+        "404":
+          description: |
+            Unknown document, foreign workspace, or not viewable by this
+            caller — deliberately indistinguishable, same rule as every other
+            document route. **This 404 is intentionally ambiguous; do not
+            treat it as proof the document does not exist.**
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                notFound: { $ref: "#/components/examples/ResourceNotFound" }
+        "409": { $ref: "#/components/responses/DocumentNotReady" }
+        "410":
+          description: |
+            `DOCUMENT_OBJECT_MISSING` — the document row says `COMPLETED` and
+            the caller is allowed to view it, but the object is missing from
+            storage (same code and status already used by the existing
+            `POST .../retry` endpoint for the same condition, reused rather
+            than inventing a parallel vocabulary). Seen on legacy rows
+            backfilled before object storage existed
+            (`bucket = 'legacy-local-disk'`) or after manual storage
+            intervention. Not retryable by re-calling `/file`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                objectMissing:
+                  value:
+                    error:
+                      code: DOCUMENT_OBJECT_MISSING
+                      message: Original document object is missing
+        "500":
+          description: |
+            `INTERNAL_ERROR` — database or storage read failure.
+            `DOCUMENT_FILE_TOO_LARGE` — `size_bytes` exceeds the in-memory
+            serving limit; see the memory note above. Expected to be
+            effectively unreachable in normal operation.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                internal:
+                  value:
+                    error:
+                      code: INTERNAL_ERROR
+                      message: Internal server error
+                tooLarge:
+                  value:
+                    error:
+                      code: DOCUMENT_FILE_TOO_LARGE
+                      message: Original document exceeds the size limit for this endpoint
+
+  /workspaces/{workspace_id}/chunks/{chunk_id}:
+    get:
+      tags: [Documents]
+      operationId: getDocumentChunk
+      summary: Read one chunk's full text, untruncated
+      description: |
+        Returns a single chunk's complete `original_text` — unlike the
+        `snippet` field in chat citations, which is cut to 280 characters at a
+        word boundary. Use this when the user wants to read the entire cited
+        passage without opening the source document.
+
+        Authorization: two layers, same pattern as `/preview` and `/file` —
+        `member` relation on the workspace (path `workspace_id`, **not**
+        derived from the chunk), then the chunk's owning document is
+        ACL-checked with the same `can_user_view_document` used everywhere
+        else. A chunk whose document was deleted is indistinguishable from an
+        unknown chunk ID (`document_chunks` cascades on document delete).
+
+        **17.3 rationale for keeping workspace-membership denial as `403`
+        instead of folding it into `404`:** `hide_document_existence`
+        (Phase 5.3) exists to stop a caller from learning whether a specific
+        `document_id`/`chunk_id` exists by comparing responses across routes
+        or methods. Workspace membership denial reveals only "you are not a
+        member of workspace `X`" — information the caller already possesses,
+        since they supplied `X` themselves in the URL. It says nothing about
+        any chunk or document inside that workspace. Folding it into `404`
+        would remove a useful, harmless distinction (misconfigured
+        integration vs. a real permission gap) for no additional
+        confidentiality. `/preview`, `/file` and this route all apply the
+        rule identically, so switching `GET` to a different route under the
+        same `workspace_id` never reveals anything new either way.
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+        - name: chunk_id
+          in: path
+          required: true
+          description: The `chunk_id` from a citation.
+          schema: { type: string, format: uuid }
+          example: 3f601309-1f9e-4f88-9f16-1077bb849460
+      responses:
+        "200":
+          description: The chunk's full text.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChunkResponse" }
+              examples:
+                found:
+                  value:
+                    id: 3f601309-1f9e-4f88-9f16-1077bb849460
+                    original_text: "Điều 23. Nguyên tắc làm thêm giờ\n\n1. Làm thêm giờ chỉ được thực hiện khi có sự đồng ý của người lao động..."
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403":
+          description: "`FORBIDDEN` — the caller is not a member of the workspace. See the 17.3 rationale above."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                notMember:
+                  value:
+                    error:
+                      code: FORBIDDEN
+                      message: Access denied
+        "404":
+          description: Unknown chunk, chunk's document deleted or in a different workspace, or not viewable by this caller — deliberately indistinguishable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                notFound: { $ref: "#/components/examples/ResourceNotFound" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
   /workspaces/{workspace_id}/documents:
     get:
       tags: [Documents]
@@ -743,9 +1062,11 @@ paths:
         There is no admin override: `ADMIN` and `HR` can read only their own
         sessions. This handler does not check `CHATBOT_USE`.
 
-        Messages are paginated with `limit`/`offset` and returned oldest first,
-        with UUID as the stable timestamp tiebreaker. Citation ACL is re-checked
-        at read time. Inaccessible chunk UUIDs and their stored UUID markers are
+        Messages are paginated with `limit`/`offset` and returned oldest first by
+        the server's internal per-session message sequence. That sequence is not
+        exposed in the response and may contain intentional gaps when an
+        assistant stream does not persist. Citation ACL is re-checked at read
+        time. Inaccessible chunk UUIDs and their stored UUID markers are
         removed from the returned message. Assistant citations are hydrated in
         one batch for the whole page and contain `chunk_id`, `document_id`,
         `document_name` and a query-centered `snippet`; history does not include
@@ -896,8 +1217,10 @@ paths:
         Preferred messages route for new clients. Authorization, response and
         ordering are identical to `/chat/history?session_id=...`: workspace
         `member` plus exact session ownership, no admin override, no
-        `CHATBOT_USE` check, `limit`/`offset` pagination, oldest message first
-        with UUID as tiebreaker, and citation ACL re-checking at read time.
+        `CHATBOT_USE` check, `limit`/`offset` pagination, oldest message first by
+        the server's internal per-session message sequence (not exposed in the
+        response; intentional gaps are possible), and citation ACL re-checking
+        at read time.
         History citations are rich four-field objects (without the stream-only
         `index`) and are hydrated once for the complete page. Each assistant
         snippet is selected using the immediately preceding user message on that
@@ -1271,6 +1594,26 @@ components:
                   code: AUTHZ_ERROR
                   message: Authorization service unavailable
 
+    DocumentNotReady:
+      description: |
+        `DOCUMENT_NOT_READY` — the document row exists and is visible to the
+        caller, but `status` is not yet `COMPLETED` (still `PROCESSING`, or
+        terminally `FAILED`). Added in Phase 17.2: before this, `/preview`
+        returned a bare `409` with an empty body for this case; the global
+        `normalize_error_responses` middleware still wrapped it into this same
+        JSON envelope with the generic code `CONFLICT`, so the body was never
+        actually missing — only the machine-readable code was non-specific.
+        `/file` reuses the exact same check and code.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+          examples:
+            notReady:
+              value:
+                error:
+                  code: DOCUMENT_NOT_READY
+                  message: Document is not ready yet; status must be COMPLETED
+
   schemas:
 
     ErrorResponse:
@@ -1310,6 +1653,9 @@ components:
                 - GENERATION_SERVICE_UNAVAILABLE
                 - AUTHZ_ERROR
                 - AUTHZ_REVOKE_FAILED
+                - DOCUMENT_NOT_READY
+                - DOCUMENT_OBJECT_MISSING
+                - DOCUMENT_FILE_TOO_LARGE
                 - INTERNAL_ERROR
             message:
               type: string
@@ -1579,6 +1925,80 @@ components:
             `chunk_count = 0` means nothing was extracted and the document will
             never be cited.
 
+    PreviewChunkItem:
+      type: object
+      required: [chunk_index, text, id]
+      additionalProperties: false
+      properties:
+        chunk_index:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Position of this chunk within the document, ascending from 0. Stable — use it to locate/scroll to a specific citation inside `content`.
+        text:
+          type: string
+          description: The chunk's full extracted text, unmodified, not truncated.
+        id:
+          type: string
+          format: uuid
+          description: The `chunk_id` that appears in citations. Same value `GET /chunks/{chunk_id}` accepts.
+
+    PreviewDocumentMeta:
+      type: object
+      required: [id, filename, content_type, created_at, size_bytes, access_mode, status]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          format: uuid
+        filename:
+          type: string
+        content_type:
+          type: [string, "null"]
+          description: As stored at upload time. `null` for documents ingested before object-storage metadata existed (Phase 5).
+        created_at:
+          allOf: [{ $ref: "#/components/schemas/UtcDateTime" }]
+        size_bytes:
+          type: [integer, "null"]
+          format: int64
+          description: Original file size in bytes. `null` for pre-Phase-5 documents.
+        access_mode:
+          $ref: "#/components/schemas/DocumentAccessMode"
+        status:
+          $ref: "#/components/schemas/DocumentStatus"
+
+    DocumentPreviewResponse:
+      type: object
+      required: [content, chunks, document]
+      additionalProperties: false
+      properties:
+        content:
+          type: string
+          description: |
+            The full extracted text of the document: every chunk's `text`,
+            joined in `chunk_index` order with a `"\n\n"` separator. This is
+            **not** the original file bytes — it is what the ingestion
+            pipeline extracted from the PDF/DOCX/TXT/MD at upload time. Not
+            paginated; a document with many chunks produces a large payload.
+        chunks:
+          type: array
+          description: Same chunks that make up `content`, individually addressable. Never empty for a `COMPLETED` document reachable through this endpoint (an empty-chunk document is unreachable in chat, but `content=""` and `chunks=[]` are structurally possible and must not crash the client).
+          items: { $ref: "#/components/schemas/PreviewChunkItem" }
+        document:
+          $ref: "#/components/schemas/PreviewDocumentMeta"
+
+    ChunkResponse:
+      type: object
+      required: [id, original_text]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+          format: uuid
+        original_text:
+          type: string
+          description: The chunk's full text, unmodified, not truncated — unlike the `snippet` fields in chat citations, which are cut to 280 characters.
+
     WorkspaceDocumentsResponse:
       type: object
       description: A page of documents. The page fields are flattened into the top level by `#[serde(flatten)]`.
@@ -1741,8 +2161,11 @@ components:
         reading; inaccessible citations and their stored UUID markers are removed.
         Assistant citations are hydrated once per page and use the same document
         metadata as the stream, but history maps markers by `chunk_id` and does
-        not include the stream-only `index` field. User messages always have an
-        empty citations array.
+        not include the stream-only `index` field. Because `content` is generated
+        by an LLM, it may contain an orphan `[chunk:<uuid>]` marker whose UUID is
+        absent from `citations`; clients MUST ignore such a marker, MUST NOT
+        create a dead source link or fail the message, and MAY remove it from
+        displayed text. User messages always have an empty citations array.
       required: [id, role, content, citations, created_at]
       additionalProperties: false
       properties:
@@ -1757,9 +2180,11 @@ components:
         citations:
           type: array
           description: |
-            Rich citation objects. `chunk_id` matches `[chunk:<uuid>]` in the
-            message content. Empty for user messages and whenever no visible
-            citation remains.
+            Rich citation objects. A well-formed marker is matched by
+            `chunk_id`, but an LLM-generated message may also contain an orphan
+            `[chunk:<uuid>]` marker whose UUID is absent from this array. Clients
+            must ignore orphan markers without failing or rendering dead links.
+            Empty for user messages and whenever no visible citation remains.
           items: { $ref: "#/components/schemas/HistoryCitation" }
         created_at:
           $ref: "#/components/schemas/UtcDateTime"

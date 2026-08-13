@@ -52,6 +52,10 @@ khi có server chính thức, team RAG sẽ cung cấp base URL cố định.
 5. Cảnh báo citation: `event: citations` là toàn bộ retrieved set (tối đa 5), không
    phải các nguồn đã được câu trả lời dùng; client phải lọc theo marker `[chunk:N]`
    sau khi ráp toàn bộ text SSE rồi mới hiển thị nguồn.
+6. Từ Phase 17, có ba route để mở tài liệu từ citation: `GET .../file` (bytes PDF
+   gốc, proxy qua API, không presigned URL), `GET .../preview` (toàn văn + chunk
+   để cuộn/highlight) và `GET .../chunks/{chunk_id}` (toàn văn một chunk). Xem
+   [mục 10 trong `INTEGRATION_GUIDE.md`](./INTEGRATION_GUIDE.md#10-xem-tài-liệu-gốc-và-chunk-trích-dẫn-phase-17).
 
 | Role | Đọc/Chat | Upload | Xóa |
 |---|---|---|---|

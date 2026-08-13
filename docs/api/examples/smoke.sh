@@ -72,7 +72,7 @@ WS="${BASE_URL}/workspaces/${WORKSPACE_ID}"
 AUTH="Authorization: Bearer ${TOKEN}"
 
 # ---------------------------------------------------------------- 1. health
-step "1/10  Health check"
+step "1/11  Health check"
 
 health_body="$(curl -sS --max-time 10 "${BASE_URL}/health")" \
   || die "không gọi được ${BASE_URL}/health — API có đang chạy và có gọi được từ máy này không?"
@@ -83,7 +83,7 @@ echo "$health_body"
 green "OK — API sống, database kết nối được"
 
 # ---------------------------------------------------------------- 2. upload
-step "2/9  Upload tài liệu"
+step "2/11  Upload tài liệu"
 
 CLEANUP_FILE=""
 if [ -z "$UPLOAD_FILE" ]; then
@@ -126,7 +126,7 @@ green "OK — document_id = ${DOCUMENT_ID}"
 blue  "Nhắc lại: HRM PHẢI lưu document_id này vào database của mình (mục 5.2)."
 
 # ---------------------------------------------------------------- 3. poll
-step "3/9  Poll trạng thái (tối đa ${POLL_TIMEOUT_SECS}s)"
+step "3/11  Poll trạng thái (tối đa ${POLL_TIMEOUT_SECS}s)"
 
 started=$(date +%s)
 final_status=""
@@ -186,7 +186,7 @@ while :; do
 done
 
 # ---------------------------------------------------------------- 4. chat
-step "4/9  Chat (SSE)"
+step "4/11  Chat (SSE)"
 
 SESSION_ID=""
 if [ "$final_status" != "COMPLETED" ]; then
@@ -297,9 +297,9 @@ PY
   [ "$chat_rc" -eq 0 ] && green "OK — chat stream hợp lệ" || red "Chat stream có vấn đề"
 fi
 
-# ------------------------------------------------------- 5-9. chat history + rename
+# ------------------------------------------------------- 5-11. chat history, tài liệu + rename
 if [ -n "$SESSION_ID" ]; then
-  step "5/10  Đọc history bằng query session_id"
+  step "5/11  Đọc history bằng query session_id"
   history_body="$(mktemp)"
   history_code="$(curl -sS -o "$history_body" -w '%{http_code}' \
     "${WS}/chat/history?session_id=${SESSION_ID}&limit=20&offset=0" -H "$AUTH")"
@@ -326,7 +326,7 @@ PY
   [ "$history_count" -ge 1 ] || die "chat/history không có message của session vừa chat"
   green "OK — history có ${history_count} message"
 
-  step "6/10  Liệt kê session của user hiện tại"
+  step "6/11  Liệt kê session của user hiện tại"
   sessions_body="$(mktemp)"
   sessions_code="$(curl -sS -o "$sessions_body" -w '%{http_code}' \
     "${WS}/chat/sessions?limit=20&offset=0" -H "$AUTH")"
@@ -338,7 +338,7 @@ PY
   rm -f "$sessions_body"
   green "OK — tìm thấy session hiện tại trong danh sách"
 
-  step "7/10  Đổi tiêu đề session bằng PATCH"
+  step "7/11  Đổi tiêu đề session bằng PATCH"
   title_body="$(mktemp)"
   title_code="$(curl -sS -o "$title_body" -w '%{http_code}' \
     -X PATCH "${WS}/chat/sessions/${SESSION_ID}" \
@@ -352,7 +352,7 @@ PY
   rm -f "$title_body"
   green "OK — title Unicode được cập nhật"
 
-  step "8/10  Đọc messages bằng path session_id"
+  step "8/11  Đọc messages bằng path session_id"
   messages_body="$(mktemp)"
   messages_code="$(curl -sS -o "$messages_body" -w '%{http_code}' \
     "${WS}/chat/sessions/${SESSION_ID}/messages?limit=20&offset=0" -H "$AUTH")"
@@ -363,7 +363,60 @@ PY
   [ "$messages_count" -ge 1 ] || die "session messages không có message vừa chat"
   green "OK — messages path có ${messages_count} message"
 
-  step "9/10  Xóa session và xác nhận CASCADE messages"
+  step "9/11  Xem tài liệu: /preview, /chunks/{id}, /file"
+  first_citation_body="$(mktemp)"
+  curl -sS -o "$first_citation_body" \
+    "${WS}/chat/sessions/${SESSION_ID}/messages?limit=20&offset=0" -H "$AUTH"
+  FIRST_CHUNK_ID="$("$PYTHON_BIN" -c '
+import json, sys
+data = json.load(sys.stdin)
+for message in data["messages"]:
+    if message["role"] == "assistant" and message["citations"]:
+        print(message["citations"][0]["chunk_id"])
+        break
+' < "$first_citation_body")"
+  rm -f "$first_citation_body"
+
+  if [ -z "$FIRST_CHUNK_ID" ]; then
+    red "Bỏ qua: câu trả lời không có citation nào để tra (tài liệu smoke có thể quá ngắn)."
+  else
+    blue "chunk_id dùng để tra = ${FIRST_CHUNK_ID}"
+
+    chunk_body="$(mktemp)"
+    chunk_code="$(curl -sS -o "$chunk_body" -w '%{http_code}' \
+      "${WS}/chunks/${FIRST_CHUNK_ID}" -H "$AUTH")"
+    [ "$chunk_code" = "200" ] || die "GET /chunks/{id} trả HTTP ${chunk_code} — mong đợi 200"
+    "$PYTHON_BIN" -c 'import json,sys; d=json.load(sys.stdin); assert d["id"] and d["original_text"]' < "$chunk_body" \
+      || die "GET /chunks/{id} thiếu id hoặc original_text"
+    rm -f "$chunk_body"
+    green "OK — /chunks/{id} trả original_text đầy đủ, không cắt"
+
+    preview_body="$(mktemp)"
+    preview_code="$(curl -sS -o "$preview_body" -w '%{http_code}' \
+      "${WS}/documents/${DOCUMENT_ID}/preview" -H "$AUTH")"
+    [ "$preview_code" = "200" ] || die "GET /preview trả HTTP ${preview_code} — mong đợi 200"
+    "$PYTHON_BIN" -c 'import json,sys; d=json.load(sys.stdin); assert d["document"]["id"] and isinstance(d["chunks"], list) and len(d["chunks"]) > 0' < "$preview_body" \
+      || die "GET /preview thiếu document metadata hoặc mảng chunks rỗng"
+    rm -f "$preview_body"
+    green "OK — /preview trả toàn văn + mảng chunk theo chunk_index"
+
+    file_body="$(mktemp)"
+    file_headers="$(mktemp)"
+    file_code="$(curl -sS -o "$file_body" -D "$file_headers" -w '%{http_code}' \
+      "${WS}/documents/${DOCUMENT_ID}/file" -H "$AUTH")"
+    echo "--- headers /file ---"
+    cat "$file_headers"
+    if [ "$file_code" = "200" ]; then
+      file_bytes="$(wc -c < "$file_body" | tr -d ' ')"
+      [ "$file_bytes" -gt 0 ] || die "GET /file trả 200 nhưng body rỗng"
+      green "OK — /file trả ${file_bytes} byte, xem Content-Type/Content-Disposition ở header trên"
+    else
+      red "GET /file trả HTTP ${file_code} (xem header ở trên) — bình thường nếu tài liệu smoke .md chưa từng đi qua object storage thật; kiểm tra thủ công nếu cần."
+    fi
+    rm -f "$file_body" "$file_headers"
+  fi
+
+  step "10/11  Xóa session và xác nhận CASCADE messages"
   session_delete_code="$(curl -sS -o /dev/null -w '%{http_code}' \
     -X DELETE "${WS}/chat/sessions/${SESSION_ID}" -H "$AUTH")"
   [ "$session_delete_code" = "204" ] \
@@ -380,8 +433,8 @@ PY
   green "OK — 204 và đọc lại trả page rỗng; session/messages đã sạch"
 fi
 
-# ---------------------------------------------------------------- 10. delete document
-step "10/10  Xóa tài liệu"
+# ---------------------------------------------------------------- 11. delete document
+step "11/11  Xóa tài liệu"
 
 del_code="$(curl -sS -o /dev/null -w '%{http_code}' \
   -X DELETE "${WS}/documents/${DOCUMENT_ID}" -H "$AUTH")"

@@ -22,6 +22,7 @@ Ví dụ chạy được: [`examples/`](./examples/).
 7. [Lỗi](#7-lỗi)
 8. [Giới hạn hiện tại](#8-giới-hạn-hiện-tại)
 9. [Checklist tích hợp](#9-checklist-tích-hợp)
+10. [Xem tài liệu gốc và chunk trích dẫn (Phase 17)](#10-xem-tài-liệu-gốc-và-chunk-trích-dẫn-phase-17)
 
 ---
 
@@ -39,7 +40,10 @@ của LLM, rồi **stream** câu trả lời kèm trích dẫn nguồn.
   token do HRM cấp.
 - **Không quản lý user.** User row được tạo tự động từ claim trong token.
 - **Không có OCR.** PDF scan (ảnh) sẽ fail với `NEEDS_OCR`.
-- **Không lưu file để tải về.** HRM vẫn phải giữ bản gốc của mình.
+- **Có phục vụ lại file gốc** kể từ Phase 17, qua `GET .../documents/{id}/file`
+  (mục 10). Server proxy bytes từ object storage nội bộ, không phải presigned
+  URL. Đây là đảo ngược quyết định cũ "HRM tự giữ bản gốc" — xem mục 10 để biết
+  giới hạn (không stream, có ngưỡng kích thước, không nhảy tới trang cụ thể).
 - **Không đảm bảo câu trả lời đúng.** Đây là LLM. Luôn hiển thị citation để
   người dùng tự kiểm chứng.
 - **Không xử lý đồng bộ.** Upload xong không có nghĩa là đã tìm kiếm được.
@@ -1317,8 +1321,10 @@ GET /workspaces/hrm/chat/history?session_id=<SESSION_ID>&limit=20&offset=0
 Authorization: Bearer <ACCESS_TOKEN_CỦA_USER>
 ```
 
-Trang message kế tiếp dùng `offset=20` trên cùng route. Messages sắp xếp cũ nhất
-trước; UUID là tiebreaker ổn định. Response của hai route có cùng page shape:
+Trang message kế tiếp dùng `offset=20` trên cùng route. Messages sắp xếp theo
+thứ tự turn cũ nhất trước bằng sequence nội bộ của server; sequence này không
+được thêm vào response nên page shape không đổi. Response của hai route có cùng
+page shape:
 
 ```json
 {
@@ -1366,13 +1372,27 @@ resolve vẫn giữ nguyên cho các client/luồng cũ.
 Khi đọc lại, server re-check ACL cho toàn bộ citation ID của cả trang trong một
 lô, hydrate metadata một lần rồi phân phối object về từng message. Citation
 không còn được xem (hoặc chunk đã bị xóa) sẽ bị loại và marker UUID tương ứng bị
-xóa khỏi `content`. Message `role: "user"` luôn có `citations: []`.
+xóa khỏi `content`. Đây chỉ là xử lý cho các marker có UUID nằm trong mảng
+`citations`. Do nội dung được sinh bởi LLM, `content` vẫn có thể chứa marker
+`[chunk:<uuid>]` không có citation object tương ứng (marker mồ côi). Client
+phải coi marker không tìm thấy trong `citations[].chunk_id` là text không có
+nguồn: không tạo link, không crash và không hiển thị lỗi cho người dùng; có thể
+loại marker đó khỏi phần text hiển thị. Message `role: "user"` luôn có
+`citations: []`.
 
 Snippet của assistant được căn theo nội dung message `user` ngay trước nó trong
 trang hiện tại, không dùng câu hỏi cuối session. Nếu assistant ở đầu trang hoặc
 không có user message ngay trước, server truyền query `None` và dùng fallback ở
 đầu chunk. Vì vậy khi phân trang, client nên giữ thứ tự message và không tự ghép
 snippet từ message khác.
+
+Server cấp hai vị trí message nguyên tử cho mỗi turn bằng counter trên session:
+user nhận vị trí trước, assistant giữ vị trí kế tiếp. Counter được khóa theo row
+session trong transaction, nên hai request song song cùng session không trùng vị
+trí và assistant không bị đẩy sau user của turn kế tiếp dù persist bất đồng bộ.
+Nếu stream lỗi hoặc buffer rỗng và assistant không được ghi, vị trí assistant
+được giữ lại như một gap có chủ ý; client không được giả định sequence là dãy
+liên tục vì sequence không xuất hiện trong response.
 
 | | Stream | History |
 |---|---|---|
@@ -1399,6 +1419,7 @@ String renderHistoryMessage(HistoryMessage message) {
         UUID chunkId = UUID.fromString(matcher.group(1));
         HistoryCitation citation = byChunkId.get(chunkId);
         String replacement = citation == null
+            // Orphan marker: keep the answer usable, but never render a dead link.
             ? ""
             : "<a href=\"#source-" + chunkId + "\">[" + escapeHtml(citation.documentName()) + "]</a>";
         matcher.appendReplacement(html, Matcher.quoteReplacement(replacement));
@@ -1643,8 +1664,10 @@ guard deterministic ở tầng retrieval: không có ngưỡng score buộc tr�
 1. **Không có webhook/callback.** Muốn biết ingest xong phải poll. Nếu HRM cần
    push, phải đề xuất cho phase sau.
 
-2. **Không có endpoint tải lại file gốc trong phạm vi này.** HRM phải tự giữ bản
-   gốc.
+2. **Đã có endpoint tải lại file gốc kể từ Phase 17** — `GET
+   .../documents/{id}/file` (mục 10). Trước Phase 17, mục này ghi "chưa có";
+   HRM không còn phải tự giữ bản gốc để hiển thị lại, dù vẫn nên có bản sao
+   riêng cho mục đích lưu trữ/tuân thủ ngoài phạm vi hệ thống này.
 
 3. **Timestamp là UTC RFC 3339 có `Z`.** Ví dụ
    `2026-08-06T03:22:57.106555Z`; Java parse thẳng bằng `Instant` hoặc
@@ -1774,6 +1797,142 @@ Tick dần khi làm.
 - [ ] Thống nhất với người dùng cuối rằng PDF scan chưa dùng được (xem 8.3)
 - [x] ~~Chạy smoke test chung end-to-end bằng token production thật~~ — upload,
       chat/citation và delete đều PASS ở Phase 6 (xem 8.7 mục 5)
+
+---
+
+## 10. Xem tài liệu gốc và chunk trích dẫn (Phase 17)
+
+Ba route dưới đây trả lời câu hỏi "bấm vào citation trong câu trả lời chat thì
+xem gì tiếp theo". Cả ba đều tái dùng đúng quy tắc phân quyền của
+`GET .../documents/{id}` (mục 4): `member` relation trên workspace, rồi ACL
+tài liệu; xem mục 10.4 về `403` vs `404`.
+
+| Route | Trả gì | Dùng khi nào |
+|---|---|---|
+| `GET .../documents/{id}/file` | Bytes file gốc (PDF/DOCX/TXT/MD) | Mở/nhúng file gốc, có bảng biểu/chữ ký/con dấu mà bản trích xuất không giữ được |
+| `GET .../documents/{id}/preview` | Toàn văn đã trích xuất + mảng chunk có `chunk_index` | Xem trong ngữ cảnh, cuộn tới đúng đoạn, highlight |
+| `GET .../chunks/{chunk_id}` | Toàn văn một chunk, không cắt | Chỉ cần đọc trọn đoạn được trích, không cần mở cả tài liệu |
+
+### 10.1 Luồng: từ citation tới tài liệu
+
+Mọi citation (SSE `event: citations`, mục 6.7; hoặc citation trong history,
+mục 6.13) đã có sẵn cả `chunk_id` và `document_id` — không cần round-trip nào
+khác để bắt đầu một trong ba luồng dưới đây.
+
+1. **Đọc trọn đoạn được trích:**
+
+   ```bash
+   curl "$BASE/workspaces/hrm/chunks/$CHUNK_ID" -H "Authorization: Bearer $TOKEN"
+   ```
+
+   Trả `{ "id": "...", "original_text": "..." }` — toàn văn, không cắt 280 ký
+   tự như `snippet` trong citation.
+
+2. **Xem trong ngữ cảnh, cuộn tới đoạn:**
+
+   ```bash
+   curl "$BASE/workspaces/hrm/documents/$DOCUMENT_ID/preview" -H "Authorization: Bearer $TOKEN"
+   ```
+
+   Tìm phần tử trong `chunks[]` có `id` khớp `chunk_id` của citation (hoặc
+   khớp `chunk_index` nếu bạn tự quản lý vị trí), cuộn tới và highlight —
+   đúng cách `gmrag_ui` đã làm cho panel "Nguồn tham khảo".
+
+3. **Mở file PDF gốc:**
+
+   ```bash
+   curl "$BASE/workspaces/hrm/documents/$DOCUMENT_ID/file" \
+     -H "Authorization: Bearer $TOKEN" -o downloaded.pdf
+   ```
+
+   `Content-Type` khớp `documents.content_type` đã lưu lúc upload;
+   `Content-Disposition: inline` để trình duyệt/`<iframe>` render thay vì tải
+   về. Không có cách nhảy thẳng tới trang chứa đoạn được trích — xem 10.3.
+
+### 10.2 Quyết định sản phẩm: HRM mở PDF từ hệ thống này
+
+Trước Phase 17, mục 1.2/8.7 của tài liệu này ghi HRM phải tự giữ bản gốc.
+Quyết định đã đảo ngược: HRM mở PDF **từ hệ thống RAG**, không phải từ
+SharePoint hay kho lưu trữ riêng.
+
+Route `/file` **proxy bytes qua API**, không dùng presigned URL trỏ thẳng
+MinIO. Lý do: MinIO hiện không cấu hình CORS và không có endpoint public tách
+biệt khỏi `S3_ENDPOINT_URL` nội bộ (hostname Docker), nên một presigned URL
+sinh ra sẽ không mở được từ trình duyệt của user cuối. Proxy giữ mọi lượt đọc
+file đi qua đúng lớp ACL của route này, đổi lại tốn băng thông và RAM của API
+process hơn — chấp nhận được với corpus vài chục file hiện tại.
+
+### 10.3 Giới hạn
+
+- **`/file` không stream.** Server đọc toàn bộ file vào RAM trước khi trả về.
+  File vượt `DOCUMENT_MAX_UPLOAD_BYTES` (mặc định 50 MiB — cùng ngưỡng dùng ở
+  upload, mục 3.2) bị từ chối với `500 DOCUMENT_FILE_TOO_LARGE` thay vì làm
+  phồng RAM process. Vì `/upload` đã chặn ở đúng ngưỡng này lúc nhận file, lỗi
+  này trong thực tế chỉ xảy ra nếu ngưỡng bị hạ sau khi tài liệu đã tồn tại.
+- **`/file` không nhảy tới trang chứa Điều cụ thể.** `document_chunks` không
+  lưu số trang. Muốn có, đó là việc của phase sau (structural chunker).
+- **`/preview` không phân trang.** Trả toàn bộ chunk trong một response. Tài
+  liệu nhiều chunk thì payload lớn — hành vi này có từ trước Phase 17, không
+  đổi.
+- **`404` ở cả ba route là cố ý mơ hồ**, giống mọi route document khác (mục
+  4.7): gộp "không tồn tại", "thuộc workspace khác" và "không có quyền xem".
+  Đừng coi `404` là bằng chứng tài liệu không tồn tại.
+
+### 10.4 `403` khi không phải member, `404` khi member nhưng không có quyền xem
+
+Cả ba route đều có hai tầng phân quyền tách biệt, và trả hai mã lỗi khác nhau
+tùy tầng nào chặn — đây là quyết định có chủ ý (Phase 17.3), khác với
+`GET .../documents/{id}` (mục 4.7) và `DELETE` (mục 5.4), nơi **cả hai tầng**
+đều gộp về `404`:
+
+| Tầng bị chặn | Mã lỗi | Vì sao |
+|---|---|---|
+| Không phải `member` của workspace | `403 FORBIDDEN` | Đây là thông tin về **quan hệ của caller với workspace mà caller tự chọn trong URL** — caller vốn đã biết mình có phải thành viên hay không. Không tiết lộ gì về tài liệu/chunk nào tồn tại bên trong workspace đó |
+| Là member, nhưng ACL tài liệu (`restricted` + không được chia sẻ) từ chối | `404 RESOURCE_NOT_FOUND` | Giữ nguyên tắc `hide_document_existence`: không cho phép phân biệt "tài liệu không tồn tại" với "tài liệu tồn tại nhưng bị cấm xem" |
+
+Vì sao không gộp cả hai về `404` cho nhất quán tuyệt đối với mục 4.7/5.4:
+membership không phải thông tin về sự tồn tại của một `document_id`/`chunk_id`
+cụ thể — nó chỉ xác nhận lại điều caller tự cung cấp trong path
+(`workspace_id`). Gộp thêm sẽ xóa một phân biệt hữu ích (tích hợp sai
+`workspace_id` vs. thiếu quyền tài liệu thật) mà không tăng thêm tính bảo mật
+nào. `/preview`, `/file` và `/chunks/{chunk_id}` áp dụng quy tắc này **giống
+hệt nhau** — đổi route dưới cùng một `workspace_id` không bao giờ lộ thêm
+thông tin theo hướng nào.
+
+### 10.5 Ví dụ curl đầy đủ
+
+```bash
+BASE="http://<RAG_HOST>:18083"
+TOKEN="<access token>"
+DOCUMENT_ID="69f56ad1-f379-4705-9eb4-f58cbd269420"
+CHUNK_ID="3f601309-1f9e-4f88-9f16-1077bb849460"
+
+curl -i "$BASE/workspaces/hrm/chunks/$CHUNK_ID" \
+  -H "Authorization: Bearer $TOKEN"
+
+curl -i "$BASE/workspaces/hrm/documents/$DOCUMENT_ID/preview" \
+  -H "Authorization: Bearer $TOKEN"
+
+curl -i "$BASE/workspaces/hrm/documents/$DOCUMENT_ID/file" \
+  -H "Authorization: Bearer $TOKEN" -o document.pdf
+```
+
+### 10.6 Lỗi
+
+| HTTP | `code` | Route | Nghĩa |
+|---|---|---|---|
+| 403 | `FORBIDDEN` | cả ba | Không phải member workspace — xem 10.4 |
+| 404 | `RESOURCE_NOT_FOUND` | cả ba | Không tồn tại / workspace khác / không có quyền xem — cố ý mơ hồ |
+| 409 | `DOCUMENT_NOT_READY` | `/preview`, `/file` | `status` chưa `COMPLETED` |
+| 410 | `DOCUMENT_OBJECT_MISSING` | `/file` | Row `COMPLETED` nhưng file không còn trong object storage (dữ liệu cũ/can thiệp thủ công) |
+| 500 | `DOCUMENT_FILE_TOO_LARGE` | `/file` | `size_bytes` vượt ngưỡng phục vụ trong RAM — xem 10.3 |
+| 500 | `INTERNAL_ERROR` | cả ba | Lỗi hệ thống, an toàn để retry |
+
+Trước Phase 17.2, `/preview` trả `409` bằng `StatusCode::CONFLICT` thô ở tầng
+handler; middleware chuẩn hoá lỗi toàn cục (`normalize_error_responses`) vẫn
+bọc nó thành JSON envelope hợp lệ, nhưng với `code` chung chung `CONFLICT`
+thay vì mã ổn định theo ngữ nghĩa. Từ Phase 17.2, cả `/preview` và `/file`
+dùng cùng `code=DOCUMENT_NOT_READY` tường minh.
 
 ---
 

@@ -7,7 +7,7 @@ Kèm theo [`../INTEGRATION_GUIDE.md`](../INTEGRATION_GUIDE.md) và
 |---|---|
 | `hrm-rag.http` | Gọi thử từng endpoint trong IDE. Có sẵn cả các case lỗi |
 | `http-client.env.json` | Biến môi trường cho `hrm-rag.http` |
-| `smoke.sh` | Chạy một mạch end-to-end, gồm history citation object và PATCH title, dùng để nghiệm thu |
+| `smoke.sh` | Chạy một mạch end-to-end, gồm history citation object, PATCH title và `/preview`/`/chunks`/`/file` (Phase 17), dùng để nghiệm thu |
 
 ---
 
@@ -27,9 +27,14 @@ Các route history luôn thao tác trên session của `userid` trong token; 6e 
 và toàn bộ messages của nó. Request 6d đổi title, trả lại session summary mới.
 Các request 6a–6c dùng `limit`/`offset` và đọc page object
 qua field `sessions` hoặc `messages`, cùng `total`, `limit`, `offset`. Request
-`E1`–`E12` là các case lỗi — chạy để xác nhận client HRM xử lý đúng từng mã lỗi.
+`E1`–`E14` là các case lỗi — chạy để xác nhận client HRM xử lý đúng từng mã lỗi.
 Các case `E4`/`E5` và `E9`/`E10` chứng minh `MANAGER`/`EMPLOYEE` đều chỉ là
 workspace `member`: upload mặc định bị `403`, DELETE bị `404 RESOURCE_NOT_FOUND`.
+
+Request 6f–6h (Phase 17) là luồng "xem tài liệu": `/preview` (toàn văn + chunk),
+`/chunks/{chunk_id}` (đòi hỏi tự điền `chunkId` trong environment — IDE không
+parse được SSE để tự lấy) và `/file` (bytes PDF gốc, proxy qua API — không phải
+presigned URL). Xem [mục 10 trong `INTEGRATION_GUIDE.md`](../INTEGRATION_GUIDE.md#10-xem-tài-liệu-gốc-và-chunk-trích-dẫn-phase-17).
 
 Request số 2 upload file `./fixtures/noi-quy-cong-ty.pdf`. Thư mục `fixtures/`
 **không** có sẵn trong repo — tự trỏ sang một file thật trên máy bạn, hoặc tạo
@@ -67,8 +72,10 @@ Script làm gì:
    Gặp `FAILED` thì giải thích `failure_code` và nói nên làm gì
 4. Chat SSE, in **nguyên văn stream**, rồi ráp lại đúng cách và in kết quả
 5. Gọi các route history: list session, đọc qua query/path, kiểm tra citation object,
-   PATCH title và xóa session
-6. Xóa document, và xác nhận đã xóa bằng cách poll lại (mong đợi `404`)
+   PATCH title
+6. Lấy `chunk_id` từ citation đầu tiên, gọi `/chunks/{id}`, `/preview` và `/file`
+   (Phase 17) rồi xóa session
+7. Xóa document, và xác nhận đã xóa bằng cách poll lại (mong đợi `404`)
 
 Bước 4 chính là phần đáng xem nhất: nó in ra stream thô để bạn **tận mắt thấy**
 marker `[chunk:1]` bị cắt vụn qua nhiều event, rồi in text đã gom lại để thấy

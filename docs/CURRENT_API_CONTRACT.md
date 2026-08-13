@@ -136,6 +136,7 @@ when `HRM_MODE=false` it is not resolved at all. Full UUIDs are unaffected.
 | `DELETE` | `/workspaces/{workspace_id}/documents/{document_id}/shares/{user_id}` | `admin` on `workspace:{workspace_id}` |
 | `PUT` | `/workspaces/{workspace_id}/documents/{document_id}/permissions` | `admin` on `workspace:{workspace_id}` |
 | `GET` | `/workspaces/{workspace_id}/documents/{document_id}/preview` | `member` on `workspace:{workspace_id}` |
+| `GET` | `/workspaces/{workspace_id}/documents/{document_id}/file` | `member` on `workspace:{workspace_id}` |
 | `GET` | `/workspaces/{workspace_id}/chunks/{chunk_id}` | `member` on `workspace:{workspace_id}` |
 | `POST` | `/workspaces/{workspace_id}/citations/resolve` | `member` on `workspace:{workspace_id}` plus document-level viewer ACL per chunk |
 | `POST` | `/workspaces/{workspace_id}/chat` | `member` on `workspace:{workspace_id}` plus chat-session ownership |
@@ -532,9 +533,19 @@ metadata-only audit rows.
 - Authorization: `member` on `workspace:{workspace_id}`.
 - Request body: none.
 - Success: `200` with `{ content, chunks, document }`. `chunks` is ordered by `chunk_index` and each item contains `{ chunk_index, text, id }`, where `id` is the chunk UUID. `document` carries the metadata the viewer needs without a second call: `{ id, filename, content_type, created_at, size_bytes, access_mode, status }` (`content_type` and `size_bytes` may be `null`; `status` is always `COMPLETED` here because other states return `409`).
-- Errors: authz `403`; `404 RESOURCE_NOT_FOUND`; `409 CONFLICT` when the document is not `COMPLETED`; or `500 INTERNAL_ERROR`, all JSON envelopes.
+- Errors: authz `403`; `404 RESOURCE_NOT_FOUND`; `409 DOCUMENT_NOT_READY` when the document is not `COMPLETED` (Phase 17.2 — was a bare `StatusCode::CONFLICT` with the generic `CONFLICT` code from `normalize_error_responses` before this); or `500 INTERNAL_ERROR`, all JSON envelopes.
 - Side effects: none.
 - Security notes: preview checks document-level ACL viewer permissions.
+
+### `GET /workspaces/{workspace_id}/documents/{document_id}/file`
+
+- Auth: bearer JWT.
+- Authorization: identical block to `/preview` — `member` on `workspace:{workspace_id}`, then document-level viewer ACL. No separate ACL logic was written for this route (Phase 17.1).
+- Request body: none.
+- Success: `200` with the original file bytes (`Content-Type` from `documents.content_type`; `Content-Disposition: inline; filename="..."; filename*=UTF-8''...` per RFC 6266/5987, correctly encoding non-ASCII filenames; `Content-Length` derived by the HTTP layer from the actual body).
+- Errors: authz `403`; `404 RESOURCE_NOT_FOUND`; `409 DOCUMENT_NOT_READY` when not `COMPLETED`; `410 DOCUMENT_OBJECT_MISSING` when the row is `COMPLETED` but the object storage read returns not-found (reuses the same code `POST .../retry` already used for this condition); `500 DOCUMENT_FILE_TOO_LARGE` when `size_bytes` exceeds `DOCUMENT_MAX_UPLOAD_BYTES` (defensive — no document accepted by upload can exceed this without the limit being lowered afterward); or `500 INTERNAL_ERROR`, all JSON envelopes.
+- Side effects: none.
+- Security notes: proxies bytes through the API rather than a presigned URL — no public S3 endpoint or MinIO CORS configuration is required, and every read stays behind this route's ACL check. `Storage::get_original_document` reads the whole object into process memory (no streaming read exists in the storage layer); the size guard above exists specifically to bound that.
 
 ### `GET /workspaces/{workspace_id}/chunks/{chunk_id}`
 
