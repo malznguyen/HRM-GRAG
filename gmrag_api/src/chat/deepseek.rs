@@ -108,11 +108,72 @@ pub struct StreamMetadata {
     pub reasoning_delta_count: u32,
 }
 
+/// Giữ byte UTF-8 dở dang ở cuối chunk mạng, ghép vào chunk kế trước khi decode.
+/// `from_utf8_lossy` từng chunk độc lập sẽ biến nửa ký tự tiếng Việt thành U+FFFD.
+#[derive(Debug, Default)]
+struct IncrementalUtf8 {
+    pending: Vec<u8>,
+}
+
+impl IncrementalUtf8 {
+    fn push(&mut self, incoming: &[u8]) -> String {
+        self.pending.extend_from_slice(incoming);
+        self.take_valid(false)
+    }
+
+    fn flush(&mut self) -> String {
+        self.take_valid(true)
+    }
+
+    fn take_valid(&mut self, flush_incomplete: bool) -> String {
+        let mut output = String::new();
+        loop {
+            match std::str::from_utf8(&self.pending) {
+                Ok(valid) => {
+                    output.push_str(valid);
+                    self.pending.clear();
+                    break;
+                }
+                Err(err) => {
+                    let valid_up_to = err.valid_up_to();
+                    if valid_up_to > 0 {
+                        let valid = std::str::from_utf8(&self.pending[..valid_up_to])
+                            .expect("valid_up_to marks a UTF-8 prefix");
+                        output.push_str(valid);
+                        self.pending.drain(..valid_up_to);
+                        continue;
+                    }
+                    match err.error_len() {
+                        Some(error_len) => {
+                            output.push(char::REPLACEMENT_CHARACTER);
+                            self.pending.drain(..error_len);
+                        }
+                        None if flush_incomplete => {
+                            output.push(char::REPLACEMENT_CHARACTER);
+                            self.pending.clear();
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        output
+    }
+}
+
 pub struct DeepseekTokenParser {
     line_buffer: String,
     pending_tokens: Vec<String>,
     done: bool,
     metadata: StreamMetadata,
+    utf8: IncrementalUtf8,
+}
+
+impl Default for DeepseekTokenParser {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DeepseekTokenParser {
@@ -122,6 +183,21 @@ impl DeepseekTokenParser {
             pending_tokens: Vec::new(),
             done: false,
             metadata: StreamMetadata::default(),
+            utf8: IncrementalUtf8::default(),
+        }
+    }
+
+    pub fn push_bytes(&mut self, bytes: &[u8]) {
+        let chunk = self.utf8.push(bytes);
+        if !chunk.is_empty() {
+            self.push_chunk(&chunk);
+        }
+    }
+
+    pub fn flush_utf8(&mut self) {
+        let chunk = self.utf8.flush();
+        if !chunk.is_empty() {
+            self.push_chunk(&chunk);
         }
     }
 
@@ -211,10 +287,13 @@ pub async fn next_stream_token(
                 }));
             }
             Ok(Some(Ok(bytes))) => {
-                parser.push_chunk(&String::from_utf8_lossy(&bytes));
+                parser.push_bytes(&bytes);
             }
             Ok(Some(Err(err))) => return Some(Err(DeepseekStreamError::Http(err))),
-            Ok(None) => return None,
+            Ok(None) => {
+                parser.flush_utf8();
+                return None;
+            }
         }
     }
 }
@@ -301,6 +380,68 @@ mod tests {
 
     fn deepseek_test_lock() -> &'static Mutex<()> {
         DEEPSEEK_TEST_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn incremental_utf8_does_not_replace_vietnamese_split_across_chunks() {
+        let text = "Tôi không tìm thấy";
+        let bytes = text.as_bytes();
+        assert_eq!(
+            &bytes[1..3],
+            &[0xc3, 0xb4],
+            "ô in Tôi is the two-byte sequence c3 b4"
+        );
+
+        let mut decoder = IncrementalUtf8::default();
+        let first = decoder.push(&bytes[..2]);
+        let second = decoder.push(&bytes[2..]);
+        let assembled = format!("{first}{second}");
+
+        assert_eq!(first, "T");
+        assert_eq!(assembled, text);
+        assert!(
+            !assembled.contains('\u{FFFD}'),
+            "split multi-byte Vietnamese must not become U+FFFD"
+        );
+    }
+
+    #[test]
+    fn parser_reassembles_vietnamese_token_split_across_network_chunks() {
+        let payload = "data: {\"choices\":[{\"delta\":{\"content\":\"Tôi\"}}]}\n";
+        let bytes = payload.as_bytes();
+        let split_at = bytes
+            .iter()
+            .position(|&b| b == 0xc3)
+            .expect("payload contains ô")
+            + 1;
+
+        let mut parser = DeepseekTokenParser::new();
+        parser.push_bytes(&bytes[..split_at]);
+        assert!(
+            parser.pop_token().is_none(),
+            "incomplete UTF-8 must wait for the next chunk"
+        );
+        parser.push_bytes(&bytes[split_at..]);
+
+        let token = parser.pop_token().expect("reassembled token");
+        assert_eq!(token, "Tôi");
+        assert!(!token.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn lossy_per_chunk_decode_is_exactly_the_bug() {
+        let text = "Tôi";
+        let bytes = text.as_bytes();
+        let broken = format!(
+            "{}{}",
+            String::from_utf8_lossy(&bytes[..2]),
+            String::from_utf8_lossy(&bytes[2..])
+        );
+        assert!(
+            broken.contains('\u{FFFD}'),
+            "document the old from_utf8_lossy-per-chunk failure mode"
+        );
+        assert_ne!(broken, text);
     }
 
     #[tokio::test]
