@@ -13,7 +13,7 @@ use axum::{
 use reqwest::Client;
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use gmrag_api::auth::authz::{Object, Relation};
@@ -121,7 +121,7 @@ impl TestServer {
             jwt,
             storage,
             retrieval,
-            ingestion_limiter: Arc::new(Semaphore::new(0)),
+            chat_admission: Default::default(),
             authz_client,
             keycloak_client,
         };
@@ -1237,10 +1237,7 @@ async fn chat_history_pagination_is_stable_complete_and_owner_scoped() {
     .unwrap();
 
     for (path, separator) in [
-        (
-            format!("chat/history?session_id={message_session}"),
-            '&',
-        ),
+        (format!("chat/history?session_id={message_session}"), '&'),
         (format!("chat/sessions/{message_session}/messages"), '?'),
     ] {
         let default_page = client
@@ -2035,10 +2032,7 @@ async fn document_file_endpoint_serves_bytes_enforces_acl_and_reports_stable_err
         .send()
         .await
         .unwrap();
-    assert_eq!(
-        forbidden_response.status(),
-        reqwest::StatusCode::FORBIDDEN
-    );
+    assert_eq!(forbidden_response.status(), reqwest::StatusCode::FORBIDDEN);
 
     // 5. Chưa COMPLETED -> 409 với JSON body ổn định (Phase 17.2).
     let not_ready_response = client

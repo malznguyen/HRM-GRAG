@@ -1,3 +1,4 @@
+pub mod admission;
 mod api_docs;
 pub mod api_error;
 pub mod audit;

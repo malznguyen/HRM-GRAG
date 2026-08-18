@@ -5,8 +5,6 @@ use gmrag_api::state::AppState;
 use gmrag_api::storage::{StorageClient, StorageConfig};
 use sqlx::postgres::PgPoolOptions;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
 use tracing::warn;
 
 const API_DRAIN_TIMEOUT_SECS: u64 = 20;
@@ -52,8 +50,8 @@ async fn main() {
         .await
         .expect("Failed to run migrations");
 
-    let jwt = auth::jwt::JwtValidator::from_env()
-        .expect("Failed to initialize JWT validator from env");
+    let jwt =
+        auth::jwt::JwtValidator::from_env().expect("Failed to initialize JWT validator from env");
     // Phase 5.1: xác nhận ngay ở log khởi động rằng cấu hình HRM được đọc từ `.env`.
     jwt.log_auth_config_on_startup();
 
@@ -76,12 +74,17 @@ async fn main() {
     // ADR-21: ingestion + chat query share one Ollama embed model (default AITeamVN/Vietnamese_Embedding).
     gmrag_api::ingestion::embedding::log_embedding_config_on_startup();
 
+    // Giới hạn số chat đồng thời: trên máy thiếu CPU, thả tự do làm sập toàn bộ
+    // thay vì chỉ chậm. Xem `gmrag_api::admission` cho số đo.
+    let chat_admission = gmrag_api::admission::ChatAdmission::from_env();
+    chat_admission.log_config_on_startup();
+
     let state = AppState {
         pool,
         jwt,
         storage,
         retrieval,
-        ingestion_limiter: Arc::new(Semaphore::new(AppState::ingestion_limit_from_env())),
+        chat_admission,
         authz_client,
         keycloak_client,
     };

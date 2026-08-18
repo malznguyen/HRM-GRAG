@@ -6,9 +6,9 @@ use std::time::Duration;
 use axum::{
     Json,
     extract::{Path, Query, State, rejection::JsonRejection},
-    http::StatusCode,
+    http::{HeaderValue, StatusCode, header},
     response::{
-        IntoResponse,
+        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
 };
@@ -1001,6 +1001,22 @@ pub async fn workspace_chat(
         return (StatusCode::BAD_REQUEST, "Message is required").into_response();
     }
 
+    // Xin suất xử lý TRƯỚC mọi thao tác ghi. Nếu từ chối ở đây thì request không
+    // để lại dấu vết nào — không có session rác, không có câu hỏi treo trong
+    // lịch sử mà chẳng bao giờ được trả lời.
+    let admission_permit = match state.chat_admission.acquire().await {
+        Ok(permit) => permit,
+        Err(rejection) => {
+            tracing::warn!(
+                %workspace_id,
+                user_id = %authz.user_id,
+                reason = rejection.as_str(),
+                "Chat request shed: server at capacity"
+            );
+            return chat_busy_response(state.chat_admission.retry_after_secs());
+        }
+    };
+
     let session_title = truncate_session_title(&message);
     match ensure_chat_session(
         &state.pool,
@@ -1069,6 +1085,13 @@ pub async fn workspace_chat(
     let idle_timeout = deepseek_stream_idle_timeout();
 
     let event_stream = async_stream::stream! {
+        // Giữ suất xử lý tới khi stream kết thúc (hoặc client ngắt kết nối, lúc
+        // đó stream bị drop và permit được trả lại). Thả permit sớm hơn — ví dụ
+        // ngay sau `build_chat_context` — sẽ cho phép số stream chạy song song
+        // vượt xa giới hạn, đúng thứ mà cơ chế này sinh ra để ngăn.
+        // Cùng lý do đặt tên như `_persist_guard`: `let _ = ...` drop tức thì.
+        let _admission_permit = admission_permit;
+
         let mut byte_stream = byte_stream;
         let mut parser = DeepseekTokenParser::new();
         let assistant_buffer = Arc::new(Mutex::new(String::new()));
@@ -1287,6 +1310,27 @@ fn history_citation_plan(
     }
 
     (page_chunk_ids, query_by_message_id)
+}
+
+/// 503 kèm `Retry-After` khi server đang quá tải.
+///
+/// Cố ý KHÔNG dùng 429 `RATE_LIMITED`: 429 nghĩa là "bạn gửi quá nhiều", còn ở
+/// đây caller không làm gì sai — server đang bận. Client nên thử lại nguyên văn
+/// request sau `Retry-After` giây, không cần backoff theo user.
+fn chat_busy_response(retry_after_secs: u64) -> Response {
+    let mut response = ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "CHAT_BUSY",
+        "Server is at capacity. Retry after the number of seconds in the Retry-After header.",
+    )
+    .into_response();
+
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::from_str(&retry_after_secs.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("15")),
+    );
+    response
 }
 
 fn chat_pipeline_error_response(err: ChatPipelineError) -> axum::response::Response {

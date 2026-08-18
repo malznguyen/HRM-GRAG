@@ -8,8 +8,7 @@ mod support;
 use reqwest::Client;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
-use std::sync::Arc;
-use tokio::sync::{Mutex, OnceCell, Semaphore};
+use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
 
 use gmrag_api::auth::authz::{AuthzClient, Object, Relation};
@@ -93,7 +92,7 @@ impl Fixture {
             jwt,
             storage,
             retrieval,
-            ingestion_limiter: Arc::new(Semaphore::new(0)),
+            chat_admission: Default::default(),
             authz_client: authz.clone(),
             keycloak_client,
         };

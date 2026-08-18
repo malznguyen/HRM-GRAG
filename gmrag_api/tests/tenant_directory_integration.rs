@@ -1,7 +1,5 @@
 mod support;
 
-use std::sync::Arc;
-
 use gmrag_api::{
     auth::authz::{AuthzClient, Object, Relation},
     state::AppState,
@@ -9,7 +7,7 @@ use gmrag_api::{
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
-use tokio::sync::{Mutex, OnceCell, Semaphore};
+use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
 
 static TEST_LOCK: OnceCell<Mutex<()>> = OnceCell::const_new();
@@ -197,7 +195,7 @@ async fn spawn_api(pool: sqlx::PgPool, authz_client: AuthzClient) -> String {
         )
         .await,
         retrieval: gmrag_api::retrieval::RetrievalClient::from_env().expect("retrieval config"),
-        ingestion_limiter: Arc::new(Semaphore::new(0)),
+        chat_admission: Default::default(),
         authz_client,
         keycloak_client: gmrag_api::auth::keycloak::KeycloakClient::from_env()
             .expect("bypass Keycloak"),

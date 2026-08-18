@@ -1,12 +1,12 @@
 mod support;
 
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use axum::{Json, Router, routing::post};
 use reqwest::Client;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Mutex;
 
 use gmrag_api::auth::authz::AuthzClient;
 use gmrag_api::retrieval::{RetrievalClient, RetrievalConfig};
@@ -193,7 +193,7 @@ async fn setup_state(pool: sqlx::PgPool, authz_client: AuthzClient) -> AppState 
         jwt,
         storage,
         retrieval,
-        ingestion_limiter: Arc::new(Semaphore::new(1)),
+        chat_admission: Default::default(),
         authz_client,
         keycloak_client,
     }

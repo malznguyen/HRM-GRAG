@@ -1,9 +1,6 @@
 mod support;
 
-use std::{
-    process::Command,
-    sync::{Arc, OnceLock},
-};
+use std::{process::Command, sync::OnceLock};
 
 use gmrag_api::{
     auth::authz::AuthzClient,
@@ -15,7 +12,6 @@ use gmrag_api::{
 use lopdf::{Document, Object, dictionary};
 use reqwest::Client;
 use sqlx::postgres::PgPoolOptions;
-use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 static TEST_ENV_INIT: OnceLock<()> = OnceLock::new();
@@ -139,7 +135,7 @@ impl Fixture {
             jwt: gmrag_api::auth::jwt::JwtValidator::from_env().unwrap(),
             storage: StorageClient::from_config(StorageConfig::from_env().unwrap()).await,
             retrieval: RetrievalClient::from_env().unwrap(),
-            ingestion_limiter: Arc::new(Semaphore::new(0)),
+            chat_admission: Default::default(),
             authz_client: authz.clone(),
             keycloak_client: gmrag_api::auth::keycloak::KeycloakClient::from_env().unwrap(),
         };

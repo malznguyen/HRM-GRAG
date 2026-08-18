@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use gmrag_api::{
     auth::{authz::AuthzClient, jwt::JwtValidator, keycloak::KeycloakClient},
     ingestion::embedding::DEFAULT_EMBEDDING_DIM,
@@ -9,7 +7,6 @@ use gmrag_api::{
 };
 use reqwest::{Client, Method, StatusCode};
 use sqlx::postgres::PgPoolOptions;
-use tokio::sync::Semaphore;
 
 const PROTECTED_ROUTES: &[(&str, &str)] = &[
     ("GET", "/users/me"),
@@ -297,7 +294,7 @@ async fn spawn_api() -> String {
             delete_request_timeout_secs: 5,
             delete_worker_timeout_secs: 60,
         }),
-        ingestion_limiter: Arc::new(Semaphore::new(1)),
+        chat_admission: Default::default(),
         authz_client: AuthzClient::new(
             "http://127.0.0.1:8081".to_string(),
             "unused".to_string(),

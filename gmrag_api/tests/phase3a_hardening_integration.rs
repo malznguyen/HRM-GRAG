@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use reqwest::Client;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use gmrag_api::auth::authz::{AuthzClient, Object, Relation, TupleKey};
@@ -496,7 +496,7 @@ async fn member_role_change_writes_audit_event() {
         jwt,
         storage,
         retrieval,
-        ingestion_limiter: Arc::new(Semaphore::new(0)),
+        chat_admission: Default::default(),
         authz_client: authz_client.clone(),
         keycloak_client,
     };
@@ -2965,7 +2965,7 @@ async fn spawn_app_with_authz(pool: &sqlx::PgPool, authz_client: AuthzClient) ->
         jwt: gmrag_api::auth::jwt::JwtValidator::from_env().unwrap(),
         storage: setup_storage().await,
         retrieval: gmrag_api::retrieval::RetrievalClient::from_env().unwrap(),
-        ingestion_limiter: Arc::new(Semaphore::new(0)),
+        chat_admission: Default::default(),
         authz_client,
         keycloak_client: gmrag_api::auth::keycloak::KeycloakClient::from_env().unwrap(),
     };
@@ -2995,7 +2995,7 @@ async fn bootstrap_member_remove_fixture(
         jwt,
         storage,
         retrieval,
-        ingestion_limiter: Arc::new(Semaphore::new(0)),
+        chat_admission: Default::default(),
         authz_client: authz_client.clone(),
         keycloak_client,
     };

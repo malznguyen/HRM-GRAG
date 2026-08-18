@@ -2,7 +2,6 @@ use std::{
     error::Error,
     io,
     path::PathBuf,
-    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,7 +19,6 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::{Client, Response, StatusCode, multipart};
 use serde_json::{Value, json};
 use sqlx::{PgPool, postgres::PgPoolOptions};
-use tokio::sync::Semaphore;
 use tokio::{task::JoinHandle, time::sleep};
 use uuid::Uuid;
 
@@ -94,7 +92,7 @@ async fn start_runtime() -> TestResult<(RuntimeContext, JoinHandle<()>)> {
         jwt,
         storage: storage.clone(),
         retrieval: retrieval.clone(),
-        ingestion_limiter: Arc::new(Semaphore::new(1)),
+        chat_admission: Default::default(),
         authz_client: authz.clone(),
         keycloak_client: KeycloakClient::disabled(),
     };

@@ -197,10 +197,12 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-        let value: Value = serde_json::from_slice(&body).expect(
-            "bare StatusCode response must still be normalized into a JSON error envelope",
-        );
+        let value: Value = serde_json::from_slice(&body)
+            .expect("bare StatusCode response must still be normalized into a JSON error envelope");
         assert_eq!(value["error"]["code"], "CONFLICT");
-        assert_eq!(value["error"]["message"], "The request conflicts with current state");
+        assert_eq!(
+            value["error"]["message"],
+            "The request conflicts with current state"
+        );
     }
 }

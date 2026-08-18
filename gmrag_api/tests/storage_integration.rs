@@ -6,9 +6,8 @@ use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use std::{
     io::{Cursor, Write},
-    sync::{Arc, OnceLock},
+    sync::OnceLock,
 };
-use tokio::sync::Semaphore;
 use uuid::Uuid;
 use zip::{ZipWriter, write::SimpleFileOptions};
 
@@ -71,7 +70,7 @@ impl TestServer {
             jwt,
             storage,
             retrieval,
-            ingestion_limiter: Arc::new(Semaphore::new(0)),
+            chat_admission: Default::default(),
             authz_client,
             keycloak_client,
         };

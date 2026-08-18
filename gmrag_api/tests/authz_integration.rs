@@ -3,8 +3,6 @@ mod support;
 use reqwest::Client;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
-use std::sync::Arc;
-use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use gmrag_api::auth::authz::{Object, Relation};
@@ -64,7 +62,7 @@ impl TestServer {
             jwt,
             storage,
             retrieval,
-            ingestion_limiter: Arc::new(Semaphore::new(1)),
+            chat_admission: Default::default(),
             authz_client,
             keycloak_client,
         };
