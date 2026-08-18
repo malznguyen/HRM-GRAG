@@ -134,8 +134,9 @@ services:
   # Durable ingestion worker. API/frontend vẫn chạy trên host theo topology local-demo.
   ingestion-worker:
     build:
-      context: ./gmrag_api
-      dockerfile: ../docker/outbox-workers.Dockerfile
+      # Context là repo root: lib gmrag_api nhúng docs/api/openapi.yaml qua include_str!.
+      context: .
+      dockerfile: docker/outbox-workers.Dockerfile
     image: hrm-rag/outbox-workers:local
     restart: unless-stopped
     depends_on:
@@ -186,8 +187,9 @@ services:
   # OPENFGA_STORE_ID do operator tạo store rồi inject (root .env / shell); worker crash-loop tới khi có.
   process-authz-outbox:
     build:
-      context: ./gmrag_api
-      dockerfile: ../docker/outbox-workers.Dockerfile
+      # Context là repo root: lib gmrag_api nhúng docs/api/openapi.yaml qua include_str!.
+      context: .
+      dockerfile: docker/outbox-workers.Dockerfile
     image: hrm-rag/outbox-workers:local
     restart: unless-stopped
     depends_on:
@@ -209,8 +211,9 @@ services:
   # Qdrant outbox worker (local demo). Multi-replica an toàn nhờ FOR UPDATE SKIP LOCKED + claim lease.
   process-qdrant-outbox:
     build:
-      context: ./gmrag_api
-      dockerfile: ../docker/outbox-workers.Dockerfile
+      # Context là repo root: lib gmrag_api nhúng docs/api/openapi.yaml qua include_str!.
+      context: .
+      dockerfile: docker/outbox-workers.Dockerfile
     image: hrm-rag/outbox-workers:local
     restart: unless-stopped
     depends_on:
@@ -232,11 +235,46 @@ services:
     command: ["/usr/local/bin/process-qdrant-outbox", "--loop"]
     stop_grace_period: 30s
 
+  # Storage outbox worker (local demo). One-shot: drain rồi exit.
+  # profiles: manual — `docker compose up` không start. Chạy tay:
+  #   docker compose run --rm --no-deps process-storage-outbox
+  process-storage-outbox:
+    build:
+      # Context là repo root: lib gmrag_api nhúng docs/api/openapi.yaml qua include_str!.
+      context: .
+      dockerfile: docker/outbox-workers.Dockerfile
+    image: hrm-rag/outbox-workers:local
+    restart: "no"
+    profiles: ["manual"]
+    depends_on:
+      postgres:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-hrm_rag_user}:${POSTGRES_PASSWORD:-hrm-rag-db-local}@postgres:5432/${POSTGRES_DB:-hrm_rag}
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${S3_BUCKET:-hrm-rag-documents}
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      S3_PRESIGN_EXPIRY_SECS: ${S3_PRESIGN_EXPIRY_SECS:-900}
+      STORAGE_OUTBOX_BATCH_SIZE: ${STORAGE_OUTBOX_BATCH_SIZE:-50}
+      STORAGE_OUTBOX_MAX_RETRIES: ${STORAGE_OUTBOX_MAX_RETRIES:-5}
+      STORAGE_OUTBOX_BASE_BACKOFF_SECS: ${STORAGE_OUTBOX_BASE_BACKOFF_SECS:-2}
+      STORAGE_OUTBOX_MAX_BACKOFF_SECS: ${STORAGE_OUTBOX_MAX_BACKOFF_SECS:-300}
+      STORAGE_OUTBOX_CLAIM_LEASE_SECS: ${STORAGE_OUTBOX_CLAIM_LEASE_SECS:-120}
+      RUST_LOG: ${RUST_LOG:-info}
+    command: ["/usr/local/bin/process-storage-outbox"]
+    stop_grace_period: 30s
+
   # Storage orphan scan (local demo). Chỉ dry-run/report, không tự động xoá object.
   storage-orphan-scan:
     build:
-      context: ./gmrag_api
-      dockerfile: ../docker/outbox-workers.Dockerfile
+      # Context là repo root: lib gmrag_api nhúng docs/api/openapi.yaml qua include_str!.
+      context: .
+      dockerfile: docker/outbox-workers.Dockerfile
     image: hrm-rag/outbox-workers:local
     restart: unless-stopped
     depends_on:

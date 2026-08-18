@@ -1,0 +1,28 @@
+# Build context cho docker/api.Dockerfile là repo root (API nhúng
+# docs/api/openapi.yaml qua include_str!). Không có file này thì context
+# kéo theo cả target/, .docker_data/ và model GGUF 634MB.
+
+.git
+.github
+.docker_data
+
+# Rust build artifacts
+gmrag_api/target
+target
+
+# Frontend
+gmrag_ui/node_modules
+gmrag_ui/.next
+
+# Model GGUF được copy thẳng lên server, không đi qua image
+docker/ollama/*.gguf
+
+# Secrets — không bao giờ vào image
+.env
+gmrag_api/.env
+*.env.prod
+
+# Rác
+*.rar
+**/chat_stream_output.txt
+plans

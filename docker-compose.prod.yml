@@ -1,0 +1,379 @@
+# Topology deploy trên server (192.168.168.89) — khác docker-compose.yml ở 3 điểm:
+#
+#   1. API chạy TRONG container và là service DUY NHẤT publish ra 0.0.0.0.
+#      docker-compose.yml để API chạy trên host (topology local-demo).
+#   2. Không có Keycloak. HRM_MODE=true dùng HS512 shared secret, KeycloakClient
+#      được khởi tạo disabled() (src/main.rs:61-66) nên container đó chỉ tốn RAM.
+#   3. Mọi service phụ thuộc nhau qua service DNS trong compose network
+#      (postgres, openfga, qdrant, minio, ollama), không qua 127.0.0.1.
+#
+# Chạy:  docker compose -p hrm-rag -f docker-compose.prod.yml --env-file .env.prod up -d
+#
+# CẢNH BÁO TÀI NGUYÊN: server hiện có 1 vCPU / 1.8GB RAM. Stack này cần ~4-6GB.
+# Đây là lần chạy để lấy số liệu chứng minh nhu cầu nâng hạ tầng, không phải
+# cấu hình production đã được xác nhận đủ tài nguyên.
+
+name: hrm-rag
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:15432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - ./.docker_data/hrm_rag/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  openfga-postgres:
+    image: postgres:16
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:15433:5432"
+    environment:
+      POSTGRES_USER: ${OPENFGA_DB_USER}
+      POSTGRES_PASSWORD: ${OPENFGA_DB_PASSWORD}
+      POSTGRES_DB: ${OPENFGA_DB_NAME}
+    volumes:
+      - ./.docker_data/hrm_rag/openfga_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${OPENFGA_DB_USER} -d ${OPENFGA_DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  openfga-migrate:
+    image: openfga/openfga:v1.5.0
+    command: migrate
+    environment:
+      - OPENFGA_DATASTORE_ENGINE=postgres
+      - OPENFGA_DATASTORE_URI=postgres://${OPENFGA_DB_USER}:${OPENFGA_DB_PASSWORD}@openfga-postgres:5432/${OPENFGA_DB_NAME}?sslmode=disable
+    depends_on:
+      openfga-postgres:
+        condition: service_healthy
+
+  openfga:
+    image: openfga/openfga:v1.5.0
+    command: run
+    restart: unless-stopped
+    # KHÔNG publish ra 0.0.0.0: ai gọi được OpenFGA là ghi thẳng tuple, tự cấp
+    # admin trên mọi workspace. Chỉ loopback cho operator debug.
+    ports:
+      - "127.0.0.1:18081:8080"
+      - "127.0.0.1:18082:8081"
+    environment:
+      - OPENFGA_DATASTORE_ENGINE=postgres
+      - OPENFGA_DATASTORE_URI=postgres://${OPENFGA_DB_USER}:${OPENFGA_DB_PASSWORD}@openfga-postgres:5432/${OPENFGA_DB_NAME}?sslmode=disable
+      - OPENFGA_AUTHN_METHOD=preshared
+      - OPENFGA_AUTHN_PRESHARED_KEYS=${OPENFGA_API_TOKEN}
+      - OPENFGA_PLAYGROUND_ENABLED=false
+    depends_on:
+      openfga-migrate:
+        condition: service_completed_successfully
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:19000:9000"
+      - "127.0.0.1:19001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - ./.docker_data/hrm_rag/minio:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET}
+    entrypoint: >
+      /bin/sh -c "
+      until /usr/bin/mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD; do
+        echo 'Waiting for MinIO...';
+        sleep 2;
+      done;
+      /usr/bin/mc mb --ignore-existing local/$$S3_BUCKET;
+      /usr/bin/mc anonymous set private local/$$S3_BUCKET;
+      "
+
+  qdrant:
+    image: qdrant/qdrant:v1.18.2
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:16333:6333"
+    volumes:
+      - ./.docker_data/hrm_rag/qdrant:/qdrant/storage
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    environment:
+      # Mặc định Ollama là 5m: sau 5 phút không ai hỏi, model bị đẩy khỏi RAM và
+      # câu hỏi kế tiếp phải trả ~16s nạp lại. Với nhân viên hỏi rải rác trong
+      # ngày thì gần như CÂU NÀO CŨNG dính. -1 = giữ model thường trú.
+      # Đổi lại là 757MB RAM bị giữ vĩnh viễn — chấp nhận được vì model này
+      # dù sao cũng phải nằm trong RAM để phục vụ.
+      OLLAMA_KEEP_ALIVE: "-1"
+    ports:
+      - "127.0.0.1:11435:11434"
+    volumes:
+      - ./.docker_data/hrm_rag/ollama:/root/.ollama
+      - ./docker/ollama:/models:ro
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # API — service DUY NHẤT mở ra LAN. HRM team gọi http://<IP>:18083
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    image: hrm-rag/api:local
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:${API_PUBLIC_PORT:-18083}:18083"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      openfga:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+      qdrant:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-production}
+      APP_RUNTIME_ROLE: api
+      API_BIND_ADDR: 0.0.0.0:18083
+      DOCS_ENABLED: ${DOCS_ENABLED:-true}
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-16}
+
+      HRM_MODE: ${HRM_MODE}
+      HRM_TENANT_ID: ${HRM_TENANT_ID}
+      HRM_WORKSPACE_ID: ${HRM_WORKSPACE_ID}
+      JWT_ALG: ${JWT_ALG}
+      JWT_ISSUER: ${JWT_ISSUER}
+      JWT_SUBJECT_CLAIM: ${JWT_SUBJECT_CLAIM}
+      JWT_AUDIENCE: ${JWT_AUDIENCE}
+      JWT_VERIFY_AUDIENCE: ${JWT_VERIFY_AUDIENCE}
+      JWT_HMAC_SECRET: ${JWT_HMAC_SECRET}
+
+      OPENFGA_API_URL: http://openfga:8080
+      OPENFGA_STORE_ID: ${OPENFGA_STORE_ID}
+      OPENFGA_MODEL_ID: ${OPENFGA_MODEL_ID}
+      OPENFGA_API_TOKEN: ${OPENFGA_API_TOKEN}
+      # Mặc định trong code là connect 2s / request 3s (auth/authz.rs:19-23), cố ý
+      # ngắn vì trên máy đủ tài nguyên thì chậm hơn thế đã là outage. Máy này 1 vCPU
+      # nên lúc khởi động đồng loạt, OpenFGA trả lời sau ngưỡng đó và API fail-closed
+      # thành AUTHZ_ERROR dù OpenFGA hoàn toàn khỏe. Nới ra là biện pháp BÙ PHẦN CỨNG
+      # THIẾU — khi server được nâng cấp, hãy bỏ hai dòng này về mặc định.
+      OPENFGA_CONNECT_TIMEOUT_SECS: ${OPENFGA_CONNECT_TIMEOUT_SECS:-10}
+      OPENFGA_REQUEST_TIMEOUT_SECS: ${OPENFGA_REQUEST_TIMEOUT_SECS:-20}
+
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-hrm_rag_document_chunks}
+      QDRANT_VECTOR_SIZE: ${QDRANT_VECTOR_SIZE}
+      QDRANT_TOP_K: ${QDRANT_TOP_K:-5}
+
+      OLLAMA_EMBED_URL: http://ollama:11434/api/embed
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL}
+
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_REGION: ${S3_REGION}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      S3_PRESIGN_EXPIRY_SECS: ${S3_PRESIGN_EXPIRY_SECS:-900}
+
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      DEEPSEEK_API_URL: ${DEEPSEEK_API_URL}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL}
+
+      # Giới hạn số chat xử lý đồng thời. Không có nó, 20 request cùng lúc làm
+      # 100% request thất bại (đo 2026-08-14) — kể cả người gửi đầu tiên.
+      # Vượt ngưỡng thì xếp hàng; hàng đầy thì trả 503 + Retry-After ngay.
+      #
+      # 5 là giá trị ĐO ĐƯỢC là tốt nhất cho máy 1 vCPU này. Ở mốc 20 người hỏi
+      # cùng lúc: conc=5 cho 16/20 câu trả lời và 0 lỗi cứng; conc=10 chỉ cho
+      # 5/20 và 5 lỗi cứng. Nâng số này khi server được nâng lõi CPU.
+      # Xem gmrag_api/src/admission.rs.
+      GMRAG_CHAT_CONCURRENCY: ${GMRAG_CHAT_CONCURRENCY:-5}
+      GMRAG_CHAT_QUEUE_DEPTH: ${GMRAG_CHAT_QUEUE_DEPTH:-20}
+      GMRAG_CHAT_QUEUE_WAIT_SECS: ${GMRAG_CHAT_QUEUE_WAIT_SECS:-15}
+
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      RUST_LOG: ${RUST_LOG:-info,lopdf=error}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18083/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 40s
+    stop_grace_period: 30s
+
+  ingestion-worker:
+    build:
+      context: .
+      dockerfile: docker/outbox-workers.Dockerfile
+    image: hrm-rag/outbox-workers:local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      qdrant:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+    environment:
+      APP_RUNTIME_ROLE: ingestion-worker
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_REGION: ${S3_REGION}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      S3_PRESIGN_EXPIRY_SECS: ${S3_PRESIGN_EXPIRY_SECS:-900}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-hrm_rag_document_chunks}
+      QDRANT_VECTOR_SIZE: ${QDRANT_VECTOR_SIZE}
+      OLLAMA_EMBED_URL: http://ollama:11434/api/embed
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      DEEPSEEK_API_URL: ${DEEPSEEK_API_URL}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL}
+      GMRAG_GRAPH_EXTRACTION_ENABLED: ${GMRAG_GRAPH_EXTRACTION_ENABLED:-false}
+      GMRAG_EMBEDDING_BATCH_SIZE: ${GMRAG_EMBEDDING_BATCH_SIZE:-8}
+      GMRAG_EMBEDDING_CONCURRENCY: ${GMRAG_EMBEDDING_CONCURRENCY:-1}
+      GMRAG_EMBEDDING_TIMEOUT_SECS: ${GMRAG_EMBEDDING_TIMEOUT_SECS:-300}
+      GMRAG_EMBEDDING_RETRIES: ${GMRAG_EMBEDDING_RETRIES:-1}
+      INGESTION_WORKER_POLL_INTERVAL_MS: ${INGESTION_WORKER_POLL_INTERVAL_MS:-1000}
+      INGESTION_JOB_LEASE_SECS: ${INGESTION_JOB_LEASE_SECS:-600}
+      INGESTION_JOB_MAX_ATTEMPTS: ${INGESTION_JOB_MAX_ATTEMPTS:-5}
+      INGESTION_JOB_BATCH_SIZE: ${INGESTION_JOB_BATCH_SIZE:-1}
+      RUST_LOG: ${RUST_LOG:-info,lopdf=error}
+    command: ["/usr/local/bin/ingestion-worker"]
+    stop_grace_period: 30s
+
+  process-authz-outbox:
+    image: hrm-rag/outbox-workers:local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      openfga:
+        condition: service_started
+    environment:
+      APP_RUNTIME_ROLE: process-authz-outbox
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      OPENFGA_API_URL: http://openfga:8080
+      OPENFGA_STORE_ID: ${OPENFGA_STORE_ID}
+      OPENFGA_MODEL_ID: ${OPENFGA_MODEL_ID}
+      OPENFGA_API_TOKEN: ${OPENFGA_API_TOKEN}
+      OPENFGA_CONNECT_TIMEOUT_SECS: ${OPENFGA_CONNECT_TIMEOUT_SECS:-10}
+      OPENFGA_REQUEST_TIMEOUT_SECS: ${OPENFGA_REQUEST_TIMEOUT_SECS:-20}
+      AUTHZ_OUTBOX_BATCH_SIZE: ${AUTHZ_OUTBOX_BATCH_SIZE:-50}
+      AUTHZ_OUTBOX_MAX_RETRIES: ${AUTHZ_OUTBOX_MAX_RETRIES:-5}
+      AUTHZ_OUTBOX_POLL_INTERVAL_SECS: ${AUTHZ_OUTBOX_POLL_INTERVAL_SECS:-30}
+      RUST_LOG: ${RUST_LOG:-info}
+    command: ["/usr/local/bin/process-authz-outbox", "--loop"]
+    stop_grace_period: 30s
+
+  process-qdrant-outbox:
+    image: hrm-rag/outbox-workers:local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    environment:
+      APP_RUNTIME_ROLE: process-qdrant-outbox
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-hrm_rag_document_chunks}
+      QDRANT_OUTBOX_BATCH_SIZE: ${QDRANT_OUTBOX_BATCH_SIZE:-50}
+      QDRANT_OUTBOX_MAX_RETRIES: ${QDRANT_OUTBOX_MAX_RETRIES:-5}
+      QDRANT_OUTBOX_POLL_INTERVAL_SECS: ${QDRANT_OUTBOX_POLL_INTERVAL_SECS:-30}
+      RUST_LOG: ${RUST_LOG:-info}
+    command: ["/usr/local/bin/process-qdrant-outbox", "--loop"]
+    stop_grace_period: 30s
+
+  process-storage-outbox:
+    image: hrm-rag/outbox-workers:local
+    restart: "no"
+    profiles: ["manual"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      # Alias được /ready parse: process-storage-outbox | storage-worker |
+      # storage-orphan-scan | storage_worker (lib.rs:95-98). Canonical
+      # as_str() = storage-worker. Binary này không serve /ready.
+      APP_RUNTIME_ROLE: process-storage-outbox
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_REGION: ${S3_REGION}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      S3_PRESIGN_EXPIRY_SECS: ${S3_PRESIGN_EXPIRY_SECS:-900}
+      STORAGE_OUTBOX_BATCH_SIZE: ${STORAGE_OUTBOX_BATCH_SIZE:-50}
+      STORAGE_OUTBOX_MAX_RETRIES: ${STORAGE_OUTBOX_MAX_RETRIES:-5}
+      RUST_LOG: ${RUST_LOG:-info}
+    command: ["/usr/local/bin/process-storage-outbox"]
+    stop_grace_period: 30s
+
+  storage-orphan-scan:
+    image: hrm-rag/outbox-workers:local
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      APP_RUNTIME_ROLE: storage-orphan-scan
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_REGION: ${S3_REGION}
+      S3_BUCKET: ${S3_BUCKET}
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+      # StorageConfig::from_env() bắt buộc có biến này, không có default —
+      # thiếu thì binary panic ngay lúc khởi động (cleanup-storage-objects.rs:93).
+      S3_PRESIGN_EXPIRY_SECS: ${S3_PRESIGN_EXPIRY_SECS:-900}
+      STORAGE_ORPHAN_SCAN_INTERVAL_SECS: ${STORAGE_ORPHAN_SCAN_INTERVAL_SECS:-3600}
+      RUST_LOG: ${RUST_LOG:-info}
+    command:
+      ["/usr/local/bin/cleanup-storage-objects", "--loop", "--dry-run", "--interval-secs", "${STORAGE_ORPHAN_SCAN_INTERVAL_SECS:-3600}"]
+    stop_grace_period: 30s

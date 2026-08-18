@@ -1145,7 +1145,7 @@ fn pdf_parse_timeout_secs() -> u64 {
 }
 
 fn graph_extraction_enabled() -> bool {
-    env_bool("GMRAG_GRAPH_EXTRACTION_ENABLED", true)
+    env_bool("GMRAG_GRAPH_EXTRACTION_ENABLED", false)
 }
 
 fn graph_extraction_concurrency() -> usize {
