@@ -3,10 +3,6 @@
 .env.*
 !.env.example
 !**/.env.example
-!**/.env.local.example
-gmrag_ui/.env
-gmrag_ui/.env.*
-!gmrag_ui/.env.example
 *.local
 *.pem
 *.key
@@ -15,9 +11,6 @@ gmrag_ui/.env.*
 id_rsa*
 secrets/
 credentials/
-# Rendered Keycloak realm (if the template approach is ever adopted)
-docker/keycloak/gmrag-realm.local.json
-
 # Nested-git cleanup backups (renamed leftover .git dirs; do not commit)
 **/.git.bak-nested-empty/
 
@@ -49,7 +42,7 @@ coverage/
 **/tmp-e2e/
 *.log
 
-# Generated docs only (source-of-truth Markdown under docs/ and plans/ is tracked)
+# Generated docs only (source-of-truth Markdown under docs/ is tracked)
 docs/generated/
 **/generated-docs/
 

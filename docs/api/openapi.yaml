@@ -498,9 +498,8 @@ paths:
       description: |
         Streams the **original bytes** of the file HRM uploaded (the PDF/DOCX/
         TXT/MD itself, not extracted text), proxied through this API from the
-        object store. This route did not exist before Phase 17 —
-        `docs/INVESTIGATION_DOCUMENT_VIEWER.md` traced that no code path had
-        ever connected the storage read (`Storage::get_original_document`,
+        object store. This route did not exist before Phase 17: until then no code path
+        connected the storage read (`Storage::get_original_document`,
         previously only called by the ingestion worker) to an HTTP handler.
         The product decision (superseding the older note that HRM must keep
         its own original files) is: HRM opens the PDF **from this system**,
@@ -544,8 +543,8 @@ paths:
         3. **View in context, scrolled to the passage:** `GET
            /documents/{document_id}/preview`, find the entry in `chunks[]`
            whose `id` equals the citation's `chunk_id` (or match by
-           `chunk_index`), and highlight it — this is the same pattern
-           `gmrag_ui`'s document viewer already implements.
+           `chunk_index`), and highlight it — this is the standard
+           document-viewer pattern on the client side.
         4. **Open the original file:** `GET /documents/{document_id}/file`,
            embedded in an `<iframe>` or opened in a new tab. The response
            `Content-Type` matches the stored file type (`application/pdf` for

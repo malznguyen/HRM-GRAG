@@ -105,7 +105,7 @@ JWT_HMAC_SECRET=$JWT_HMAC_SECRET
 # --- Ingestion: hạ concurrency cho máy 1 vCPU --------------------------------
 # Không ghi GMRAG_INGESTION_DOCUMENT_CONCURRENCY: worker không đọc biến này;
 # API tạo semaphore nhưng không route nào .acquire() — NO-OP.
-# Xem docs/RECON_2026-08-17.md §7.5. Worker tuần tự nhờ INGESTION_JOB_BATCH_SIZE=1.
+# Worker tuần tự nhờ INGESTION_JOB_BATCH_SIZE=1.
 GMRAG_EMBEDDING_BATCH_SIZE=8
 GMRAG_EMBEDDING_CONCURRENCY=1
 GMRAG_EMBEDDING_TIMEOUT_SECS=300

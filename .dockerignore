@@ -10,10 +10,6 @@
 gmrag_api/target
 target
 
-# Frontend
-gmrag_ui/node_modules
-gmrag_ui/.next
-
 # Model GGUF được copy thẳng lên server, không đi qua image
 docker/ollama/*.gguf
 
@@ -25,4 +21,3 @@ gmrag_api/.env
 # Rác
 *.rar
 **/chat_stream_output.txt
-plans

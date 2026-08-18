@@ -1836,7 +1836,7 @@ khác để bắt đầu một trong ba luồng dưới đây.
 
    Tìm phần tử trong `chunks[]` có `id` khớp `chunk_id` của citation (hoặc
    khớp `chunk_index` nếu bạn tự quản lý vị trí), cuộn tới và highlight —
-   đúng cách `gmrag_ui` đã làm cho panel "Nguồn tham khảo".
+   đó là cách dựng panel "Nguồn tham khảo" phía client.
 
 3. **Mở file PDF gốc:**
 

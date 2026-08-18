@@ -27,10 +27,10 @@ These are internal side effects and do not change request/response contracts.
 - Protected routes use `Authorization: Bearer <Keycloak access token>`.
 - The backend validates RS256 signature, issuer, audience, expiry, and non-empty subject through Keycloak JWKS.
 - Required invariant: JWT `sub` must equal Keycloak Admin `user.id` and is the canonical user id for SQL and OpenFGA.
-- Two separate harnesses provide evidence for this invariant:
-  - API identity E2E (`scripts/run-keycloak-identity-e2e.ps1`, local-test-only confidential `gmrag-e2e`) proves backend token validation, subject equality, SQL/OpenFGA consistency, role flows, and `/users/sync`.
-  - Browser PKCE smoke (`scripts/run-keycloak-browser-smoke.ps1`, public `gmrag-frontend`) proves Authorization Code + PKCE end-user login/session/logout. API E2E does not prove browser PKCE.
-- Direct Grant is disabled for `gmrag-frontend` and must never be used by the browser or production user flow. A local-test-only confidential client may use it solely for backend API identity automation.
+- This applies to the `HRM_MODE=false` path only. Production runs `HRM_MODE=true`:
+  HRM signs an HS512 token, this API verifies it, and no Keycloak is deployed.
+  The identity/browser harnesses that used to prove the Keycloak invariant lived
+  with the frontend and are not part of this repository.
 - Keycloak Admin API is used for verified-user lookup on `POST /tenants/{tenant_id}/owners` and `POST /workspaces/{workspace_id}/members`.
 
 ### Authorization

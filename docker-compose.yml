@@ -117,21 +117,7 @@ services:
       retries: 24
       start_period: 15s
 
-  # Keycloak — IdP duy nhất cho frontend OIDC, bearer JWT và Admin API lookup.
-  # Admin console (demo local): http://localhost:8080 — user/pass admin/admin
-  keycloak:
-    image: quay.io/keycloak/keycloak:26.6.4
-    command: ["start-dev", "--import-realm"]
-    ports:
-      - "127.0.0.1:18080:8080"
-    environment:
-      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
-      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
-    volumes:
-      # File phải tên <realm>-realm.json theo convention import-at-startup của Keycloak
-      - ./docker/keycloak/gmrag-realm.json:/opt/keycloak/data/import/gmrag-realm.json:ro
-
-  # Durable ingestion worker. API/frontend vẫn chạy trên host theo topology local-demo.
+  # Durable ingestion worker. API vẫn chạy trên host theo topology local-demo.
   ingestion-worker:
     build:
       # Context là repo root: lib gmrag_api nhúng docs/api/openapi.yaml qua include_str!.
