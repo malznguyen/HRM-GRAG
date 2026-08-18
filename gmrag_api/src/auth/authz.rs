@@ -367,9 +367,14 @@ impl AuthzClient {
         Ok(list_resp.objects)
     }
 
-    /// Đọc tuple để operator đối chiếu; không dùng cho authorization ở request path.
-    /// OpenFGA Read API là POST; body rỗng nghĩa là quét mọi tuple trong store (phân trang).
-    pub async fn list_all_tuples(&self) -> Result<Vec<TupleKey>, AuthzError> {
+    /// Đọc tuple khớp `filter` (user + relation + object). `None` = quét cả store.
+    ///
+    /// OpenFGA Read API là POST. Dùng filter trên đường nóng; `list_all_tuples`
+    /// chỉ dành cho operator report.
+    pub async fn read_tuples(
+        &self,
+        filter: Option<&TupleKey>,
+    ) -> Result<Vec<TupleKey>, AuthzError> {
         let url = format!("{}/stores/{}/read", self.api_url, self.store_id);
         let mut tuples = Vec::new();
         let mut continuation_token: Option<String> = None;
@@ -377,6 +382,16 @@ impl AuthzClient {
         loop {
             let mut body = serde_json::Map::new();
             body.insert("page_size".to_string(), serde_json::json!(100));
+            if let Some(tuple_key) = filter {
+                body.insert(
+                    "tuple_key".to_string(),
+                    serde_json::json!({
+                        "user": tuple_key.user,
+                        "relation": tuple_key.relation,
+                        "object": tuple_key.object,
+                    }),
+                );
+            }
             if let Some(token) = &continuation_token {
                 body.insert(
                     "continuation_token".to_string(),
@@ -401,6 +416,18 @@ impl AuthzClient {
             };
             continuation_token = Some(token);
         }
+    }
+
+    /// Đọc tuple để operator đối chiếu; không dùng cho authorization ở request path.
+    /// OpenFGA Read API là POST; body rỗng nghĩa là quét mọi tuple trong store (phân trang).
+    pub async fn list_all_tuples(&self) -> Result<Vec<TupleKey>, AuthzError> {
+        self.read_tuples(None).await
+    }
+
+    /// `POST /read` đã lọc đúng một `tuple_key` — không quét store.
+    pub async fn has_tuple(&self, tuple: &TupleKey) -> Result<bool, AuthzError> {
+        let matches = self.read_tuples(Some(tuple)).await?;
+        Ok(matches.iter().any(|found| found == tuple))
     }
 
     pub async fn write_tuple(

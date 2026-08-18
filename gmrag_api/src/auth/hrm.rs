@@ -242,15 +242,21 @@ pub async fn provision_identity(
     };
     let user = format!("user:{}", claims.sub);
     let object = Object::Workspace(config.workspace_id);
-    let desired_tuple = tuple_key(&user, desired_relation, &object);
-    let other_tuple = tuple_key(&user, other_relation, &object);
+    let (desired_tuple, other_tuple) =
+        role_tuple_keys(&user, &object, desired_relation, other_relation);
 
-    let tuples = authz
-        .list_all_tuples()
-        .await
-        .map_err(HrmProvisionError::Authz)?;
-    let desired_present = tuples.iter().any(|tuple| tuple == &desired_tuple);
-    let other_present = tuples.iter().any(|tuple| tuple == &other_tuple);
+    let (desired_result, other_result) = tokio::join!(
+        authz.read_tuples(Some(&desired_tuple)),
+        authz.read_tuples(Some(&other_tuple)),
+    );
+    let desired_matches = desired_result.map_err(HrmProvisionError::Authz)?;
+    let other_matches = other_result.map_err(HrmProvisionError::Authz)?;
+    let (desired_present, other_present) = role_tuple_presence(
+        &desired_tuple,
+        &other_tuple,
+        &desired_matches,
+        &other_matches,
+    );
 
     let plan = plan_tuple_sync(
         &user,
@@ -294,6 +300,34 @@ fn tuple_key(user: &str, relation: Relation, object: &Object) -> TupleKey {
         relation: relation.as_str().to_string(),
         object: object.to_string(),
     }
+}
+
+/// Hai filter `POST /stores/{id}/read` trên đường provision: desired + relation còn lại.
+fn role_tuple_keys(
+    user: &str,
+    object: &Object,
+    desired_relation: Relation,
+    other_relation: Relation,
+) -> (TupleKey, TupleKey) {
+    (
+        tuple_key(user, desired_relation, object),
+        tuple_key(user, other_relation, object),
+    )
+}
+
+/// Có mặt hay không từ hai lần `POST /read` đã lọc đúng `tuple_key`.
+///
+/// Không quét store: mỗi `*_matches` là kết quả đọc một key (user+relation+object).
+fn role_tuple_presence(
+    desired: &TupleKey,
+    other: &TupleKey,
+    desired_matches: &[TupleKey],
+    other_matches: &[TupleKey],
+) -> (bool, bool) {
+    (
+        desired_matches.iter().any(|tuple| tuple == desired),
+        other_matches.iter().any(|tuple| tuple == other),
+    )
 }
 
 async fn upsert_hrm_user(
@@ -664,6 +698,88 @@ mod tests {
             Relation::Admin,
             true,
             false,
+        );
+        assert_eq!(settled, TupleSyncPlan::default());
+    }
+
+    fn workspace_tuple(user: &str, relation: Relation) -> TupleKey {
+        tuple_key(
+            user,
+            relation,
+            &Object::Workspace(Uuid::parse_str("fa76881f-6367-4b80-a89e-a3e01206a806").unwrap()),
+        )
+    }
+
+    #[test]
+    fn role_tuple_keys_are_exact_user_relation_object_filters() {
+        let object =
+            Object::Workspace(Uuid::parse_str("fa76881f-6367-4b80-a89e-a3e01206a806").unwrap());
+        let (desired, other) = role_tuple_keys(
+            "user:employee-1",
+            &object,
+            Relation::Member,
+            Relation::Admin,
+        );
+
+        assert_eq!(desired.user, "user:employee-1");
+        assert_eq!(desired.relation, "member");
+        assert_eq!(
+            desired.object,
+            "workspace:fa76881f-6367-4b80-a89e-a3e01206a806"
+        );
+        assert_eq!(other.user, "user:employee-1");
+        assert_eq!(other.relation, "admin");
+        assert_eq!(other.object, desired.object);
+        assert_ne!(desired, other);
+    }
+
+    #[test]
+    fn role_tuple_presence_reads_only_the_two_filtered_results() {
+        let desired = workspace_tuple("user:employee-1", Relation::Member);
+        let other = workspace_tuple("user:employee-1", Relation::Admin);
+        let stranger = workspace_tuple("user:loadtest-user-1", Relation::Member);
+
+        assert_eq!(
+            role_tuple_presence(&desired, &other, &[], &[]),
+            (false, false)
+        );
+        assert_eq!(
+            role_tuple_presence(&desired, &other, std::slice::from_ref(&desired), &[]),
+            (true, false)
+        );
+        assert_eq!(
+            role_tuple_presence(&desired, &other, &[], std::slice::from_ref(&other)),
+            (false, true)
+        );
+        assert_eq!(
+            role_tuple_presence(
+                &desired,
+                &other,
+                std::slice::from_ref(&desired),
+                std::slice::from_ref(&other)
+            ),
+            (true, true)
+        );
+        // Filtered read of a different user must not count as present.
+        assert_eq!(
+            role_tuple_presence(
+                &desired,
+                &other,
+                std::slice::from_ref(&stranger),
+                std::slice::from_ref(&stranger)
+            ),
+            (false, false)
+        );
+
+        let (desired_present, other_present) =
+            role_tuple_presence(&desired, &other, std::slice::from_ref(&desired), &[]);
+        let settled = plan_tuple_sync(
+            "user:employee-1",
+            &Object::Workspace(Uuid::parse_str("fa76881f-6367-4b80-a89e-a3e01206a806").unwrap()),
+            Relation::Member,
+            Relation::Admin,
+            desired_present,
+            other_present,
         );
         assert_eq!(settled, TupleSyncPlan::default());
     }

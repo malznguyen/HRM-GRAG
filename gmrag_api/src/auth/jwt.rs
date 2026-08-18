@@ -1,7 +1,4 @@
-use jsonwebtoken::{
-    Algorithm, DecodingKey, Validation, decode, decode_header,
-    errors::ErrorKind,
-};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, errors::ErrorKind};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
@@ -501,12 +498,11 @@ mod tests {
             "exp": now_seconds() + 3600
         });
 
-        let result = validator.validate(&token(Algorithm::HS512, secret, claims)).await;
+        let result = validator
+            .validate(&token(Algorithm::HS512, secret, claims))
+            .await;
 
-        assert_eq!(
-            result.expect("valid token").sub,
-            "employee-1"
-        );
+        assert_eq!(result.expect("valid token").sub, "employee-1");
     }
 
     #[tokio::test]
@@ -573,7 +569,9 @@ mod tests {
         });
 
         assert_eq!(
-            validator.validate(&token(Algorithm::HS512, secret, expired)).await,
+            validator
+                .validate(&token(Algorithm::HS512, secret, expired))
+                .await,
             Err(JwtError::InvalidToken)
         );
         assert_eq!(
@@ -654,10 +652,7 @@ mod tests {
     fn rejects_invalid_algorithm_and_audience_configuration() {
         assert_eq!(configured_algorithm(), Ok(Algorithm::RS256));
         assert_eq!(optional_bool("JWT_VERIFY_AUDIENCE_MISSING", true), Ok(true));
-        assert_eq!(
-            reqwest::Url::parse("not-a-url").is_err(),
-            true
-        );
+        assert_eq!(reqwest::Url::parse("not-a-url").is_err(), true);
     }
 
     #[test]
