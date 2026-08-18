@@ -17,13 +17,23 @@ SSE, UI có thể gửi request nhưng không hiển thị đúng luồng/event 
 
 ## Địa chỉ API
 
-- Ngay trên máy chạy RAG: `http://127.0.0.1:18083`
-- Từ máy khác trong LAN: `http://<RAG_HOST>:18083`
+**Base URL: `http://192.168.168.89:18083`** (server `hrm-grag`, LAN nội bộ).
 
-Deployment bàn giao hiện dùng `API_BIND_ADDR=0.0.0.0:18083`; firewall đã mở inbound
-TCP port `18083`, nên team HRM có thể mở Swagger và gọi API từ máy khác trong LAN.
-Đây chưa phải endpoint production: URL hiện dùng HTTP và chưa có TLS/reverse proxy;
-khi có server chính thức, team RAG sẽ cung cấp base URL cố định.
+- Swagger UI: <http://192.168.168.89:18083/docs>
+- OpenAPI YAML: <http://192.168.168.89:18083/openapi.yaml>
+- Health: <http://192.168.168.89:18083/health>
+
+Deployment dùng `API_BIND_ADDR=0.0.0.0:18083`; firewalld đã mở inbound TCP `18083`,
+nên team HRM gọi được từ máy khác trong LAN. Toàn bộ dịch vụ nội bộ (Postgres,
+OpenFGA, MinIO, Qdrant, Ollama) chỉ bind loopback và **không** mở ra mạng.
+
+Đây chưa phải endpoint production: hiện dùng HTTP, chưa có TLS/reverse proxy.
+
+> **Giới hạn tài nguyên hiện tại.** Server đang chạy với **1 vCPU / 1.8 GB RAM**
+> trong khi stack cần khoảng 4–6 GB. Toàn bộ 11 bước smoke test đã pass, nhưng
+> throughput rất thấp: embedding một chunk mất ~12 giây, load average ~2.5 trên
+> 1 core. Dùng để tích hợp và kiểm thử thì được; **chưa chịu được tải nhiều người
+> dùng đồng thời**. Việc nâng cấp đang được đề xuất.
 
 ## Đọc theo thứ tự này
 
@@ -56,6 +66,8 @@ khi có server chính thức, team RAG sẽ cung cấp base URL cố định.
    gốc, proxy qua API, không presigned URL), `GET .../preview` (toàn văn + chunk
    để cuộn/highlight) và `GET .../chunks/{chunk_id}` (toàn văn một chunk). Xem
    [mục 10 trong `INTEGRATION_GUIDE.md`](./INTEGRATION_GUIDE.md#10-xem-tài-liệu-gốc-và-chunk-trích-dẫn-phase-17).
+7. **`POST .../chat` có thể trả `503 CHAT_BUSY` — client BẮT BUỘC xử lý.**
+   Xem mục ngay dưới đây.
 
 | Role | Đọc/Chat | Upload | Xóa |
 |---|---|---|---|
@@ -67,6 +79,42 @@ khi có server chính thức, team RAG sẽ cung cấp base URL cố định.
 MANAGER/EMPLOYEE mặc định nhận `403 CHATBOT_UPLOAD_PERMISSION_REQUIRED` khi upload và
 `404 RESOURCE_NOT_FOUND` khi DELETE. Không được hiểu response DELETE `404` là bằng chứng
 tài liệu không tồn tại; hãy ẩn thao tác upload/xóa theo role ngay tại HRM.
+
+## Bắt buộc xử lý: `503 CHAT_BUSY` khi server quá tải
+
+Server giới hạn số câu hỏi được xử lý đồng thời. Vượt ngưỡng thì request được
+**xếp hàng chờ**; nếu hàng đợi cũng đầy hoặc chờ quá lâu, API trả:
+
+```
+HTTP/1.1 503 Service Unavailable
+Retry-After: 15
+Content-Type: application/json
+
+{"error":{"code":"CHAT_BUSY","message":"Server is at capacity. Retry after the number of seconds in the Retry-After header."}}
+```
+
+**Client phải làm gì:** đợi đúng số giây trong header `Retry-After` rồi gửi lại
+**nguyên văn** request cũ — giữ nguyên `session_id`, không sinh mới. Request bị
+từ chối **không** để lại dấu vết nào ở server: không tạo session, không ghi câu
+hỏi vào lịch sử. Gửi lại là an toàn, không sợ trùng lặp.
+
+Nếu retry vẫn 503 thì nên hiển thị cho nhân viên một thông báo kiểu "hệ thống
+đang bận, vui lòng thử lại sau" thay vì báo lỗi kỹ thuật.
+
+Phân biệt với `429 RATE_LIMITED`:
+
+| | `429 RATE_LIMITED` | `503 CHAT_BUSY` |
+|---|---|---|
+| Nghĩa | **Bạn** gửi quá nhiều (>30 chat/60s cho một `userid`) | **Server** đang bận, bạn không làm gì sai |
+| Cách xử lý | Giảm tần suất gửi của user đó | Thử lại sau `Retry-After` giây |
+
+Ngưỡng hiện tại: **5 câu hỏi xử lý đồng thời**, thêm **20 chỗ xếp hàng**, chờ
+tối đa **15 giây**. Các con số này sẽ được nới sau khi server được nâng cấu hình.
+
+Thực đo với 20 người hỏi cùng lúc: **16/20 nhận được câu trả lời** (p50 12 giây),
+4 nhận `503`. Với 40 người cùng lúc: 19 nhận câu trả lời, 21 nhận `503`. Không
+có trường hợp nào lỗi cứng. Nếu client retry đúng theo `Retry-After` thì cuối
+cùng mọi người đều được phục vụ.
 
 ## Test nhanh nhất
 

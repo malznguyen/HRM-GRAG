@@ -2,7 +2,7 @@ openapi: 3.1.0
 
 info:
   title: HRM RAG API — HRM integration surface
-  version: "0.2.0-phase11"
+  version: "0.2.0-phase17"
   summary: The HRM integration contract for documents, grounded chat and user-owned chat history.
   description: |
     This specification documents **only** the endpoints the HRM backend consumes.
@@ -1046,6 +1046,34 @@ paths:
                     error:
                       code: GENERATION_SERVICE_UNAVAILABLE
                       message: Generation service unavailable
+        "503":
+          description: |
+            `CHAT_BUSY` — the server is already handling its maximum number of
+            concurrent questions and the wait queue is full or the wait timed
+            out. **The caller did nothing wrong**; this is backpressure, not a
+            per-caller quota (that is `429 RATE_LIMITED`).
+
+            The request is rejected **before any write**: no session is created
+            and the question is not stored in history. Retrying the identical
+            request — same `session_id` — is therefore safe and cannot duplicate
+            anything.
+
+            Wait the number of seconds given in the `Retry-After` response
+            header before retrying.
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying the identical request.
+              required: true
+              schema: { type: integer, minimum: 1, example: 15 }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+              examples:
+                chatBusy:
+                  value:
+                    error:
+                      code: CHAT_BUSY
+                      message: Server is at capacity. Retry after the number of seconds in the Retry-After header.
 
   /workspaces/{workspace_id}/chat/history:
     get:
@@ -1411,7 +1439,8 @@ components:
         The RAG service does not issue tokens and has no login endpoint. It
         verifies a token minted by the HRM identity provider, using the
         algorithm in `JWT_ALG` and the key material in `JWT_HMAC_SECRET`
-        (HS256/HS384/HS512) or the JWKS at `JWT_JWKS_URL` (RS256).
+        (HS512) or the JWKS at `JWT_JWKS_URL` (RS256). `JWT_ALG` accepts only
+        `RS256` and `HS512`; `HS256` or `HS384` prevent the API from booting.
 
         Claims read by the server:
           * subject — the claim named by `JWT_SUBJECT_CLAIM`. For HRM this is
