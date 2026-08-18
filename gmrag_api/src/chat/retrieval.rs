@@ -246,7 +246,7 @@ pub async fn fetch_chat_history(
         INNER JOIN chat_sessions cs ON cs.id = cm.session_id
         WHERE cm.session_id = $1
           AND cs.workspace_id = $2
-        ORDER BY cm.created_at DESC
+        ORDER BY cm.message_sequence DESC
         LIMIT 5
         "#,
     )
@@ -290,7 +290,7 @@ pub async fn fetch_session_chat_messages(
         WHERE cm.session_id = $1
           AND cs.workspace_id = $2
           AND cs.user_id = $3
-        ORDER BY cm.created_at ASC, cm.id ASC
+        ORDER BY cm.message_sequence ASC
         LIMIT $4 OFFSET $5
         "#,
     )

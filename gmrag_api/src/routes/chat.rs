@@ -26,9 +26,9 @@ use crate::chat::retrieval::{StoredChatMessagePage, fetch_session_chat_messages}
 use crate::chat::{
     ChatPipelineError, SessionError, build_chat_context, delete_chat_session, ensure_chat_session,
     filter_citation_ids_for_user, filter_citations_for_allowed_ids, filter_citations_for_user,
-    insert_chat_message, list_user_chat_sessions, prepare_deepseek_stream,
-    resolve_chunk_index_citations, truncate_session_title, update_chat_session_title,
-    verify_chat_session_owner,
+    insert_chat_message, insert_user_chat_message_and_reserve_turn, list_user_chat_sessions,
+    prepare_deepseek_stream, resolve_chunk_index_citations, truncate_session_title,
+    update_chat_session_title, verify_chat_session_owner,
 };
 use crate::state::AppState;
 
@@ -904,6 +904,7 @@ struct PersistAssistantOnDrop {
     workspace_id: Uuid,
     user_id: String,
     session_id: Uuid,
+    message_sequence: i64,
 }
 
 impl Drop for PersistAssistantOnDrop {
@@ -924,6 +925,7 @@ impl Drop for PersistAssistantOnDrop {
         let workspace_id = self.workspace_id;
         let user_id = self.user_id.clone();
         let session_id = self.session_id;
+        let message_sequence = self.message_sequence;
 
         // Drop không async: cần Handle để spawn. Ngoài runtime thì bỏ qua, không panic.
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
@@ -957,8 +959,15 @@ impl Drop for PersistAssistantOnDrop {
                 }
             };
 
-            if let Err(err) =
-                insert_chat_message(&pool, session_id, "assistant", &content, &citations).await
+            if let Err(err) = insert_chat_message(
+                &pool,
+                session_id,
+                message_sequence,
+                "assistant",
+                &content,
+                &citations,
+            )
+            .await
             {
                 tracing::error!(
                     %session_id,
@@ -1037,11 +1046,19 @@ pub async fn workspace_chat(
         }
     }
 
-    if let Err(err) = insert_chat_message(&state.pool, body.session_id, "user", &message, &[]).await
+    let turn = match insert_user_chat_message_and_reserve_turn(
+        &state.pool,
+        body.session_id,
+        &message,
+    )
+    .await
     {
-        tracing::error!(error = %err, "Failed to insert user chat message");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+        Ok(turn) => turn,
+        Err(err) => {
+            tracing::error!(error = %err, "Failed to insert user chat message and reserve turn");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
 
     let client = Client::new();
     let context = match build_chat_context(
@@ -1106,6 +1123,7 @@ pub async fn workspace_chat(
             workspace_id: workspace_id_for_acl,
             user_id: user_id_for_acl,
             session_id,
+            message_sequence: turn.assistant_sequence,
         };
 
         while let Some(token_result) = next_stream_token(&mut byte_stream, &mut parser, idle_timeout).await {
@@ -1459,6 +1477,60 @@ mod tests {
 
         let (_, queries) = history_citation_plan(&[row]);
         assert!(queries.is_empty());
+    }
+
+    #[test]
+    fn history_snippet_queries_follow_distinct_user_turns() {
+        let first_chunk = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let second_chunk = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let rows = vec![
+            crate::chat::retrieval::StoredChatMessage {
+                id: Uuid::new_v4(),
+                role: "user".to_string(),
+                content: "Chính sách làm thêm giờ".to_string(),
+                citations: sqlx::types::Json(Vec::new()),
+                created_at: chrono::NaiveDateTime::MIN,
+            },
+            crate::chat::retrieval::StoredChatMessage {
+                id: Uuid::new_v4(),
+                role: "assistant".to_string(),
+                content: "Trả lời làm thêm giờ".to_string(),
+                citations: sqlx::types::Json(vec![first_chunk]),
+                created_at: chrono::NaiveDateTime::MIN,
+            },
+            crate::chat::retrieval::StoredChatMessage {
+                id: Uuid::new_v4(),
+                role: "user".to_string(),
+                content: "Nghỉ phép năm".to_string(),
+                citations: sqlx::types::Json(Vec::new()),
+                created_at: chrono::NaiveDateTime::MIN,
+            },
+            crate::chat::retrieval::StoredChatMessage {
+                id: Uuid::new_v4(),
+                role: "assistant".to_string(),
+                content: "Trả lời nghỉ phép năm".to_string(),
+                citations: sqlx::types::Json(vec![second_chunk]),
+                created_at: chrono::NaiveDateTime::MIN,
+            },
+        ];
+
+        let (_, queries) = history_citation_plan(&rows);
+        assert_eq!(queries[&rows[1].id], "Chính sách làm thêm giờ");
+        assert_eq!(queries[&rows[3].id], "Nghỉ phép năm");
+        assert_eq!(
+            select_citation_snippet(
+                "Làm thêm giờ được phê duyệt trước.",
+                queries.get(&rows[1].id).map(String::as_str),
+            ),
+            "Làm thêm giờ được phê duyệt trước."
+        );
+        assert_eq!(
+            select_citation_snippet(
+                "Nghỉ phép năm là 12 ngày.",
+                queries.get(&rows[3].id).map(String::as_str),
+            ),
+            "Nghỉ phép năm là 12 ngày."
+        );
     }
 
     #[test]

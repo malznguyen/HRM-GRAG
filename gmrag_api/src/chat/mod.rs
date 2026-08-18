@@ -563,21 +563,20 @@ pub async fn ensure_chat_session(
     user_id: &str,
     title: &str,
 ) -> Result<(), SessionError> {
-    let owner: Option<String> = sqlx::query_scalar(
+    let owner: Option<(String, Uuid)> = sqlx::query_as(
         r#"
-        SELECT user_id
+        SELECT user_id, workspace_id
         FROM chat_sessions
-        WHERE id = $1 AND workspace_id = $2
+        WHERE id = $1
         "#,
     )
     .bind(session_id)
-    .bind(workspace_id)
     .fetch_optional(pool)
     .await
     .map_err(SessionError::Database)?;
 
-    if let Some(existing_user) = owner {
-        if existing_user == user_id {
+    if let Some((existing_user, existing_workspace)) = owner {
+        if existing_workspace == workspace_id && existing_user == user_id {
             return Ok(());
         }
         return Err(SessionError::Forbidden);
@@ -587,6 +586,7 @@ pub async fn ensure_chat_session(
         r#"
         INSERT INTO chat_sessions (id, workspace_id, user_id, title)
         VALUES ($1, $2, $3, $4)
+        ON CONFLICT (id) DO NOTHING
         "#,
     )
     .bind(session_id)
@@ -597,7 +597,112 @@ pub async fn ensure_chat_session(
     .await
     .map_err(SessionError::Database)?;
 
-    Ok(())
+    let owner: Option<(String, Uuid)> =
+        sqlx::query_as("SELECT user_id, workspace_id FROM chat_sessions WHERE id = $1")
+            .bind(session_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(SessionError::Database)?;
+
+    match owner {
+        Some((existing_user, existing_workspace))
+            if existing_workspace == workspace_id && existing_user == user_id =>
+        {
+            Ok(())
+        }
+        _ => Err(SessionError::Forbidden),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatTurnSequence {
+    pub user_sequence: i64,
+    pub assistant_sequence: i64,
+}
+
+/// Atomically reserves the two message positions belonging to one turn and
+/// inserts the user message. The session row is locked before reading/updating
+/// the counter, so concurrent requests for one session receive disjoint turns.
+/// The assistant position is intentionally reserved even if the stream later
+/// fails or produces an empty buffer; gaps are acceptable and prevent a later
+/// turn from being renumbered behind an already-started request.
+pub async fn insert_user_chat_message_and_reserve_turn(
+    pool: &PgPool,
+    session_id: Uuid,
+    content: &str,
+) -> Result<ChatTurnSequence, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+
+    let stored_next: i64 = sqlx::query_scalar(
+        r#"
+        SELECT next_message_sequence
+        FROM chat_sessions
+        WHERE id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(session_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+
+    let max_existing: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(message_sequence) FROM chat_messages WHERE session_id = $1")
+            .bind(session_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+
+    let first_available = match max_existing {
+        Some(maximum) if maximum == i64::MAX => {
+            return Err(sqlx::Error::Protocol(
+                "chat message sequence exhausted".to_string(),
+            ));
+        }
+        Some(maximum) => maximum + 1,
+        None => 1,
+    };
+    let user_sequence = stored_next.max(first_available);
+    if user_sequence > i64::MAX - 2 {
+        return Err(sqlx::Error::Protocol(
+            "chat message sequence exhausted".to_string(),
+        ));
+    }
+    let assistant_sequence = user_sequence + 1;
+    let next_sequence = user_sequence + 2;
+
+    sqlx::query(
+        r#"
+        UPDATE chat_sessions
+        SET next_message_sequence = $2
+        WHERE id = $1
+        "#,
+    )
+    .bind(session_id)
+    .bind(next_sequence)
+    .execute(&mut *transaction)
+    .await?;
+
+    let citations_json = sqlx::types::Json(Vec::<Uuid>::new());
+    sqlx::query(
+        r#"
+        INSERT INTO chat_messages (
+            session_id, message_sequence, role, content, citations
+        )
+        VALUES ($1, $2, 'user', $3, $4)
+        "#,
+    )
+    .bind(session_id)
+    .bind(user_sequence)
+    .bind(content)
+    .bind(citations_json)
+    .execute(&mut *transaction)
+    .await?;
+
+    transaction.commit().await?;
+
+    Ok(ChatTurnSequence {
+        user_sequence,
+        assistant_sequence,
+    })
 }
 
 #[derive(Debug, Serialize, sqlx::FromRow)]
@@ -744,6 +849,7 @@ pub async fn update_chat_session_title(
 pub async fn insert_chat_message(
     pool: &PgPool,
     session_id: Uuid,
+    message_sequence: i64,
     role: &str,
     content: &str,
     citations: &[Uuid],
@@ -752,11 +858,14 @@ pub async fn insert_chat_message(
 
     sqlx::query(
         r#"
-        INSERT INTO chat_messages (session_id, role, content, citations)
-        VALUES ($1, $2, $3, $4)
+        INSERT INTO chat_messages (
+            session_id, message_sequence, role, content, citations
+        )
+        VALUES ($1, $2, $3, $4, $5)
         "#,
     )
     .bind(session_id)
+    .bind(message_sequence)
     .bind(role)
     .bind(content)
     .bind(citations_json)

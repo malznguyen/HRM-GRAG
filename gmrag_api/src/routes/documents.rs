@@ -30,9 +30,9 @@ use crate::document_format::{DocumentFormat, document_max_upload_bytes};
 use crate::ingestion::jobs::{IngestionWorkerConfig, enqueue_job_tx, retry_failed_document};
 use crate::retrieval::outbox::enqueue_delete_by_document_tx;
 use crate::state::AppState;
+use crate::storage::StorageError;
 use crate::storage::build_original_document_object_key;
 use crate::storage::outbox::enqueue_delete_object_tx;
-use crate::storage::StorageError;
 
 #[derive(Deserialize)]
 pub struct SetDocumentAccessModeRequest {
@@ -603,7 +603,10 @@ pub async fn get_document_file(
     }
 
     let size_limit = document_file_serve_limit_bytes();
-    if file_target.size_bytes.is_none_or(|size| size > size_limit || size < 0) {
+    if file_target
+        .size_bytes
+        .is_none_or(|size| size > size_limit || size < 0)
+    {
         error!(
             user_id = %authz.user_id,
             workspace_id = %workspace_id,
